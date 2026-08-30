@@ -31,7 +31,6 @@ class CheckpointLoadReport:
     scaler_state: dict[str, Any] | None
     ema_state: dict[str, Any] | None
     engine_state: dict[str, Any] | None
-    ewc_state: dict[str, Any] | None
     metadata: dict[str, Any]
 
 
@@ -48,7 +47,6 @@ def save_checkpoint(
     ema_state: dict[str, Any] | None = None,
     sampler_state: dict[str, Any] | None = None,
     engine_state: dict[str, Any] | None = None,
-    ewc_state: dict[str, Any] | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> Path:
     destination = Path(path)
@@ -62,7 +60,6 @@ def save_checkpoint(
         "ema": ema_state,
         "sampler": sampler_state,
         "engine": engine_state,
-        "ewc": ewc_state,
         "epoch": int(epoch),
         "global_step": int(global_step),
         "config": asdict(config),
@@ -135,7 +132,6 @@ def load_checkpoint(
         scaler_state=payload.get("scaler"),
         ema_state=payload.get("ema"),
         engine_state=payload.get("engine"),
-        ewc_state=payload.get("ewc"),
         metadata=dict(payload.get("metadata", {})),
     )
 
@@ -309,53 +305,6 @@ class ModelEMA:
             with torch.no_grad():
                 for name, value in backup.items():
                     state[name].copy_(value)
-
-
-import torch
-
-
-class ElasticWeightConsolidation:
-    def __init__(self, weight: float = 0.0) -> None:
-        self.weight = weight
-        self.reference: dict[str, Tensor] = {}
-        self.fisher: dict[str, Tensor] = {}
-
-    def consolidate(
-        self, model: nn.Module, parameter_names: set[str] | None = None
-    ) -> None:
-        for name, parameter in model.named_parameters():
-            if parameter_names is None or name in parameter_names:
-                self.reference[name] = parameter.detach().clone()
-                self.fisher[name] = (
-                    parameter.grad.detach().square().clone()
-                    if parameter.grad is not None
-                    else torch.zeros_like(parameter)
-                )
-
-    def penalty(self, model: nn.Module) -> Tensor:
-        reference = next(model.parameters())
-        result = reference.sum() * 0
-        for name, parameter in model.named_parameters():
-            if name in self.reference:
-                result = (
-                    result
-                    + (
-                        self.fisher[name] * (parameter - self.reference[name]).square()
-                    ).sum()
-                )
-        return result * self.weight
-
-    def state_dict(self) -> dict[str, object]:
-        return {
-            "weight": self.weight,
-            "reference": self.reference,
-            "fisher": self.fisher,
-        }
-
-    def load_state_dict(self, state: dict[str, object]) -> None:
-        self.weight = float(state["weight"])
-        self.reference = dict(state["reference"])  # type: ignore[arg-type]
-        self.fisher = dict(state["fisher"])  # type: ignore[arg-type]
 
 
 from dataclasses import dataclass
@@ -546,9 +495,217 @@ def router_temperature(
     return max(config.minimum, value)
 
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 
-from tfs_moe_fusion.config import TaskUpdatePolicyConfig
+from tfs_moe_fusion.config import MoEExecutionScheduleConfig, TaskUpdatePolicyConfig
+from tfs_moe_fusion.moe import FunctionalMoEBlock, MoEExecutionPolicy
+
+
+def _cosine_progress(step: int, start: int, end: int) -> float:
+    if end <= start:
+        return float(step >= end)
+    progress = min(max((step - start) / (end - start), 0.0), 1.0)
+    return 0.5 - 0.5 * math.cos(math.pi * progress)
+
+
+class RouterLoadMonitor:
+    """Checkpointable block-level EMA load monitor and recovery controller."""
+
+    def __init__(self, config: MoEExecutionScheduleConfig) -> None:
+        self.config = config
+        self.usage_ema: dict[str, list[float]] = {}
+        self.top2_mass_ema: dict[str, float] = {}
+        self.starvation_counters: dict[str, list[int]] = {}
+        self.overload_counters: dict[str, int] = {}
+        self.recovery_until_step = 0
+
+    @property
+    def recovery_active(self) -> bool:
+        return self.recovery_until_step > 0
+
+    def in_recovery(self, step: int) -> bool:
+        return step < self.recovery_until_step
+
+    @torch.no_grad()
+    def update(
+        self, diagnostics: tuple[RouterDiagnostics, ...], step: int
+    ) -> dict[str, float]:
+        decay = self.config.monitor.ema_decay
+        minimum = self.config.monitor.starvation_threshold
+        maximum = self.config.monitor.overload_threshold
+        patience = self.config.monitor.patience_steps
+        result: dict[str, float] = {}
+        triggered = False
+        for item in diagnostics:
+            experts = item.probabilities.shape[1]
+            load = (
+                torch.nn.functional.one_hot(item.topk_indices, experts)
+                .amax(1)
+                .float()
+                .mean(0)
+            )
+            load = reduce_mean(load).cpu()
+            valid = item.valid_expert_mask.any(0).cpu()
+            top2_mass = item.probabilities.gather(1, item.topk_indices).sum(1).mean()
+            top2_mass = float(reduce_mean(top2_mass).cpu())
+            name = item.block_id
+            previous = self.usage_ema.get(name, load.tolist())
+            usage = [
+                (decay * old + (1 - decay) * float(current) if bool(is_valid) else old)
+                for old, current, is_valid in zip(
+                    previous, load.tolist(), valid.tolist()
+                )
+            ]
+            self.usage_ema[name] = usage
+            previous_mass = self.top2_mass_ema.get(name, top2_mass)
+            self.top2_mass_ema[name] = decay * previous_mass + (1 - decay) * top2_mass
+            counters = self.starvation_counters.setdefault(name, [0] * experts)
+            for index, is_valid in enumerate(valid.tolist()):
+                if not is_valid:
+                    continue
+                counters[index] = counters[index] + 1 if usage[index] < minimum else 0
+                triggered = triggered or counters[index] >= patience
+            overload = self.overload_counters.get(name, 0)
+            overload = overload + 1 if max(usage) > maximum else 0
+            self.overload_counters[name] = overload
+            triggered = triggered or overload >= patience
+            result[f"router_top2_mass/{name}"] = self.top2_mass_ema[name]
+            result[f"router_max_load/{name}"] = max(usage)
+        if triggered:
+            self.recovery_until_step = max(
+                self.recovery_until_step,
+                step + 1 + self.config.recovery.steps,
+            )
+            self.starvation_counters = {
+                name: [0] * len(values)
+                for name, values in self.starvation_counters.items()
+            }
+            self.overload_counters = {name: 0 for name in self.overload_counters}
+        result["router_recovery_active"] = float(self.in_recovery(step + 1))
+        if self.top2_mass_ema:
+            result["router_top2_mass"] = sum(self.top2_mass_ema.values()) / len(
+                self.top2_mass_ema
+            )
+        return result
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "usage_ema": self.usage_ema,
+            "top2_mass_ema": self.top2_mass_ema,
+            "starvation_counters": self.starvation_counters,
+            "overload_counters": self.overload_counters,
+            "recovery_until_step": self.recovery_until_step,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.usage_ema = {
+            str(name): [float(value) for value in values]
+            for name, values in state.get("usage_ema", {}).items()
+        }
+        self.top2_mass_ema = {
+            str(name): float(value)
+            for name, value in state.get("top2_mass_ema", {}).items()
+        }
+        self.starvation_counters = {
+            str(name): [int(value) for value in values]
+            for name, values in state.get("starvation_counters", {}).items()
+        }
+        self.overload_counters = {
+            str(name): int(value)
+            for name, value in state.get("overload_counters", {}).items()
+        }
+        self.recovery_until_step = int(state.get("recovery_until_step", 0))
+
+
+class MoEExecutionScheduler:
+    def __init__(
+        self, config: MoEExecutionScheduleConfig, monitor: RouterLoadMonitor
+    ) -> None:
+        self.config, self.monitor = config, monitor
+
+    def resolve(self, step: int) -> MoEExecutionPolicy | None:
+        if not self.config.enabled:
+            return None
+        warmup = self.config.warmup
+        recovery = self.monitor.in_recovery(step)
+        temperature = self._temperature(step)
+        noise = self._noise(step)
+        if recovery:
+            temperature = max(temperature, self.config.recovery.temperature_floor)
+            noise = max(noise, self.config.recovery.noise_std)
+
+        if step < warmup.uniform_steps:
+            return MoEExecutionPolicy(
+                "dense_uniform",
+                uniform_to_soft=0.0,
+                spatial_gate_scale=0.0,
+                detach_router=True,
+                temperature=temperature,
+                noise_std=noise,
+            )
+        if step < warmup.uniform_to_soft_end:
+            progress = _cosine_progress(
+                step, warmup.uniform_steps, warmup.uniform_to_soft_end
+            )
+            return MoEExecutionPolicy(
+                "dense_annealed",
+                uniform_to_soft=progress,
+                spatial_gate_scale=progress,
+                temperature=temperature,
+                noise_std=noise,
+            )
+        if step < warmup.soft_to_topk_end:
+            progress = _cosine_progress(
+                step, warmup.uniform_to_soft_end, warmup.soft_to_topk_end
+            )
+            return MoEExecutionPolicy(
+                "dense_annealed",
+                uniform_to_soft=1.0,
+                soft_to_topk=progress,
+                temperature=temperature,
+                noise_std=noise,
+            )
+
+        interval = (
+            self.config.recovery.refresh_interval
+            if recovery
+            else self.config.refresh.interval
+        )
+        elapsed = step - warmup.soft_to_topk_end
+        if elapsed > 0 and elapsed % interval == 0:
+            return MoEExecutionPolicy(
+                "expert_refresh",
+                refresh_routed_fraction=self.config.refresh.routed_fraction,
+                detach_router=True,
+                expert_only=self.config.refresh.expert_only,
+                spatial_gate_scale=0.0,
+                temperature=temperature,
+                noise_std=noise,
+            )
+        return MoEExecutionPolicy(
+            "sparse_batch", temperature=temperature, noise_std=noise
+        )
+
+    def _temperature(self, step: int) -> float:
+        warmup, routing = self.config.warmup, self.config.routing
+        if step <= warmup.uniform_steps:
+            return routing.initial_temperature
+        if step < warmup.soft_to_topk_end:
+            progress = _cosine_progress(
+                step, warmup.uniform_steps, warmup.soft_to_topk_end
+            )
+            return routing.initial_temperature + progress * (
+                routing.sparse_start_temperature - routing.initial_temperature
+            )
+        progress = _cosine_progress(step, warmup.soft_to_topk_end, routing.final_step)
+        return routing.sparse_start_temperature + progress * (
+            routing.final_temperature - routing.sparse_start_temperature
+        )
+
+    def _noise(self, step: int) -> float:
+        routing = self.config.routing
+        progress = _cosine_progress(step, 0, routing.noise_end_step)
+        return routing.initial_noise_std * (1 - progress)
 
 
 class TaskParameterPolicy:
@@ -563,6 +720,41 @@ class TaskParameterPolicy:
         changed: list[nn.Parameter] = []
         for group in frozen:
             for parameter in self.registry.parameters(group):
+                if parameter.requires_grad:
+                    parameter.requires_grad_(False)
+                    changed.append(parameter)
+        try:
+            yield
+        finally:
+            for parameter in changed:
+                parameter.requires_grad_(True)
+
+
+class ExpertOnlyParameterPolicy:
+    expert_groups = frozenset(
+        {
+            "common_experts",
+            "low_frequency_experts",
+            "detail_experts",
+            "semantic_experts",
+            "ir_experts",
+            "feedback_experts",
+        }
+    )
+
+    def __init__(self, registry: ParameterGroupRegistry) -> None:
+        self.registry = registry
+
+    @contextmanager
+    def apply(self, enabled: bool) -> Iterator[None]:
+        if not enabled:
+            yield
+            return
+        changed: list[nn.Parameter] = []
+        for group, parameters in self.registry.groups.items():
+            if group in self.expert_groups:
+                continue
+            for parameter in parameters:
                 if parameter.requires_grad:
                     parameter.requires_grad_(False)
                     changed.append(parameter)
@@ -630,6 +822,26 @@ def gradient_statistics(model: nn.Module) -> dict[str, float]:
     }
 
 
+def expert_gradient_statistics(
+    registry: ParameterGroupRegistry,
+) -> dict[str, float]:
+    expert_groups = ExpertOnlyParameterPolicy.expert_groups
+    result: dict[str, float] = {}
+    for group in sorted(expert_groups):
+        gradients = [
+            parameter.grad.detach().float().norm()
+            for parameter in registry.parameters(group)
+            if parameter.grad is not None
+        ]
+        norm = (
+            torch.linalg.vector_norm(torch.stack(gradients))
+            if gradients
+            else torch.zeros(())
+        )
+        result[f"expert_grad_norm/{group}"] = float(norm)
+    return result
+
+
 def router_statistics(values: tuple[RouterDiagnostics, ...]) -> dict[str, float]:
     if not values:
         return {"router_entropy": 0.0, "router_max_load": 0.0}
@@ -639,15 +851,24 @@ def router_statistics(values: tuple[RouterDiagnostics, ...]) -> dict[str, float]
     load = torch.stack(
         [
             torch.nn.functional.one_hot(item.topk_indices, item.probabilities.shape[1])
+            .amax(1)
             .float()
-            .mean((0, 1))
+            .mean(0)
             for item in values
         ]
     ).mean(0)
-    return {
+    result = {
         "router_entropy": float(entropy.detach()),
         "router_max_load": float(load.max().detach()),
     }
+    for item in values:
+        residuals = item.auxiliary.get("expert_residual_rms", {})
+        for expert, value in residuals.items():
+            result[f"expert_residual_rms/{item.block_id}/{expert}"] = float(value)
+        scale = item.auxiliary.get("residual_scale_rms")
+        if scale is not None:
+            result[f"moe_residual_scale/{item.block_id}"] = float(scale)
+    return result
 
 
 import logging
@@ -657,7 +878,6 @@ import torch
 from tqdm.auto import tqdm
 
 from tfs_moe_fusion.data import (
-    DeterministicDummyFusionDataset,
     SemanticRTFusionDataset,
     SynchronizedAugmentationConfig,
     SynchronizedImageAugmentation,
@@ -675,38 +895,6 @@ class TrainerState:
     phase: str = "stabilization"
     router_temperature: float = 1.0
     collapse_count: int = 0
-
-
-class DummyBatchProvider:
-    """Stateful deterministic provider used to verify the complete trainer."""
-
-    def __init__(self, config: ProjectConfig) -> None:
-        self.batch_size = config.training.batch_size
-        self.datasets = {
-            task: DeterministicDummyFusionDataset(
-                task,
-                config.data.dummy_length,
-                config.data.height,
-                config.data.width,
-                config.experiment.seed,
-            )
-            for task in TaskType
-        }
-        self.cursors = {task: 0 for task in TaskType}
-
-    def next_batch(self, task: TaskType) -> FusionBatch:
-        dataset, cursor = self.datasets[task], self.cursors[task]
-        indices = [
-            (cursor + offset) % len(dataset) for offset in range(self.batch_size)
-        ]
-        self.cursors[task] = (cursor + self.batch_size) % len(dataset)
-        return collate_fusion_samples([dataset[index] for index in indices])
-
-    def state_dict(self) -> dict[str, int]:
-        return {task.value: value for task, value in self.cursors.items()}
-
-    def load_state_dict(self, state: dict[str, int]) -> None:
-        self.cursors = {TaskType.parse(key): int(value) for key, value in state.items()}
 
 
 class SemanticRTBatchProvider:
@@ -832,9 +1020,7 @@ class SemanticRTBatchProvider:
 
 def build_batch_provider(
     config: ProjectConfig,
-) -> DummyBatchProvider | SemanticRTBatchProvider:
-    if config.data.dataset == "deterministic_dummy":
-        return DummyBatchProvider(config)
+) -> SemanticRTBatchProvider:
     if config.data.dataset == "semantic_rt":
         return SemanticRTBatchProvider(config)
     raise ValueError(f"No batch provider is configured for {config.data.dataset!r}")
@@ -886,17 +1072,18 @@ class Trainer:
             if config.training.ema.enabled
             else None
         )
-        self.ewc = ElasticWeightConsolidation(config.training.ewc.weight)
         self.policy = TaskParameterPolicy(
             self.registry, config.training.task_update_policy
+        )
+        self.expert_only_policy = ExpertOnlyParameterPolicy(self.registry)
+        self.router_monitor = RouterLoadMonitor(config.training.moe_execution)
+        self.moe_scheduler = MoEExecutionScheduler(
+            config.training.moe_execution, self.router_monitor
         )
         self.task_sampler = StatefulTaskSampler.from_strings(
             config.training.task_sampling.weights, config.experiment.seed + 17
         )
         self.provider = build_batch_provider(config)
-        if isinstance(self.provider, DummyBatchProvider):
-            for task in TaskType:
-                self.provider.cursors[task] = self.rank * config.training.batch_size
         self.state = TrainerState()
         self.gradient_conflicts = GradientConflictMonitor()
         self.last_loss: LossOutput | None = None
@@ -945,7 +1132,7 @@ class Trainer:
                     task=task.value,
                     loss=f"{total_loss:.4f}",
                     lr=f"{self.optimizer.param_groups[0]['lr']:.2e}",
-                    refresh=False,
+                    refresh=bool(result.diagnostics.get("moe_refresh", 0.0)),
                 )
 
                 if self.state.global_step % self.config.training.log_every_steps == 0:
@@ -1046,19 +1233,38 @@ class Trainer:
         self.state.epoch = self.state.global_step // config.steps_per_epoch
         phase = active_phase(config.phases.phases, self.state.epoch)
         self.state.phase = phase.name
-        self.state.router_temperature = router_temperature(
-            config.router_temperature, self.state.global_step, self.total_steps
+        execution_policy = self.moe_scheduler.resolve(self.state.global_step)
+        self._set_moe_execution_policy(execution_policy)
+        self.state.router_temperature = (
+            execution_policy.temperature
+            if execution_policy is not None and execution_policy.temperature is not None
+            else router_temperature(
+                config.router_temperature, self.state.global_step, self.total_steps
+            )
         )
         self._set_router_temperature(self.state.router_temperature)
+        if execution_policy is not None:
+            self._set_router_noise(execution_policy.noise_std)
         self.optimizer.zero_grad(set_to_none=True)
         aggregate: LossOutput | None = None
-        with self.policy.apply(task):
+        loss_multipliers = dict(phase.loss_multipliers)
+        if execution_policy is not None and execution_policy.expert_only:
+            loss_multipliers.update({"moe": 0.0, "consistency": 0.0})
+        with ExitStack() as stack:
+            stack.enter_context(self.policy.apply(task))
+            stack.enter_context(
+                self.expert_only_policy.apply(
+                    execution_policy is not None and execution_policy.expert_only
+                )
+            )
             for _ in range(config.gradient_accumulation_steps):
                 batch = self.provider.next_batch(task).to(self.device)
                 with self.amp.autocast():
                     output = self.model(batch)
                     auxiliary: dict[str, Any] = {}
-                    if self._use_consistency(task):
+                    if not (
+                        execution_policy is not None and execution_policy.expert_only
+                    ) and self._use_consistency(task):
                         auxiliary["paired_output"] = self.model(
                             self._paired_batch(batch)
                         )
@@ -1072,25 +1278,19 @@ class Trainer:
                             self.model,
                             auxiliary,
                             phase.name,
-                            phase.loss_multipliers,
+                            loss_multipliers,
                         )
                     )
-                    ewc_penalty = (
-                        self.ewc.penalty(self.raw_model)
-                        if config.ewc.enabled
-                        else result.total * 0
-                    )
-                    if config.ewc.enabled:
-                        result.components["ewc/penalty"] = ewc_penalty
-                        result.weighted_components["ewc/penalty"] = ewc_penalty
-                        result.total = result.total + ewc_penalty
                     scaled_loss = result.total / config.gradient_accumulation_steps
                 self.amp.backward(scaled_loss)
                 aggregate = result
                 self.state.micro_step += 1
         assert aggregate is not None
         self.amp.unscale_(self.optimizer)
-        gradient_info = gradient_statistics(self.model)
+        gradient_info = {
+            **gradient_statistics(self.model),
+            **expert_gradient_statistics(self.registry),
+        }
         if gradient_info["nonfinite_gradients"]:
             raise FloatingPointError("Training produced non-finite gradients")
         if config.gradient_clip.enabled:
@@ -1120,6 +1320,20 @@ class Trainer:
                 )
             )
         )
+        aggregate.diagnostics.update(
+            self.router_monitor.update(
+                tuple(output.router_diagnostics), self.state.global_step
+            )
+        )
+        if execution_policy is not None:
+            aggregate.diagnostics.update(
+                {
+                    "moe_execution": execution_policy.mode,
+                    "moe_uniform_to_soft": execution_policy.uniform_to_soft,
+                    "moe_soft_to_topk": execution_policy.soft_to_topk,
+                    "moe_refresh": float(execution_policy.expert_only),
+                }
+            )
         del aggregate_context
         self._monitor_collapse(aggregate.diagnostics)
         self.state.global_step += 1
@@ -1146,8 +1360,8 @@ class Trainer:
                 },
                 "provider": self.provider.state_dict(),
                 "gradient_conflicts": self.gradient_conflicts.state_dict(),
+                "router_monitor": self.router_monitor.state_dict(),
             },
-            ewc_state=self.ewc.state_dict(),
             metadata=metadata,
         )
 
@@ -1186,8 +1400,6 @@ class Trainer:
             self.ema.load_state_dict(report.ema_state)
         if report.sampler_state is not None:
             self.task_sampler.load_state_dict(report.sampler_state)
-        if report.ewc_state is not None:
-            self.ewc.load_state_dict(report.ewc_state)
         state = report.engine_state or {}
         if "trainer" in state:
             self.state = TrainerState(**state["trainer"])
@@ -1197,6 +1409,8 @@ class Trainer:
             self.provider.load_state_dict(state["provider"])
         if "gradient_conflicts" in state:
             self.gradient_conflicts.load_state_dict(state["gradient_conflicts"])
+        if "router_monitor" in state:
+            self.router_monitor.load_state_dict(state["router_monitor"])
 
     def _next_task(self) -> TaskType:
         if self.config.training.task_sampling.strategy == "alternating":
@@ -1230,6 +1444,18 @@ class Trainer:
             router = getattr(module, "router", None)
             if router is not None and hasattr(router, "temperature"):
                 router.temperature = temperature
+
+    def _set_router_noise(self, standard_deviation: float) -> None:
+        for module in self.model.modules():
+            router = getattr(module, "router", None)
+            if router is not None and hasattr(router, "noisy_topk"):
+                router.noisy_topk = standard_deviation > 0
+                router.noisy_topk_std = standard_deviation
+
+    def _set_moe_execution_policy(self, policy: MoEExecutionPolicy | None) -> None:
+        for module in self.model.modules():
+            if isinstance(module, FunctionalMoEBlock):
+                module.set_execution_policy(policy)
 
     def _monitor_collapse(self, diagnostics: dict[str, Any]) -> None:
         threshold = self.config.training.diagnostics.router_collapse_threshold

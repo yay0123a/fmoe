@@ -5,10 +5,11 @@ kept as project documentation.
 
 ## Real-data training
 
-- Implement dataset adapters for MSRS, FMB, SemanticRT, and the prepared MFIF
-  datasets without changing their official internal layouts.
-- Validate pair matching, label IDs, train/validation/test splits, augmentations,
-  and task-homogeneous batching.
+- Implement dataset adapters for MSRS and FMB without changing their official
+  internal layouts. SemanticRT and its prepared MFIF data are already connected
+  to the default training profile.
+- Validate MSRS/FMB pair matching, label IDs, train/validation/test splits,
+  augmentations, and task-homogeneous batching.
 - Allow training configurations to enable or disable individual tasks while
   preserving exact checkpoint resume.
 

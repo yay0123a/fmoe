@@ -13,7 +13,7 @@ from tfs_moe_fusion.trainer import Trainer
 from tfs_moe_fusion.types import TaskType
 from tfs_moe_fusion.utils import (
     configure_logging,
-    make_dummy_batch,
+    make_probe_batch,
     prepare_run,
     resolve_device,
     seed_everything,
@@ -23,7 +23,11 @@ from tfs_moe_fusion.utils import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("configs/default.yaml"))
-    parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Override training.device from the config (for example cpu or cuda:1)",
+    )
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--dry-run", action="store_true")
@@ -38,12 +42,19 @@ def main() -> None:
     config, run_dir = prepare_run(args.config)
     logger = configure_logging(log_file=run_dir / "train.log")
     seed_everything(config.experiment.seed, config.experiment.deterministic)
-    device = resolve_device(args.device)
+    device = resolve_device(args.device or config.training.device)
+    if args.dry_run:
+        config.model.guidance.semantic.enabled = False
+        config.training.losses.strict_targets = False
+        logger.info(
+            "Dry-run uses an engineering probe with semantic weights disabled"
+        )
+
     model = build_model(config).to(device)
 
     if args.dry_run:
         task = TaskType.parse(args.task)
-        batch = make_dummy_batch(config, task).to(device)
+        batch = make_probe_batch(config, task).to(device)
         model.train()
         output = model(batch)
         loss = MultiTaskLossManager(config.training.losses)(

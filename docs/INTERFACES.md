@@ -46,6 +46,14 @@ padded size; the public fused image is cropped to the original height and width.
 `RouterOutput`, spatial gates, optional expert outputs, and diagnostics); it remains
 iterable as `(feature, diagnostics)` for earlier callers.
 
+Training resolves one execution policy per optimizer step. It continuously moves from
+uniform dense mixing to soft routing and then Top-2 before switching to direct sparse
+dispatch. Sparse aggregation writes selected, weighted expert contributions directly
+into `[B,C,H,W]`; it does not construct `[B,E,C,H,W]`. Full expert outputs are retained
+only when `return_expert_outputs=True` is explicitly requested for debugging.
+Run `python tools/benchmark_moe_execution.py --device cuda:0 --batch-size 4` for
+the dense-reference versus sparse training microbenchmark.
+
 The fixed five encoder MoE blocks each contribute a `RouterDiagnostics` value containing
 `[B,E]` logits, normalized probabilities and availability mask; `[B,K]` Top-k
 indices and renormalized weights; `[B,5]` evidence-branch weights; and optional

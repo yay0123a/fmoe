@@ -16,31 +16,25 @@ Implemented contracts:
 - Explicit exhaustive parameter groups, task-specific freezing, phase loss
   multipliers, router temperature schedule, AdamW decay/no-decay splitting,
   warmup/cosine/step/constant schedulers, accumulation and gradient clipping.
-- FP32/FP16/BF16 execution, EMA, optional EWC, DDP initialization/wrapping,
+- FP32/FP16/BF16 execution, EMA, DDP initialization/wrapping,
   gradient and router-collapse diagnostics.
 - Atomic checkpoints with exact optimizer/scheduler/scaler/EMA/task sampler,
-  data cursor, phase/router/EWC and Python/NumPy/Torch/CUDA RNG restoration.
+  data cursor, phase/router and Python/NumPy/Torch/CUDA RNG restoration.
 
-The deterministic fixture validates engineering behavior only and is not a
-scientific dataset. Implement a `FusionDatasetAdapter` yielding the same
-`FusionBatch` contract before research training.
+The production trainer consumes the real SemanticRT adapter. Generated probe
+batches are restricted to CLI plumbing checks and never enter `Trainer`.
 
-Run the compact 20-step acceptance profile:
+Run the asset-independent engineering probe:
 
 ```bash
-python train.py \
-  --config configs/experiments/stage5_training_smoke.yaml \
-  --device cpu \
-  --max-steps 20
+python train.py --config configs/default.yaml --device cpu --dry-run --task vif
 ```
 
-Resume:
+Run one real-data training step after installing the SemanticRT data and local
+SegFormer weights:
 
 ```bash
-python train.py \
-  --config configs/experiments/stage5_training_smoke.yaml \
-  --resume runs/stage5_training_smoke/checkpoints/latest.pt \
-  --max-steps 20
+python train.py --config configs/default.yaml --device auto --max-steps 1
 ```
 
 Stage 6 evaluation metrics, ablations, benchmarks, and paper plots are

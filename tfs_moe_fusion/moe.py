@@ -325,7 +325,12 @@ class SemanticExpert(FunctionalExpert):
             ).to(tensor.dtype)
             gate_logits = gate_logits + self.external_conditioner(maps)
         gate = torch.sigmoid(gate_logits)
-        return ExpertOutput(residual * gate, self.expert_type, _valid(tensor))
+        return ExpertOutput(
+            residual * gate,
+            self.expert_type,
+            _valid(tensor),
+            diagnostics={"gate": gate},
+        )
 
 
 class InfraredSaliencyExpert(FunctionalExpert):
@@ -845,6 +850,29 @@ class MoEOutput:
         yield self.diagnostics
 
 
+@dataclass(frozen=True, slots=True)
+class MoEExecutionPolicy:
+    """Resolved execution semantics shared by every MoE forward in one step."""
+
+    mode: str
+    uniform_to_soft: float = 1.0
+    soft_to_topk: float = 0.0
+    spatial_gate_scale: float = 1.0
+    refresh_routed_fraction: float = 0.5
+    detach_router: bool = False
+    expert_only: bool = False
+    temperature: float | None = None
+    noise_std: float = 0.0
+
+    @property
+    def sparse(self) -> bool:
+        return self.mode == "sparse_batch"
+
+    @classmethod
+    def legacy(cls, sparse: bool) -> MoEExecutionPolicy:
+        return cls("sparse_batch" if sparse else "dense_masked")
+
+
 class FunctionalMoEBlock(nn.Module):
     def __init__(
         self,
@@ -875,6 +903,7 @@ class FunctionalMoEBlock(nn.Module):
         self.sparse_execution = config.sparse_execution
         self.train_execution = config.train_execution
         self.inference_execution = config.inference_execution
+        self.execution_policy: MoEExecutionPolicy | None = None
         self.residual_scale = nn.Parameter(
             torch.full((1, channels, 1, 1), config.residual_scale)
         )
@@ -888,71 +917,60 @@ class FunctionalMoEBlock(nn.Module):
         return_expert_outputs: bool = False,
     ) -> MoEOutput:
         routing = self.router(router_context)
-        if sparse_execution is None:
-            execution = (
-                self.train_execution if self.training else self.inference_execution
-            )
-            execute_sparse = execution == "sparse_batch"
-        else:
-            execute_sparse = sparse_execution
-        residuals: list[Tensor] = []
-        # Training losses supervise expert specialization. Retaining these tensors
-        # only while training avoids the inference-time memory cost.
+        policy = self._resolve_policy(sparse_execution)
+        global_weights, spatial_gates = self._mixture_weights(tensor, routing, policy)
+        mixed_residual = torch.zeros_like(tensor)
         retained_outputs: dict[str, ExpertOutput] | None = (
-            {} if return_expert_outputs or self.training else None
+            {} if return_expert_outputs else None
         )
+        regularizers: dict[str, list[Tensor]] = {}
+        residual_rms: dict[str, Tensor] = {}
         for index, expert in enumerate(self.experts):
-            if not execute_sparse:
-                expert_output = expert(tensor, expert_context)
-                valid = expert_output.valid_samples[:, None, None, None]
-                residuals.append(expert_output.residual * valid)
-                if retained_outputs is not None:
-                    retained_outputs[self.expert_names[index]] = expert_output
-                continue
-
-            sample_indices = torch.nonzero(
-                (routing.topk_indices == index).any(dim=1), as_tuple=False
-            ).flatten()
+            sample_indices = self._expert_indices(tensor, routing, index, policy)
             if sample_indices.numel() == 0:
-                residuals.append(torch.zeros_like(tensor))
                 continue
             selected_tensor = tensor.index_select(0, sample_indices)
             selected_context = self._select_context(expert_context, sample_indices)
             expert_output = expert(selected_tensor, selected_context)
             valid = expert_output.valid_samples[:, None, None, None]
             selected_residual = expert_output.residual * valid
-            full_residual = torch.zeros_like(tensor).index_copy(
-                0, sample_indices, selected_residual
+            residual_rms[self.expert_names[index]] = (
+                selected_residual.detach().float().square().mean().sqrt()
             )
-            residuals.append(full_residual)
+            weights = global_weights.index_select(0, sample_indices)[
+                :, index : index + 1, None, None
+            ]
+            contribution = selected_residual * weights
+            if spatial_gates is not None:
+                gates = spatial_gates.index_select(0, sample_indices)[
+                    :, index : index + 1
+                ]
+                contribution = contribution * gates
+            mixed_residual = mixed_residual.index_add(0, sample_indices, contribution)
+            for name, value in self._expert_regularizers(
+                expert_output, selected_context
+            ).items():
+                regularizers.setdefault(name, []).append(value)
             if retained_outputs is not None:
-                full_valid = torch.zeros(
-                    tensor.shape[0], dtype=torch.bool, device=tensor.device
-                ).index_copy(0, sample_indices, expert_output.valid_samples)
-                retained_outputs[self.expert_names[index]] = ExpertOutput(
-                    full_residual,
-                    expert_output.expert,
-                    full_valid,
-                    diagnostics=expert_output.diagnostics,
+                retained_outputs[self.expert_names[index]] = self._restore_output(
+                    tensor, sample_indices, expert_output
                 )
-        stacked = torch.stack(residuals, dim=1)
-
-        global_weights = tensor.new_zeros(tensor.shape[0], len(self.experts))
-        global_weights.scatter_(1, routing.topk_indices, routing.topk_weights)
-        mixture_weights = global_weights[:, :, None, None, None]
-        if routing.spatial_gates is not None:
-            mixture_weights = mixture_weights * routing.spatial_gates[:, :, None]
-        mixed_residual = (stacked * mixture_weights).sum(dim=1)
         scaled_residual = self.residual_scale * mixed_residual
         output = tensor + scaled_residual
         auxiliary = dict(routing.auxiliary)
-        if retained_outputs:
+        auxiliary["expert_residual_rms"] = residual_rms
+        auxiliary["residual_scale_rms"] = (
+            self.residual_scale.detach().float().square().mean().sqrt()
+        )
+        if regularizers:
+            auxiliary["expert_regularizers"] = {
+                name: torch.stack(values).mean()
+                for name, values in regularizers.items()
+            }
+        if retained_outputs is not None:
             auxiliary["expert_residuals"] = {
                 name: value.residual for name, value in retained_outputs.items()
             }
-            ir_output = retained_outputs.get("infrared_saliency")
-            if ir_output is not None and "saliency" in ir_output.diagnostics:
-                auxiliary["ir_saliency"] = ir_output.diagnostics["saliency"]
         if expert_context.semantic_boundary is not None:
             auxiliary["semantic_boundary"] = expert_context.semantic_boundary
         diagnostics = RouterDiagnostics(
@@ -976,8 +994,129 @@ class FunctionalMoEBlock(nn.Module):
             routing.spatial_gates,
             retained_outputs,
             diagnostics,
-            {"execution": "sparse_batch" if execute_sparse else "dense_masked"},
+            {
+                "execution": policy.mode,
+                "uniform_to_soft": policy.uniform_to_soft,
+                "soft_to_topk": policy.soft_to_topk,
+            },
         )
+
+    def set_execution_policy(self, policy: MoEExecutionPolicy | None) -> None:
+        self.execution_policy = policy
+
+    def _resolve_policy(self, sparse_execution: bool | None) -> MoEExecutionPolicy:
+        if sparse_execution is not None:
+            return MoEExecutionPolicy.legacy(sparse_execution)
+        if self.execution_policy is not None and self.training:
+            return self.execution_policy
+        execution = self.train_execution if self.training else self.inference_execution
+        return MoEExecutionPolicy.legacy(execution == "sparse_batch")
+
+    def _mixture_weights(
+        self,
+        tensor: Tensor,
+        routing: RouterOutput,
+        policy: MoEExecutionPolicy,
+    ) -> tuple[Tensor, Tensor | None]:
+        valid = routing.valid_expert_mask.to(tensor)
+        uniform = valid / valid.sum(1, keepdim=True).clamp_min(1)
+        topk = tensor.new_zeros(tensor.shape[0], len(self.experts))
+        topk.scatter_(1, routing.topk_indices, routing.topk_weights)
+        soft = routing.probabilities.to(tensor)
+
+        if policy.mode == "dense_uniform":
+            weights, gates = uniform, None
+        elif policy.mode == "dense_annealed":
+            beta = min(max(policy.uniform_to_soft, 0.0), 1.0)
+            alpha = min(max(policy.soft_to_topk, 0.0), 1.0)
+            weights = (1 - beta) * uniform + beta * soft
+            weights = (1 - alpha) * weights + alpha * topk
+            gates = routing.spatial_gates
+            if gates is not None and policy.spatial_gate_scale < 1:
+                scale = max(policy.spatial_gate_scale, 0.0)
+                gates = 1 + scale * (gates - 1)
+        elif policy.mode == "expert_refresh":
+            routed = min(max(policy.refresh_routed_fraction, 0.0), 1.0)
+            weights = routed * soft.detach() + (1 - routed) * uniform
+            gates = None
+        else:
+            weights, gates = topk, routing.spatial_gates
+
+        if policy.detach_router:
+            weights = weights.detach()
+            gates = gates.detach() if gates is not None else None
+        return weights, gates
+
+    @staticmethod
+    def _expert_indices(
+        tensor: Tensor,
+        routing: RouterOutput,
+        expert_index: int,
+        policy: MoEExecutionPolicy,
+    ) -> Tensor:
+        if policy.sparse:
+            selected = (routing.topk_indices == expert_index).any(dim=1)
+        else:
+            selected = routing.valid_expert_mask[:, expert_index]
+        return torch.nonzero(selected, as_tuple=False).flatten()
+
+    @staticmethod
+    def _restore_output(
+        tensor: Tensor, indices: Tensor, output: ExpertOutput
+    ) -> ExpertOutput:
+        residual = torch.zeros_like(tensor).index_copy(0, indices, output.residual)
+        valid = torch.zeros(
+            tensor.shape[0], dtype=torch.bool, device=tensor.device
+        ).index_copy(0, indices, output.valid_samples)
+        return ExpertOutput(
+            residual,
+            output.expert,
+            valid,
+            diagnostics=output.diagnostics,
+        )
+
+    @staticmethod
+    def _expert_regularizers(
+        output: ExpertOutput, context: ExpertContext
+    ) -> dict[str, Tensor]:
+        residual = output.residual
+        if output.expert is ExpertType.LOW_FREQUENCY:
+            smooth = functional.avg_pool2d(residual, 5, stride=1, padding=2)
+            return {"frequency/low_leakage": (residual - smooth).abs().mean()}
+        if output.expert is ExpertType.DETAIL:
+            smooth = functional.avg_pool2d(residual, 5, stride=1, padding=2)
+            return {"frequency/detail_leakage": smooth.abs().mean()}
+        if output.expert is ExpertType.SEMANTIC:
+            gate = output.diagnostics.get("gate")
+            boundary = context.semantic_boundary
+            if isinstance(gate, Tensor) and boundary is not None:
+                target = functional.interpolate(
+                    boundary.to(gate),
+                    gate.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                ).clamp(0, 1)
+                return {
+                    "frequency/semantic_boundary": functional.binary_cross_entropy(
+                        gate.clamp(1e-6, 1 - 1e-6), target
+                    )
+                }
+        if output.expert is ExpertType.INFRARED_SALIENCY:
+            saliency = output.diagnostics.get("saliency")
+            infrared = other = None
+            if context.modality_a is ModalityType.INFRARED_GRAY:
+                infrared, other = context.source_a_feature, context.source_b_feature
+            elif context.modality_b is ModalityType.INFRARED_GRAY:
+                infrared, other = context.source_b_feature, context.source_a_feature
+            if isinstance(saliency, Tensor) and infrared is not None:
+                other = torch.zeros_like(infrared) if other is None else other
+                target = (infrared - other).abs().mean(1, keepdim=True)
+                maximum = target.flatten(1).amax(1).clamp_min(1e-6)
+                target = (target / maximum[:, None, None, None]).detach()
+                return {
+                    "infrared/saliency_alignment": functional.l1_loss(saliency, target)
+                }
+        return {}
 
     @staticmethod
     def _select_context(context: ExpertContext, indices: Tensor) -> ExpertContext:

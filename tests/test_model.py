@@ -266,10 +266,14 @@ import torch
 from tfs_moe_fusion.guidance import FrozenSegformerBackend, LightweightFocusHead
 
 ROOT = Path(__file__).resolve().parents[1]
-SEMANTIC_DIR = ROOT / "weights/segformer_b0_citycapes"
+SEMANTIC_DIR = ROOT / "weights/segformer_b0_cityscapes"
 
 
+@pytest.mark.integration
 def test_local_segformer_checkpoint_loads_strictly_and_is_frozen() -> None:
+    required = ("config.json", "preprocessor_config.json", "pytorch_model.bin")
+    if not all((SEMANTIC_DIR / name).is_file() for name in required):
+        pytest.skip("local SegFormer integration assets are not installed")
     backend = FrozenSegformerBackend(SEMANTIC_DIR, input_size=64, expected_classes=19)
     backend.train()
     assert not backend.training and not backend.model.training
@@ -415,14 +419,153 @@ def test_dense_and_sparse_execution_are_numerically_equivalent() -> None:
     )
 
 
+def test_dense_topk_and_sparse_execution_have_equivalent_gradients() -> None:
+    torch.manual_seed(17)
+    config = MoEConfig(
+        experts=EXPERTS,
+        top_k=2,
+        router_hidden_channels=16,
+        expert_expansion=1,
+        noisy_topk=False,
+    )
+    block = FunctionalMoEBlock(8, config, "s2").eval()
+
+    def gradients(sparse: bool):
+        block.zero_grad(set_to_none=True)
+        feature = torch.randn(2, 8, 9, 11, requires_grad=True)
+        context = _router_context(feature, has_ir=True)
+        expert_context = _expert_context(feature, has_ir=True)
+        output = block(
+            feature, context, expert_context, sparse_execution=sparse
+        ).feature
+        output.square().mean().backward()
+        parameter_gradients = {
+            name: (
+                parameter.grad.detach().clone()
+                if parameter.grad is not None
+                else torch.zeros_like(parameter)
+            )
+            for name, parameter in block.named_parameters()
+        }
+        return feature.grad.detach().clone(), parameter_gradients
+
+    torch.manual_seed(29)
+    dense_input, dense_parameters = gradients(False)
+    torch.manual_seed(29)
+    sparse_input, sparse_parameters = gradients(True)
+    torch.testing.assert_close(sparse_input, dense_input, rtol=1e-5, atol=1e-7)
+    assert dense_parameters.keys() == sparse_parameters.keys()
+    for name in dense_parameters:
+        torch.testing.assert_close(
+            sparse_parameters[name], dense_parameters[name], rtol=1e-5, atol=1e-7
+        )
+
+
+def test_sparse_execution_never_calls_an_unselected_expert() -> None:
+    torch.manual_seed(31)
+    config = MoEConfig(
+        experts=EXPERTS,
+        top_k=2,
+        router_hidden_channels=16,
+        expert_expansion=1,
+    )
+    block = FunctionalMoEBlock(8, config, "s2").eval()
+    calls = [0] * len(EXPERTS)
+    handles = [
+        expert.register_forward_hook(
+            lambda _module, _inputs, _output, index=index: calls.__setitem__(
+                index, calls[index] + 1
+            )
+        )
+        for index, expert in enumerate(block.experts)
+    ]
+    feature = torch.randn(1, 8, 9, 11)
+    with torch.no_grad():
+        output = block(
+            feature,
+            _router_context(feature, has_ir=True),
+            _expert_context(feature, has_ir=True),
+            sparse_execution=True,
+        )
+    for handle in handles:
+        handle.remove()
+    selected = set(output.router.topk_indices.flatten().tolist())
+    assert sum(calls) == len(selected) == config.top_k
+    assert all(calls[index] == int(index in selected) for index in range(len(calls)))
+
+
+def test_annealed_topk_boundary_matches_sparse_without_retaining_residuals() -> None:
+    from tfs_moe_fusion.moe import MoEExecutionPolicy
+
+    torch.manual_seed(37)
+    config = MoEConfig(
+        experts=EXPERTS,
+        top_k=2,
+        router_hidden_channels=16,
+        expert_expansion=1,
+        noisy_topk=False,
+    )
+    block = FunctionalMoEBlock(8, config, "s2").train()
+    feature = torch.randn(2, 8, 9, 11)
+    router_context = _router_context(feature, has_ir=True)
+    expert_context = _expert_context(feature, has_ir=True)
+    block.set_execution_policy(
+        MoEExecutionPolicy("dense_annealed", uniform_to_soft=1.0, soft_to_topk=1.0)
+    )
+    dense = block(feature, router_context, expert_context)
+    block.set_execution_policy(MoEExecutionPolicy("sparse_batch"))
+    sparse = block(feature, router_context, expert_context)
+    torch.testing.assert_close(sparse.feature, dense.feature, rtol=1e-6, atol=1e-7)
+    assert sparse.expert_outputs is None
+    assert "expert_residuals" not in sparse.diagnostics.auxiliary
+    assert "expert_regularizers" in sparse.diagnostics.auxiliary
+
+
+def test_uniform_warmup_updates_every_expert_but_not_either_router() -> None:
+    from tfs_moe_fusion.moe import MoEExecutionPolicy
+
+    torch.manual_seed(41)
+    config = MoEConfig(
+        experts=EXPERTS,
+        top_k=2,
+        router_hidden_channels=16,
+        expert_expansion=1,
+        noisy_topk=False,
+    )
+    block = FunctionalMoEBlock(8, config, "s2").train()
+    block.set_execution_policy(
+        MoEExecutionPolicy(
+            "dense_uniform",
+            uniform_to_soft=0.0,
+            spatial_gate_scale=0.0,
+            detach_router=True,
+        )
+    )
+    feature = torch.randn(2, 8, 9, 11)
+    output = block(
+        feature,
+        _router_context(feature, has_ir=True),
+        _expert_context(feature, has_ir=True),
+    )
+    output.feature.square().mean().backward()
+    assert all(
+        any(
+            parameter.grad is not None and torch.count_nonzero(parameter.grad)
+            for parameter in expert.parameters()
+        )
+        for expert in block.experts
+    )
+    assert all(parameter.grad is None for parameter in block.router.parameters())
+
+
 from pathlib import Path
 
 import pytest
 import torch
 
 from tfs_moe_fusion.config import load_config
-from tfs_moe_fusion.data import DeterministicDummyFusionDataset, collate_fusion_samples
 from tfs_moe_fusion.model import build_model
+from tfs_moe_fusion.utils import make_probe_batch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -436,10 +579,8 @@ def _config():
     config.model.moe.expert_expansion = 1
     config.model.guidance.focus.hidden_channels = 8
     config.model.guidance.semantic.input_size = 32
+    config.model.guidance.semantic.enabled = False
     config.model.feedback.guide_channels = 8
-    config.data.height = 17
-    config.data.width = 19
-    config.data.dummy_length = 6
     config.training.batch_size = 1
     config.training.ema.enabled = False
     return config
@@ -447,9 +588,9 @@ def _config():
 
 @pytest.mark.parametrize("task", list(TaskType))
 def test_final_closed_loop_contract_for_every_task(task: TaskType) -> None:
-    data = DeterministicDummyFusionDataset(task, length=1, height=33, width=35, seed=23)
-    batch = collate_fusion_samples([data[0]])
-    model = build_model(_config()).eval()
+    config = _config()
+    batch = make_probe_batch(config, task, spatial_size=(33, 35))
+    model = build_model(config).eval()
     with torch.no_grad():
         output = model(batch)
     assert output.fused.shape == output.coarse.shape == (1, 3, 33, 35)
@@ -475,22 +616,22 @@ def test_final_closed_loop_contract_for_every_task(task: TaskType) -> None:
         "feedback.s2.moe0.input",
     ]
     assert output.auxiliary is not None
-    assert output.auxiliary.semantic_probabilities.shape == (1, 19, 33, 35)
-    assert output.auxiliary.semantic_uncertainty.shape == (1, 1, 33, 35)
-    assert output.auxiliary.semantic_boundary.shape == (1, 1, 33, 35)
+    assert output.auxiliary.semantic_probabilities is None
+    assert output.auxiliary.semantic_uncertainty is None
+    assert output.auxiliary.semantic_boundary is None
     assert output.auxiliary.focus_reliability.shape == (1, 2, 33, 35)
     assert output.auxiliary.focus_selection.shape == (1, 2, 33, 35)
     assert output.auxiliary.focus_confidence.shape == (1, 1, 33, 35)
-    assert output.debug["semantic_available"] is True
+    assert output.debug["semantic_available"] is False
     assert output.aux["final_preclamp"].shape == output.fused.shape
     assert output.aux["clamp_low_ratio"].ndim == 0
     assert output.aux["clamp_high_ratio"].ndim == 0
 
 
-def test_final_backward_keeps_semantic_model_frozen() -> None:
-    data = DeterministicDummyFusionDataset(TaskType.MFIF, length=1, height=33, width=35)
-    batch = collate_fusion_samples([data[0]])
-    model = build_model(_config())
+def test_final_backward_without_external_semantic_assets() -> None:
+    config = _config()
+    batch = make_probe_batch(config, TaskType.MFIF, spatial_size=(33, 35))
+    model = build_model(config)
     output = model(batch)
     output.fused.mean().backward()
     trainable_gradients = [
@@ -500,10 +641,6 @@ def test_final_backward_keeps_semantic_model_frozen() -> None:
     ]
     assert trainable_gradients
     assert all(torch.isfinite(value).all() for value in trainable_gradients)
-    assert all(
-        parameter.grad is None
-        for parameter in model.feedback.semantic_backend.parameters()
-    )
 
 
 def test_initial_and_feedback_moe_parameters_are_independent() -> None:
@@ -522,8 +659,8 @@ def test_initial_and_feedback_moe_parameters_are_independent() -> None:
 
 
 def test_final_source_order_and_supervision_do_not_change_inference() -> None:
-    data = DeterministicDummyFusionDataset(TaskType.MFIF, length=1, height=31, width=37)
-    batch = collate_fusion_samples([data[0]])
+    config = _config()
+    batch = make_probe_batch(config, TaskType.MFIF, spatial_size=(31, 37))
     swapped = FusionBatch(
         source_a=batch.source_b,
         source_b=batch.source_a,
@@ -531,7 +668,7 @@ def test_final_source_order_and_supervision_do_not_change_inference() -> None:
         sample_ids=batch.sample_ids,
         focus_target=torch.rand_like(batch.focus_target),
     )
-    model = build_model(_config()).eval()
+    model = build_model(config).eval()
     with torch.no_grad():
         regular = model(batch)
         reversed_sources = model(swapped)
@@ -549,10 +686,9 @@ def test_final_source_order_and_supervision_do_not_change_inference() -> None:
 def test_disable_refinement_decoder_is_a_true_coarse_only_ablation() -> None:
     config = _config()
     config.model.ablation.disable_refinement_decoder = True
-    data = DeterministicDummyFusionDataset(TaskType.VIF, length=1, height=31, width=37)
     model = build_model(config).eval()
     with torch.no_grad():
-        output = model(collate_fusion_samples([data[0]]))
+        output = model(make_probe_batch(config, TaskType.VIF, spatial_size=(31, 37)))
     torch.testing.assert_close(output.fused, output.coarse)
     assert torch.count_nonzero(output.refinement) == 0
     assert output.debug["refinement_decoder_disabled"] is True
@@ -561,11 +697,11 @@ def test_disable_refinement_decoder_is_a_true_coarse_only_ablation() -> None:
 @pytest.mark.parametrize("task", list(TaskType))
 def test_null_semantic_backend_runs_every_task(task: TaskType) -> None:
     config = _config()
+    config.model.guidance.semantic.enabled = True
     config.model.guidance.semantic.backend = None
-    data = DeterministicDummyFusionDataset(task, length=1, height=31, width=37)
     model = build_model(config).eval()
     with torch.no_grad():
-        output = model(collate_fusion_samples([data[0]]))
+        output = model(make_probe_batch(config, task, spatial_size=(31, 37)))
     assert output.auxiliary is not None
     assert output.auxiliary.semantic_probabilities is None
     assert output.debug["semantic_available"] is False

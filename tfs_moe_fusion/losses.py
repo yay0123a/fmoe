@@ -175,7 +175,19 @@ def frequency_specialization(
     low_terms: list[Tensor] = []
     detail_terms: list[Tensor] = []
     semantic_terms: list[Tensor] = []
+    infrared_terms: list[Tensor] = []
     for item in diagnostics:
+        regularizers = item.auxiliary.get("expert_regularizers", {})
+        if regularizers:
+            if (value := regularizers.get("frequency/low_leakage")) is not None:
+                low_terms.append(value)
+            if (value := regularizers.get("frequency/detail_leakage")) is not None:
+                detail_terms.append(value)
+            if (value := regularizers.get("frequency/semantic_boundary")) is not None:
+                semantic_terms.append(value)
+            if (value := regularizers.get("infrared/saliency_alignment")) is not None:
+                infrared_terms.append(value)
+            continue
         residuals = item.auxiliary.get("expert_residuals", {})
         low, detail, semantic = (
             residuals.get("low_frequency"),
@@ -203,6 +215,7 @@ def frequency_specialization(
         "frequency/low_leakage": mean(low_terms),
         "frequency/detail_leakage": mean(detail_terms),
         "frequency/semantic_boundary": mean(semantic_terms),
+        "infrared/saliency_alignment": mean(infrared_terms),
     }
 
 
@@ -247,13 +260,15 @@ def moe_balance_loss(
         valid = item.valid_expert_mask.float()
         target = valid.sum(0) / valid.sum().clamp_min(1)
         importance = item.probabilities.mean(0)
-        selected = (
+        hard_load = (
             torch.nn.functional.one_hot(item.topk_indices, item.probabilities.shape[1])
             .float()
             .mean((0, 1))
+            .detach()
         )
+        effective_experts = (target > 0).sum().to(importance)
         importance_losses.append((importance - target).square().sum())
-        load_losses.append((selected - target).square().sum())
+        load_losses.append(effective_experts * (importance * hard_load).sum())
         entropies.append(entropy(item.probabilities))
     return (
         torch.stack(importance_losses).mean(),
@@ -472,30 +487,53 @@ class MultiTaskLossManager(nn.Module):
 
     def _shared(self, context, components, weights, skipped) -> None:
         output = context.output
-        if self.config.frequency.enabled and output.router_diagnostics:
-            components.update(frequency_specialization(output.router_diagnostics))
-            weights.update(
-                {
-                    "frequency/low_leakage": self.config.frequency.weight
-                    * self.config.frequency.low_leakage,
-                    "frequency/detail_leakage": self.config.frequency.weight
-                    * self.config.frequency.detail_leakage,
-                    "frequency/semantic_boundary": self.config.frequency.weight
-                    * self.config.frequency.semantic_boundary,
-                }
-            )
+        if output.router_diagnostics and (
+            self.config.frequency.enabled or self.config.infrared.enabled
+        ):
+            specialization = frequency_specialization(output.router_diagnostics)
+            if self.config.frequency.enabled:
+                for name in (
+                    "frequency/low_leakage",
+                    "frequency/detail_leakage",
+                    "frequency/semantic_boundary",
+                ):
+                    components[name] = specialization[name]
+                weights.update(
+                    {
+                        "frequency/low_leakage": self.config.frequency.weight
+                        * self.config.frequency.low_leakage,
+                        "frequency/detail_leakage": self.config.frequency.weight
+                        * self.config.frequency.detail_leakage,
+                        "frequency/semantic_boundary": self.config.frequency.weight
+                        * self.config.frequency.semantic_boundary,
+                    }
+                )
+            if self.config.infrared.enabled:
+                components["infrared/saliency_alignment"] = specialization[
+                    "infrared/saliency_alignment"
+                ]
+                weights["infrared/saliency_alignment"] = (
+                    self.config.infrared.weight
+                    * self.config.infrared.saliency_alignment
+                )
         elif self.config.frequency.enabled:
             skipped["frequency"] = "No router diagnostics"
         if self.config.moe.enabled and output.router_diagnostics:
-            importance, load, router_entropy = moe_balance_loss(
+            soft_balance, switch_balance, router_entropy = moe_balance_loss(
                 output.router_diagnostics
             )
-            components.update({"moe/importance": importance, "moe/hard_load": load})
+            components.update(
+                {
+                    "moe/soft_balance": soft_balance,
+                    "moe/switch_balance": switch_balance,
+                }
+            )
             weights.update(
                 {
-                    "moe/importance": self.config.moe.weight,
-                    "moe/hard_load": self.config.moe.weight
-                    * self.config.moe.hard_load_weight,
+                    "moe/soft_balance": self.config.moe.weight
+                    * self.config.moe.soft_balance_weight,
+                    "moe/switch_balance": self.config.moe.weight
+                    * self.config.moe.switch_balance_weight,
                 }
             )
             if self.config.moe.entropy_enabled:

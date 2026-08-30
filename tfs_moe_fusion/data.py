@@ -9,10 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import torch
 from PIL import Image
+from torch import Tensor
 from torch.utils.data import Dataset
 
-from tfs_moe_fusion.types import FusionSample, TaskType
+from tfs_moe_fusion.types import FusionSample, ModalityType, TaskType
 
 
 class FusionDatasetAdapter(Dataset[FusionSample], ABC):
@@ -25,87 +27,6 @@ class FusionDatasetAdapter(Dataset[FusionSample], ABC):
     @abstractmethod
     def __getitem__(self, index: int) -> FusionSample:
         raise NotImplementedError
-
-
-import torch
-from torch import Tensor
-
-from tfs_moe_fusion.types import FusionSample, ModalityType
-
-
-class DeterministicDummyFusionDataset(FusionDatasetAdapter):
-    """Generate reproducible tensors solely for infrastructure tests."""
-
-    def __init__(
-        self,
-        task: TaskType | str,
-        length: int = 16,
-        height: int = 128,
-        width: int = 128,
-        seed: int = 3407,
-    ) -> None:
-        self.task = TaskType.parse(task)
-        if length <= 0 or height <= 0 or width <= 0:
-            raise ValueError("length, height, and width must be positive")
-        self.length = length
-        self.height = height
-        self.width = width
-        self.seed = seed
-
-    def __len__(self) -> int:
-        return self.length
-
-    def __getitem__(self, index: int) -> FusionSample:
-        if not 0 <= index < self.length:
-            raise IndexError(index)
-        generator = torch.Generator().manual_seed(
-            self.seed + self.task.index * 1_000_003 + index
-        )
-        base = torch.rand((3, self.height, self.width), generator=generator)
-
-        if self.task is TaskType.MFIF:
-            mask = self._focus_mask()
-            shifted = torch.roll(base, shifts=1, dims=-1)
-            source_a = mask * base + (1.0 - mask) * shifted
-            source_b = (1.0 - mask) * base + mask * shifted
-            return FusionSample(
-                source_a=source_a,
-                modality_a=ModalityType.GENERIC_RGB,
-                source_b=source_b,
-                modality_b=ModalityType.GENERIC_RGB,
-                task=self.task,
-                sample_id=f"dummy-mfif-{index:05d}",
-                target=base,
-                focus_target=mask,
-                metadata={"fixture": True},
-            )
-
-        infrared = base.mean(dim=0, keepdim=True)
-        infrared = (
-            0.8 * infrared + 0.2 * torch.rand(infrared.shape, generator=generator)
-        ).clamp(0.0, 1.0)
-        target = 0.5 * base + 0.5 * infrared.expand_as(base)
-        segmentation = None
-        if self.task is TaskType.SEG:
-            segmentation = (infrared[0] > 0.5).to(torch.long)
-        return FusionSample(
-            source_a=base,
-            modality_a=ModalityType.VISIBLE_RGB,
-            source_b=infrared,
-            modality_b=ModalityType.INFRARED_GRAY,
-            task=self.task,
-            sample_id=f"dummy-{self.task.value}-{index:05d}",
-            target=target,
-            segmentation_target=segmentation,
-            metadata={"fixture": True},
-        )
-
-    def _focus_mask(self) -> Tensor:
-        split = max(1, self.width // 2)
-        mask = torch.zeros((1, self.height, self.width))
-        mask[..., :split] = 1.0
-        return mask
-
 
 SEMANTIC_RT_TO_CITYSCAPES = {
     0: 255,  # background

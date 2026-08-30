@@ -13,7 +13,7 @@ from tfs_moe_fusion.config import load_config
 from tfs_moe_fusion.model import build_model
 from tfs_moe_fusion.trainer import load_checkpoint
 from tfs_moe_fusion.types import FusionBatch, ModalityType, SourceBatch, TaskType
-from tfs_moe_fusion.utils import configure_logging, make_dummy_batch, resolve_device
+from tfs_moe_fusion.utils import configure_logging, make_probe_batch, resolve_device
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
@@ -30,7 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--modality-a", choices=[item.value for item in ModalityType])
     parser.add_argument("--modality-b", choices=[item.value for item in ModalityType])
-    parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Override training.device from the config (for example cpu or cuda:1)",
+    )
     parser.add_argument("--save-coarse", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -39,8 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     config = load_config(args.config)
-    device = resolve_device(args.device)
+    device = resolve_device(args.device or config.training.device)
     logger = configure_logging()
+    if args.dry_run:
+        config.model.guidance.semantic.enabled = False
+        logger.info(
+            "Dry-run uses an engineering probe with semantic weights disabled"
+        )
     model = build_model(config).to(device).eval()
 
     if args.checkpoint is not None:
@@ -53,7 +62,7 @@ def main() -> None:
 
     task = TaskType.parse(args.task)
     if args.dry_run:
-        batch = make_dummy_batch(config, task, 1).to(device)
+        batch = make_probe_batch(config, task).to(device)
         with torch.no_grad():
             output = model(batch)
         logger.info(

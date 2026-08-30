@@ -70,7 +70,7 @@ class MoEConfig:
     )
     top_k: int = 2
     sparse_execution: bool = True
-    train_execution: str = "dense_masked"
+    train_execution: str = "sparse_batch"
     inference_execution: str = "sparse_batch"
     spatial_gating: bool = True
     router_branches: list[str] = field(
@@ -115,7 +115,7 @@ class SemanticGuidanceConfig:
     backend: str | None = "segformer_b0_local"
     frozen: bool = True
     predicted_guidance_only: bool = True
-    model_dir: str = "weights/semantic/segFormer_B0_citycapes"
+    model_dir: str = "weights/segformer_b0_cityscapes"
     input_size: int = 256
     num_classes: int = 19
     strict_loading: bool = True
@@ -177,15 +177,12 @@ class ModelConfig:
 
 @dataclass(slots=True)
 class DataConfig:
-    dataset: str = "unconfigured"
-    height: int = 128
-    width: int = 128
-    dummy_length: int = 16
+    dataset: str = "semantic_rt"
     num_workers: int = 0
     pin_memory: bool = False
-    root: str = ""
-    mfif_root: str = ""
-    manifest: str = ""
+    root: str = "data/semantic_rt"
+    mfif_root: str = "data/mfif/semantic_rt"
+    manifest: str = "data/splits/semantic_rt_test_uniform_2000_seed3407.txt"
     crop_size: int = 256
     horizontal_flip_probability: float = 0.5
     rotation_degrees: float = 10.0
@@ -225,16 +222,6 @@ class TaskSamplingConfig:
 class EMAConfig:
     enabled: bool = True
     decay: float = 0.999
-
-
-@dataclass(slots=True)
-class EWCConfig:
-    enabled: bool = False
-    weight: float = 0.0
-    groups: list[str] = field(
-        default_factory=lambda: ["shared_backbone", "common_experts"]
-    )
-    fisher_batches: int = 100
 
 
 @dataclass(slots=True)
@@ -289,7 +276,9 @@ class FrequencyLossConfig:
 class MoEBalanceLossConfig:
     enabled: bool = True
     weight: float = 0.01
-    hard_load_weight: float = 1.0
+    soft_balance_weight: float = 1.0
+    switch_balance_weight: float = 0.1
+    hard_load_weight: float | None = None
     entropy_enabled: bool = False
     entropy_weight: float = 0.0
     entropy_target: float = 1.0
@@ -309,6 +298,7 @@ class InfraredPreservationLossConfig:
     enabled: bool = True
     weight: float = 0.1
     detach_saliency: bool = True
+    saliency_alignment: float = 0.1
 
 
 @dataclass(slots=True)
@@ -364,10 +354,10 @@ class TrainingPhaseConfig:
 
 def _default_training_phases() -> list[TrainingPhaseConfig]:
     return [
-        TrainingPhaseConfig("stabilization", 0, 5),
-        TrainingPhaseConfig("auxiliary_alignment", 5, 15),
-        TrainingPhaseConfig("joint", 15, 90),
-        TrainingPhaseConfig("routing_finetune", 90, 100),
+        TrainingPhaseConfig("stabilization", 0, 6),
+        TrainingPhaseConfig("frequency_alignment", 6, 12),
+        TrainingPhaseConfig("joint", 12, 44),
+        TrainingPhaseConfig("routing_finetune", 44, 50),
     ]
 
 
@@ -382,6 +372,56 @@ class RouterTemperatureScheduleConfig:
     end: float = 0.7
     schedule: str = "cosine"
     minimum: float = 0.5
+
+
+@dataclass(slots=True)
+class MoEWarmupConfig:
+    uniform_steps: int = 250
+    uniform_to_soft_end: int = 750
+    soft_to_topk_end: int = 1500
+
+
+@dataclass(slots=True)
+class MoERefreshConfig:
+    interval: int = 200
+    routed_fraction: float = 0.5
+    expert_only: bool = True
+
+
+@dataclass(slots=True)
+class MoERoutingScheduleConfig:
+    initial_temperature: float = 1.5
+    sparse_start_temperature: float = 1.0
+    final_temperature: float = 0.7
+    final_step: int = 7500
+    initial_noise_std: float = 0.05
+    noise_end_step: int = 7500
+
+
+@dataclass(slots=True)
+class MoERouterMonitorConfig:
+    ema_decay: float = 0.95
+    starvation_threshold: float = 0.02
+    overload_threshold: float = 0.80
+    patience_steps: int = 500
+
+
+@dataclass(slots=True)
+class MoERecoveryConfig:
+    steps: int = 200
+    temperature_floor: float = 1.0
+    noise_std: float = 0.03
+    refresh_interval: int = 50
+
+
+@dataclass(slots=True)
+class MoEExecutionScheduleConfig:
+    enabled: bool = True
+    warmup: MoEWarmupConfig = field(default_factory=MoEWarmupConfig)
+    refresh: MoERefreshConfig = field(default_factory=MoERefreshConfig)
+    routing: MoERoutingScheduleConfig = field(default_factory=MoERoutingScheduleConfig)
+    monitor: MoERouterMonitorConfig = field(default_factory=MoERouterMonitorConfig)
+    recovery: MoERecoveryConfig = field(default_factory=MoERecoveryConfig)
 
 
 @dataclass(slots=True)
@@ -409,16 +449,17 @@ class DistributedConfig:
 
 @dataclass(slots=True)
 class TrainingConfig:
-    epochs: int = 100
-    steps_per_epoch: int = 1000
+    device: str = "cuda:0"
+    epochs: int = 50
+    steps_per_epoch: int = 750
     max_steps: int | None = None
-    batch_size: int = 4
+    batch_size: int = 2
     precision: str = "fp32"
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     task_sampling: TaskSamplingConfig = field(default_factory=TaskSamplingConfig)
     gradient_strategy: str = "alternating"
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 2
     gradient_clip: GradientClipConfig = field(default_factory=GradientClipConfig)
     task_update_policy: TaskUpdatePolicyConfig = field(
         default_factory=TaskUpdatePolicyConfig
@@ -429,12 +470,14 @@ class TrainingConfig:
     router_temperature: RouterTemperatureScheduleConfig = field(
         default_factory=RouterTemperatureScheduleConfig
     )
+    moe_execution: MoEExecutionScheduleConfig = field(
+        default_factory=MoEExecutionScheduleConfig
+    )
     diagnostics: TrainingDiagnosticsConfig = field(
         default_factory=TrainingDiagnosticsConfig
     )
     log_every_steps: int = 10
     ema: EMAConfig = field(default_factory=EMAConfig)
-    ewc: EWCConfig = field(default_factory=EWCConfig)
     losses: LossConfig = field(default_factory=LossConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     distributed: DistributedConfig = field(default_factory=DistributedConfig)
@@ -635,18 +678,8 @@ class ProjectConfig:
                 )
 
         data = self.data
-        if data.dataset not in {
-            "unconfigured",
-            "deterministic_dummy",
-            "semantic_rt",
-        }:
-            raise ConfigurationError(
-                "data.dataset must be deterministic_dummy or semantic_rt"
-            )
-        if data.height <= 0 or data.width <= 0:
-            raise ConfigurationError("data height and width must be positive")
-        if data.dummy_length <= 0:
-            raise ConfigurationError("data.dummy_length must be positive")
+        if data.dataset != "semantic_rt":
+            raise ConfigurationError("data.dataset must be semantic_rt")
         if data.num_workers < 0:
             raise ConfigurationError("data.num_workers cannot be negative")
         if data.crop_size <= 0:
@@ -674,6 +707,13 @@ class ProjectConfig:
         if self.training.epochs <= 0 or self.training.batch_size <= 0:
             raise ConfigurationError("training epochs and batch_size must be positive")
         training = self.training
+        if training.device not in {"auto", "cpu", "cuda"} and not (
+            training.device.startswith("cuda:")
+            and training.device.removeprefix("cuda:").isdigit()
+        ):
+            raise ConfigurationError(
+                "training.device must be auto, cpu, cuda, or cuda:<index>"
+            )
         if training.steps_per_epoch <= 0:
             raise ConfigurationError("training.steps_per_epoch must be positive")
         if training.max_steps is not None and training.max_steps <= 0:
@@ -777,6 +817,52 @@ class ProjectConfig:
             raise ConfigurationError("router temperature schedule is invalid")
         if min(temperature.start, temperature.end, temperature.minimum) <= 0:
             raise ConfigurationError("router temperatures must be positive")
+        execution = training.moe_execution
+        warmup = execution.warmup
+        if not (
+            0
+            <= warmup.uniform_steps
+            <= warmup.uniform_to_soft_end
+            <= warmup.soft_to_topk_end
+        ):
+            raise ConfigurationError(
+                "MoE warmup steps must satisfy 0 <= uniform <= soft <= top-k"
+            )
+        if execution.refresh.interval <= 0 or not (
+            0.0 <= execution.refresh.routed_fraction <= 1.0
+        ):
+            raise ConfigurationError("MoE refresh interval/routed_fraction are invalid")
+        routing = execution.routing
+        if (
+            min(
+                routing.initial_temperature,
+                routing.sparse_start_temperature,
+                routing.final_temperature,
+            )
+            <= 0
+            or routing.final_step < warmup.soft_to_topk_end
+        ):
+            raise ConfigurationError("MoE routing temperatures/final_step are invalid")
+        if (
+            routing.initial_noise_std < 0
+            or routing.noise_end_step < warmup.soft_to_topk_end
+        ):
+            raise ConfigurationError("MoE routing noise schedule is invalid")
+        monitor = execution.monitor
+        if not 0.0 < monitor.ema_decay < 1.0 or not (
+            0.0 <= monitor.starvation_threshold < monitor.overload_threshold <= 1.0
+        ):
+            raise ConfigurationError("MoE router monitor thresholds are invalid")
+        if monitor.patience_steps <= 0:
+            raise ConfigurationError("MoE monitor patience_steps must be positive")
+        recovery = execution.recovery
+        if (
+            recovery.steps <= 0
+            or recovery.temperature_floor <= 0
+            or recovery.noise_std < 0
+            or recovery.refresh_interval <= 0
+        ):
+            raise ConfigurationError("MoE recovery settings are invalid")
         if (
             training.diagnostics.interval <= 0
             or training.diagnostics.collapse_patience <= 0
@@ -786,10 +872,6 @@ class ProjectConfig:
             raise ConfigurationError("router collapse threshold must be in (0, 1]")
         if not 0.0 < self.training.ema.decay < 1.0:
             raise ConfigurationError("training.ema.decay must be between 0 and 1")
-        if training.ewc.weight < 0 or training.ewc.fisher_batches <= 0:
-            raise ConfigurationError("EWC weight/fisher_batches are invalid")
-        if not set(training.ewc.groups) <= legal_groups:
-            raise ConfigurationError("EWC contains an unknown parameter group")
         if (
             training.checkpoint.every_epochs <= 0
             or training.checkpoint.every_steps <= 0
@@ -799,6 +881,28 @@ class ProjectConfig:
             raise ConfigurationError("checkpoint.keep_last must be positive")
         if training.losses.focus.selection < 0 or training.losses.focus.boundary < 0:
             raise ConfigurationError("Focus loss weights cannot be negative")
+        balance = training.losses.moe
+        if balance.hard_load_weight is not None:
+            import warnings
+
+            warnings.warn(
+                "losses.moe.hard_load_weight is deprecated; use switch_balance_weight",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            balance.switch_balance_weight = balance.hard_load_weight
+        if (
+            min(
+                balance.weight,
+                balance.soft_balance_weight,
+                balance.switch_balance_weight,
+                balance.entropy_weight,
+            )
+            < 0
+        ):
+            raise ConfigurationError("MoE balance loss weights cannot be negative")
+        if training.losses.infrared.saliency_alignment < 0:
+            raise ConfigurationError("infrared.saliency_alignment cannot be negative")
         semantic_loss = training.losses.semantic
         if (
             semantic_loss.class_weights is not None

@@ -149,11 +149,12 @@ def seed_everything(seed: int, deterministic: bool = True) -> None:
 
 
 from tfs_moe_fusion.config import ProjectConfig, load_config, save_resolved_config
-from tfs_moe_fusion.data import (
-    DeterministicDummyFusionDataset,
-    collate_fusion_samples,
+from tfs_moe_fusion.types import (
+    FusionBatch,
+    ModalityType,
+    SourceBatch,
+    TaskType,
 )
-from tfs_moe_fusion.types import FusionBatch, TaskType
 
 
 def prepare_run(config_path: str | Path) -> tuple[ProjectConfig, Path]:
@@ -164,18 +165,47 @@ def prepare_run(config_path: str | Path) -> tuple[ProjectConfig, Path]:
     return config, run_dir
 
 
-def make_dummy_batch(
-    config: ProjectConfig, task: TaskType, batch_size: int | None = None
+def make_probe_batch(
+    config: ProjectConfig,
+    task: TaskType,
+    batch_size: int = 1,
+    spatial_size: tuple[int, int] = (32, 32),
 ) -> FusionBatch:
-    size = batch_size or config.training.batch_size
-    dataset = DeterministicDummyFusionDataset(
-        task=task,
-        length=max(size, config.data.dummy_length),
-        height=config.data.height,
-        width=config.data.width,
-        seed=config.experiment.seed,
+    """Create one synthetic batch for CLI plumbing checks, never for training."""
+
+    if batch_size <= 0 or min(spatial_size) <= 0:
+        raise ValueError("Probe batch and spatial dimensions must be positive")
+    generator = torch.Generator().manual_seed(config.experiment.seed + task.index)
+    height, width = spatial_size
+    source_a = torch.rand((batch_size, 3, height, width), generator=generator)
+    sample_ids = tuple(f"probe-{task.value}-{index}" for index in range(batch_size))
+    metadata = tuple({"engineering_probe": True} for _ in range(batch_size))
+
+    if task is TaskType.MFIF:
+        source_b = torch.roll(source_a, shifts=1, dims=-1)
+        focus = torch.zeros((batch_size, 1, height, width))
+        focus[..., : max(1, width // 2)] = 1.0
+        return FusionBatch(
+            SourceBatch(source_a, ModalityType.GENERIC_RGB),
+            SourceBatch(source_b, ModalityType.GENERIC_RGB),
+            task,
+            sample_ids,
+            target=(source_a + source_b) * 0.5,
+            focus_target=focus,
+            metadata=metadata,
+        )
+
+    infrared = source_a.mean(dim=1, keepdim=True)
+    segmentation = (infrared[:, 0] > 0.5).long() if task is TaskType.SEG else None
+    return FusionBatch(
+        SourceBatch(source_a, ModalityType.VISIBLE_RGB),
+        SourceBatch(infrared, ModalityType.INFRARED_GRAY),
+        task,
+        sample_ids,
+        target=(source_a + infrared.expand_as(source_a)) * 0.5,
+        segmentation_target=segmentation,
+        metadata=metadata,
     )
-    return collate_fusion_samples([dataset[index] for index in range(size)])
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -184,4 +214,13 @@ def resolve_device(requested: str) -> torch.device:
     device = torch.device(requested)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
+    if (
+        device.type == "cuda"
+        and device.index is not None
+        and device.index >= torch.cuda.device_count()
+    ):
+        raise RuntimeError(
+            f"CUDA device {device.index} was requested, but only "
+            f"{torch.cuda.device_count()} device(s) are visible"
+        )
     return device

@@ -1,6 +1,6 @@
 schema_version: 1
 experiment:
-  name: tfs_moe_fusion_full_training
+  name: semantic_rt_test_uniform_2000_single_gpu
   seed: 3407
   deterministic: true
   output_dir: runs
@@ -64,7 +64,7 @@ model:
     - infrared_saliency
     top_k: 2
     sparse_execution: true
-    train_execution: dense_masked
+    train_execution: sparse_batch
     inference_execution: sparse_batch
     spatial_gating: true
     router_branches:
@@ -114,7 +114,7 @@ model:
       backend: segformer_b0_local
       frozen: true
       predicted_guidance_only: true
-      model_dir: weights/segformer_b0_citycapes
+      model_dir: weights/segformer_b0_cityscapes
       input_size: 256
       num_classes: 19
       strict_loading: true
@@ -153,17 +153,24 @@ model:
     disable_final_residual: false
     share_feedback_encoder_moe: false
 data:
-  dataset: deterministic_dummy
-  height: 128
-  width: 128
-  dummy_length: 48
+  dataset: semantic_rt
+  root: data/semantic_rt
+  mfif_root: data/mfif/semantic_rt
+  manifest: data/splits/semantic_rt_test_uniform_2000_seed3407.txt
+  crop_size: 256
+  horizontal_flip_probability: 0.5
+  rotation_degrees: 10.0
+  rotation_probability: 0.5
+  segmentation_min_valid_pixels: 64
+  segmentation_crop_attempts: 10
   num_workers: 0
   pin_memory: false
 training:
-  epochs: 100
-  steps_per_epoch: 1000
+  device: cuda:0
+  epochs: 50
+  steps_per_epoch: 750
   max_steps: null
-  batch_size: 4
+  batch_size: 2
   precision: bf16
   optimizer:
     name: adamw
@@ -179,7 +186,7 @@ training:
       feedback_routers: 0.5
   scheduler:
     name: cosine_with_warmup
-    warmup_steps: 5000
+    warmup_steps: 2000
     minimum_learning_rate: 1.0e-06
     step_size: 10000
     gamma: 0.5
@@ -190,7 +197,7 @@ training:
       mfif: 1.0
       seg: 1.0
   gradient_strategy: alternating
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 2
   gradient_clip:
     enabled: true
     max_norm: 1.0
@@ -206,22 +213,23 @@ training:
     phases:
     - name: stabilization
       start: 0
-      end: 5
+      end: 6
       loss_multipliers:
         frequency: 0.0
         consistency: 0.0
-    - name: auxiliary_alignment
-      start: 5
-      end: 15
+    - name: frequency_alignment
+      start: 6
+      end: 12
       loss_multipliers:
         frequency: 0.5
+        consistency: 0.0
     - name: joint
-      start: 15
-      end: 90
+      start: 12
+      end: 44
       loss_multipliers: {}
     - name: routing_finetune
-      start: 90
-      end: 100
+      start: 44
+      end: 50
       loss_multipliers:
         moe: 1.5
   router_temperature:
@@ -229,6 +237,33 @@ training:
     end: 0.7
     schedule: cosine
     minimum: 0.5
+  moe_execution:
+    enabled: true
+    warmup:
+      uniform_steps: 250
+      uniform_to_soft_end: 750
+      soft_to_topk_end: 1500
+    refresh:
+      interval: 200
+      routed_fraction: 0.5
+      expert_only: true
+    routing:
+      initial_temperature: 1.5
+      sparse_start_temperature: 1.0
+      final_temperature: 0.7
+      final_step: 7500
+      initial_noise_std: 0.05
+      noise_end_step: 7500
+    monitor:
+      ema_decay: 0.95
+      starvation_threshold: 0.02
+      overload_threshold: 0.8
+      patience_steps: 500
+    recovery:
+      steps: 200
+      temperature_floor: 1.0
+      noise_std: 0.03
+      refresh_interval: 50
   diagnostics:
     interval: 100
     gradient_conflict_enabled: false
@@ -237,15 +272,8 @@ training:
     collapse_patience: 10
   log_every_steps: 10
   ema:
-    enabled: false
+    enabled: true
     decay: 0.999
-  ewc:
-    enabled: false
-    weight: 0.0
-    groups:
-    - shared_backbone
-    - common_experts
-    fisher_batches: 100
   losses:
     strict_targets: true
     vif:
@@ -270,7 +298,26 @@ training:
       dice: 1.0
       coarse_supervision: 0.25
       ignore_index: 255
-      class_weights: null
+      class_weights:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 3.0
+      - 3.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 2.8
+      - 3.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 3.0
+      - 3.0
       improvement_enabled: false
       improvement_weight: 0.0
       improvement_margin: 0.0
@@ -284,7 +331,8 @@ training:
     moe:
       enabled: true
       weight: 0.01
-      hard_load_weight: 1.0
+      soft_balance_weight: 1.0
+      switch_balance_weight: 0.1
       entropy_enabled: false
       entropy_weight: 0.0
       entropy_target: 1.0
@@ -298,15 +346,15 @@ training:
       enabled: true
       weight: 0.1
       detach_saliency: true
+      saliency_alignment: 0.1
     regularization:
       residual_magnitude: 0.001
       range_penalty: 0.001
   checkpoint:
-    every_epochs: 1
-    every_steps: 1000
+    every_epochs: 10
+    every_steps: 60001
     keep_last: 3
     resume: null
   distributed:
     enabled: false
     find_unused_parameters: true
-

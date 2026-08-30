@@ -26,8 +26,12 @@ dev = [
 packages = ["tfs_moe_fusion"]
 
 [tool.pytest.ini_options]
-addopts = "-ra"
+addopts = "-ra -m 'not integration'"
 testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+  "integration: requires local pretrained weights and/or research datasets",
+]
 
 [tool.ruff]
 extend-exclude = ["data", "runs", "weights"]

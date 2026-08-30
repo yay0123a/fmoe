@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ from tfs_moe_fusion.trainer import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _smoke_config():
+def _smoke_config(assets: tuple[Path, Path, Path] | None = None):
     config = load_config(ROOT / "configs/default.yaml")
     config.model.backbone.channels = [8, 16, 32, 64]
     config.model.backbone.depths = [1, 1, 1, 1]
@@ -25,10 +26,13 @@ def _smoke_config():
     config.model.moe.expert_expansion = 1
     config.model.guidance.focus.hidden_channels = 8
     config.model.guidance.semantic.input_size = 32
+    config.model.guidance.semantic.enabled = False
     config.model.feedback.guide_channels = 8
-    config.data.height = 17
-    config.data.width = 19
-    config.data.dummy_length = 6
+    config.data.crop_size = 32
+    config.data.horizontal_flip_probability = 0.0
+    config.data.rotation_probability = 0.0
+    if assets is not None:
+        config.data.root, config.data.mfif_root, config.data.manifest = map(str, assets)
     config.training.epochs = 1
     config.training.steps_per_epoch = 20
     config.training.max_steps = 20
@@ -37,6 +41,7 @@ def _smoke_config():
     config.training.task_sampling.strategy = "alternating"
     config.training.scheduler.warmup_steps = 2
     config.training.ema.enabled = True
+    config.training.losses.strict_targets = False
     return config
 
 
@@ -90,8 +95,10 @@ from tfs_moe_fusion.utils import seed_everything
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_trainer_exports_applied_ema_weights(tmp_path: Path) -> None:
-    config = _smoke_config()
+def test_trainer_exports_applied_ema_weights(
+    tmp_path: Path, semantic_rt_assets: tuple[Path, Path, Path]
+) -> None:
+    config = _smoke_config(semantic_rt_assets)
     trainer = Trainer(
         build_model(config), config, torch.device("cpu"), tmp_path / "trainer"
     )
@@ -121,14 +128,17 @@ def test_trainer_exports_applied_ema_weights(tmp_path: Path) -> None:
         resumed.resume(destination)
 
 
-def test_resume_reproduces_the_next_optimizer_update(tmp_path: Path) -> None:
-    config = _smoke_config()
+def test_resume_reproduces_the_next_optimizer_update(
+    tmp_path: Path, semantic_rt_assets: tuple[Path, Path, Path]
+) -> None:
+    config = _smoke_config(semantic_rt_assets)
     seed_everything(config.experiment.seed, True)
     baseline = Trainer(
         build_model(config), config, torch.device("cpu"), tmp_path / "baseline"
     )
     baseline.train_step(TaskType.VIF)
     checkpoint = baseline.save(tmp_path / "exact.pt")
+    expected_monitor = deepcopy(baseline.router_monitor.state_dict())
     baseline.train_step(TaskType.MFIF)
     expected = {
         name: value.detach().clone()
@@ -139,6 +149,7 @@ def test_resume_reproduces_the_next_optimizer_update(tmp_path: Path) -> None:
         build_model(config), config, torch.device("cpu"), tmp_path / "resumed"
     )
     resumed.resume(checkpoint)
+    assert resumed.router_monitor.state_dict() == expected_monitor
     resumed.train_step(TaskType.MFIF)
     for name, value in resumed.model.state_dict().items():
         # Optimizer/RNG/sampler states are exact; parallel CPU kernels may differ

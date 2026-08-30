@@ -9,7 +9,7 @@ from tfs_moe_fusion.config import load_config
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _smoke_config():
+def _smoke_config(assets: tuple[Path, Path, Path] | None = None):
     config = load_config(ROOT / "configs/default.yaml")
     config.model.backbone.channels = [8, 16, 32, 64]
     config.model.backbone.depths = [1, 1, 1, 1]
@@ -18,10 +18,13 @@ def _smoke_config():
     config.model.moe.expert_expansion = 1
     config.model.guidance.focus.hidden_channels = 8
     config.model.guidance.semantic.input_size = 32
+    config.model.guidance.semantic.enabled = False
     config.model.feedback.guide_channels = 8
-    config.data.height = 17
-    config.data.width = 19
-    config.data.dummy_length = 6
+    config.data.crop_size = 32
+    config.data.horizontal_flip_probability = 0.0
+    config.data.rotation_probability = 0.0
+    if assets is not None:
+        config.data.root, config.data.mfif_root, config.data.manifest = map(str, assets)
     config.training.epochs = 1
     config.training.steps_per_epoch = 20
     config.training.max_steps = 20
@@ -30,6 +33,7 @@ def _smoke_config():
     config.training.task_sampling.strategy = "alternating"
     config.training.scheduler.warmup_steps = 2
     config.training.ema.enabled = True
+    config.training.losses.strict_targets = False
     return config
 
 
@@ -65,19 +69,6 @@ def test_ema_updates_and_restores_live_weights() -> None:
         assert not torch.equal(model.weight, live)
     torch.testing.assert_close(model.weight, live)
     assert not torch.equal(before, live)
-
-
-from tfs_moe_fusion.trainer import ElasticWeightConsolidation
-
-
-def test_ewc_penalizes_drift_from_consolidated_parameters() -> None:
-    model = torch.nn.Linear(2, 1)
-    model(torch.ones(1, 2)).sum().backward()
-    ewc = ElasticWeightConsolidation(1.0)
-    ewc.consolidate(model)
-    with torch.no_grad():
-        model.weight.add_(1)
-    assert ewc.penalty(model) > 0
 
 
 from tfs_moe_fusion.losses import focus_losses
@@ -173,7 +164,7 @@ from pathlib import Path
 from tfs_moe_fusion.losses import LossContext, LossOutput, MultiTaskLossManager
 from tfs_moe_fusion.model import build_model
 from tfs_moe_fusion.types import TaskType
-from tfs_moe_fusion.utils import make_dummy_batch
+from tfs_moe_fusion.utils import make_probe_batch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -181,7 +172,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_loss_manager_returns_structured_vif_output() -> None:
     config = _smoke_config()
     model = build_model(config).train()
-    batch = make_dummy_batch(config, TaskType.VIF)
+    batch = make_probe_batch(config, TaskType.VIF)
     value = MultiTaskLossManager(config.training.losses)(
         LossContext(batch, model(batch), TaskType.VIF, 0, 0, model)
     )
@@ -195,6 +186,85 @@ from tfs_moe_fusion.losses import moe_balance_loss
 def test_moe_balance_is_availability_aware_and_finite() -> None:
     importance, load, entropy = moe_balance_loss((_diagnostic(),))
     assert importance.isfinite() and load.isfinite() and entropy.isfinite()
+
+
+def test_switch_balance_routes_gradient_through_probabilities() -> None:
+    diagnostic = _diagnostic()
+    soft, switch, _ = moe_balance_loss((diagnostic,))
+    (soft + switch).backward()
+    assert diagnostic.probabilities.grad is not None
+    assert torch.isfinite(diagnostic.probabilities.grad).all()
+
+
+from tfs_moe_fusion.trainer import (
+    ExpertOnlyParameterPolicy,
+    MoEExecutionScheduler,
+    RouterLoadMonitor,
+)
+
+
+def test_moe_execution_schedule_is_continuous_and_refreshes() -> None:
+    config = _smoke_config().training.moe_execution
+    monitor = RouterLoadMonitor(config)
+    scheduler = MoEExecutionScheduler(config, monitor)
+
+    uniform = scheduler.resolve(249)
+    uniform_boundary = scheduler.resolve(250)
+    soft_boundary = scheduler.resolve(750)
+    sparse_boundary = scheduler.resolve(1500)
+    refresh = scheduler.resolve(1700)
+
+    assert uniform is not None and uniform.mode == "dense_uniform"
+    assert uniform_boundary is not None
+    assert uniform_boundary.mode == "dense_annealed"
+    assert uniform_boundary.uniform_to_soft == pytest.approx(0.0)
+    assert soft_boundary is not None
+    assert soft_boundary.uniform_to_soft == pytest.approx(1.0)
+    assert soft_boundary.soft_to_topk == pytest.approx(0.0)
+    assert sparse_boundary is not None and sparse_boundary.mode == "sparse_batch"
+    assert refresh is not None and refresh.mode == "expert_refresh"
+    assert refresh.expert_only and refresh.detach_router
+
+
+def test_router_monitor_recovery_state_round_trips() -> None:
+    config = _smoke_config().training.moe_execution
+    config.monitor.patience_steps = 1
+    config.monitor.starvation_threshold = 0.2
+    monitor = RouterLoadMonitor(config)
+    probabilities = torch.tensor([[0.9, 0.1]])
+    diagnostic = RouterDiagnostics(
+        "s2.moe0",
+        probabilities.log(),
+        probabilities,
+        torch.tensor([[0]]),
+        torch.ones(1, 1),
+        torch.ones(1, 2, dtype=torch.bool),
+    )
+    monitor.update((diagnostic,), step=10)
+    assert monitor.in_recovery(11)
+
+    restored = RouterLoadMonitor(config)
+    restored.load_state_dict(monitor.state_dict())
+    assert restored.state_dict() == monitor.state_dict()
+    policy = MoEExecutionScheduler(config, restored).resolve(11)
+    assert policy is not None
+    assert policy.temperature >= config.recovery.temperature_floor
+    assert policy.noise_std >= config.recovery.noise_std
+
+
+def test_expert_only_policy_freezes_every_nonexpert_group() -> None:
+    config = _smoke_config()
+    registry = ParameterGroupRegistry.from_model(build_model(config))
+    policy = ExpertOnlyParameterPolicy(registry)
+    with policy.apply(True):
+        for group, parameters in registry.groups.items():
+            expected = group in policy.expert_groups
+            assert all(parameter.requires_grad is expected for parameter in parameters)
+    assert all(
+        parameter.requires_grad
+        for parameters in registry.groups.values()
+        for parameter in parameters
+    )
 
 
 from pathlib import Path
@@ -255,8 +325,10 @@ from tfs_moe_fusion.trainer import Trainer
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_trainer_performs_real_updates_for_all_tasks(tmp_path: Path) -> None:
-    config = _smoke_config()
+def test_trainer_performs_real_updates_for_all_tasks(
+    tmp_path: Path, semantic_rt_assets: tuple[Path, Path, Path]
+) -> None:
+    config = _smoke_config(semantic_rt_assets)
     trainer = Trainer(build_model(config), config, torch.device("cpu"), tmp_path)
     for task in TaskType:
         result = trainer.train_step(task)
@@ -265,11 +337,13 @@ def test_trainer_performs_real_updates_for_all_tasks(tmp_path: Path) -> None:
 
 
 def test_train_displays_one_progress_bar_per_epoch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    semantic_rt_assets: tuple[Path, Path, Path],
 ) -> None:
     import tfs_moe_fusion.trainer as trainer_module
 
-    config = _smoke_config()
+    config = _smoke_config(semantic_rt_assets)
     config.training.epochs = 2
     config.training.steps_per_epoch = 2
     config.training.max_steps = None

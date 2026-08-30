@@ -4,7 +4,7 @@
 
 - Package, configuration, registries, logging and reproducibility.
 - Typed task, modality, batch, output and diagnostic contracts.
-- Deterministic task-homogeneous dummy datasets.
+- Typed task-homogeneous dataset adapters and engineering probe batches.
 - Reversible arbitrary-size padding and debug-only differentiable forward.
 - Checkpoint, CLI and test infrastructure.
 - Permanent architecture, interface and third-party attribution documents.
@@ -39,7 +39,7 @@
 ## Stage 5 — Training system (completed)
 
 - Complete task-specific loss selection and alternating schedule.
-- Gradient coordination, optional EWC, EMA, AMP/DDP and exact resume.
+- Gradient coordination, EMA, AMP/DDP and exact resume.
 - Availability-aware load balancing and expert specialization objectives.
 
 ## Stage 6 — Evaluation and paper evidence (deferred by request)
