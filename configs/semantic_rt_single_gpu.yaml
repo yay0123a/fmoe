@@ -1,0 +1,98 @@
+_base_: default.yaml
+
+experiment:
+  name: semantic_rt_1000_single_gpu
+  seed: 3407
+  deterministic: true
+  output_dir: runs
+
+data:
+  dataset: semantic_rt
+  root: data/semantic_rt
+  mfif_root: data/mfif/semantic_rt
+  manifest: data/splits/semantic_rt_train_1000_seed3407.txt
+  crop_size: 256
+  horizontal_flip_probability: 0.5
+  rotation_degrees: 10.0
+  rotation_probability: 0.5
+  segmentation_min_valid_pixels: 64
+  segmentation_crop_attempts: 10
+  num_workers: 0
+  pin_memory: false
+
+training:
+  epochs: 50
+  steps_per_epoch: 750
+  max_steps: null
+  batch_size: 2
+  gradient_accumulation_steps: 2
+  precision: bf16
+  optimizer:
+    learning_rate: 0.0002
+    weight_decay: 0.0001
+  scheduler:
+    name: cosine_with_warmup
+    warmup_steps: 2000
+    minimum_learning_rate: 0.000001
+  task_sampling:
+    strategy: weighted_random
+    weights:
+      vif: 1.0
+      mfif: 1.0
+      seg: 1.0
+  phases:
+    phases:
+    - name: stabilization
+      start: 0
+      end: 6
+      loss_multipliers:
+        frequency: 0.0
+        consistency: 0.0
+    - name: frequency_alignment
+      start: 6
+      end: 12
+      loss_multipliers:
+        frequency: 0.5
+        consistency: 0.0
+    - name: joint
+      start: 12
+      end: 44
+      loss_multipliers: {}
+    - name: routing_finetune
+      start: 44
+      end: 50
+      loss_multipliers:
+        moe: 1.5
+  ema:
+    enabled: true
+    decay: 0.999
+  losses:
+    semantic:
+      class_weights:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 3.0
+      - 3.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 2.8
+      - 3.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 3.0
+      - 3.0
+  checkpoint:
+    every_epochs: 10
+    every_steps: 60001
+    keep_last: 3
+    resume: null
+  distributed:
+    enabled: false
+    find_unused_parameters: true
