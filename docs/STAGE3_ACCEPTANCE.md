@@ -12,8 +12,8 @@ full softmax, global Top-2 precedes expert execution, and a source/auxiliary-awa
 inference paths are numerically equivalent. Diagnostics include entropy, importance,
 hard load, availability, full probabilities, selections, and spatial gates.
 
-The encoder placement is fixed to `s2.moe0`, `s3.moe0`, `s3.moe1`, `s4.moe0`, and
-`s4.moe1`. All five blocks reuse one TaskEmbedding while retaining independent router
+The optimized encoder placement is fixed to `s2.moe0`, `s3.moe0`, and `s4.moe0`.
+All three blocks reuse one TaskEmbedding while retaining independent router
 and expert parameters. The public contracts include `FunctionalExpertPool`,
 `MoEOutput`, and `TaskFrequencyMoEBlock`; the Stage 2 frequency foundation remains
 available in code without becoming an unused resident module in MoE models. The full

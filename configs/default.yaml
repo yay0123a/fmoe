@@ -81,8 +81,8 @@ model:
     block_counts:
       s1: 0
       s2: 1
-      s3: 2
-      s4: 2
+      s3: 1
+      s4: 1
     router_hidden_channels: 64
     expert_expansion: 2
     residual_scale: 0.001
@@ -118,7 +118,7 @@ model:
       input_size: 256
       num_classes: 19
       strict_loading: true
-      detach_guidance_input: false
+      detach_guidance_input: true
       guidance_policy: all
       guidance_tasks:
       - vif
@@ -163,8 +163,8 @@ data:
   rotation_probability: 0.5
   segmentation_min_valid_pixels: 64
   segmentation_crop_attempts: 10
-  num_workers: 0
-  pin_memory: false
+  num_workers: 4
+  pin_memory: true
 training:
   device: cuda:0
   epochs: 50
@@ -213,24 +213,28 @@ training:
     phases:
     - name: stabilization
       start: 0
-      end: 6
+      end: 5
       loss_multipliers:
-        frequency: 0.0
-        consistency: 0.0
-    - name: frequency_alignment
-      start: 6
-      end: 12
+        seg_fusion: 1.0
+        semantic: 0.25
+    - name: semantic_ramp
+      start: 5
+      end: 15
       loss_multipliers:
-        frequency: 0.5
-        consistency: 0.0
+        seg_fusion: 1.0
+        semantic: 0.5
     - name: joint
-      start: 12
+      start: 15
       end: 44
-      loss_multipliers: {}
+      loss_multipliers:
+        seg_fusion: 0.75
+        semantic: 1.0
     - name: routing_finetune
       start: 44
       end: 50
       loss_multipliers:
+        seg_fusion: 0.75
+        semantic: 1.0
         moe: 1.5
   router_temperature:
     start: 1.5
@@ -240,9 +244,9 @@ training:
   moe_execution:
     enabled: true
     warmup:
-      uniform_steps: 250
-      uniform_to_soft_end: 750
-      soft_to_topk_end: 1500
+      uniform_steps: 50
+      uniform_to_soft_end: 150
+      soft_to_topk_end: 300
     refresh:
       interval: 200
       routed_fraction: 0.5
@@ -270,6 +274,8 @@ training:
     gradient_conflict_interval: 1000
     router_collapse_threshold: 0.95
     collapse_patience: 10
+    loss_gradient_interval: 100
+    loss_gradient_until_step: 1000
   log_every_steps: 10
   ema:
     enabled: true
@@ -293,10 +299,14 @@ training:
       selection: 1.0
       boundary: 0.5
       confidence: 0.1
+    seg_fusion:
+      enabled: true
+      intensity: 1.0
+      gradient: 1.0
     semantic:
       cross_entropy: 1.0
-      dice: 1.0
-      coarse_supervision: 0.25
+      dice: 0.5
+      coarse_supervision: 0.0
       ignore_index: 255
       class_weights:
       - 1.0
@@ -321,9 +331,9 @@ training:
       improvement_enabled: false
       improvement_weight: 0.0
       improvement_margin: 0.0
-      boundary_alignment: 0.05
+      boundary_alignment: 0.0
     frequency:
-      enabled: true
+      enabled: false
       weight: 0.01
       low_leakage: 1.0
       detail_leakage: 1.0
@@ -337,7 +347,7 @@ training:
       entropy_weight: 0.0
       entropy_target: 1.0
     consistency:
-      enabled: true
+      enabled: false
       weight: 0.01
       probability: 0.25
       gaussian_kernel_size: 9

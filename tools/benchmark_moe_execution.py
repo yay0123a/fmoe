@@ -81,9 +81,7 @@ def benchmark(
             sparse_execution=sparse,
         )
         output.feature.square().mean().backward()
-        if sparse:
-            return int(output.router.topk_indices.numel())
-        return int(output.router.valid_expert_mask.sum())
+        return int(output.diagnostics.auxiliary["expert_sample_assignments"])
 
     for _ in range(warmup):
         step()
@@ -161,6 +159,9 @@ def main() -> None:
         "dense": asdict(dense),
         "sparse": asdict(sparse),
         "speedup": dense.mean_step_ms / sparse.mean_step_ms,
+        "assignment_reduction": (
+            1 - sparse.expert_sample_assignments / dense.expert_sample_assignments
+        ),
         "memory_reduction": (
             1 - sparse.peak_memory_mib / dense.peak_memory_mib
             if dense.peak_memory_mib and sparse.peak_memory_mib

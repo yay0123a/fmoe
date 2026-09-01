@@ -235,6 +235,22 @@ def vif_losses(fused: Tensor, visible: Tensor, infrared: Tensor) -> dict[str, Te
     }
 
 
+def seg_fusion_anchor_losses(
+    fused: Tensor, visible: Tensor, infrared: Tensor
+) -> dict[str, Tensor]:
+    """Minimal fusion-quality anchor for segmentation-conditioned output."""
+    target_intensity = torch.maximum(luminance(visible), luminance(infrared))
+    target_gradient = torch.maximum(
+        gradient_magnitude(visible), gradient_magnitude(infrared)
+    )
+    return {
+        "seg_fusion/intensity": (luminance(fused) - target_intensity).abs().mean(),
+        "seg_fusion/gradient": (gradient_magnitude(fused) - target_gradient)
+        .abs()
+        .mean(),
+    }
+
+
 def mfif_losses(
     fused: Tensor, target: Tensor, use_charbonnier: bool
 ) -> dict[str, Tensor]:
@@ -435,6 +451,17 @@ class MultiTaskLossManager(nn.Module):
         )
 
     def _semantic(self, context, components, weights, skipped) -> None:
+        if self.config.seg_fusion.enabled:
+            visible, infrared = self._visible_ir(context.batch)
+            components.update(
+                seg_fusion_anchor_losses(context.output.fused, visible, infrared)
+            )
+            weights.update(
+                {
+                    "seg_fusion/intensity": self.config.seg_fusion.intensity,
+                    "seg_fusion/gradient": self.config.seg_fusion.gradient,
+                }
+            )
         target, segmentation = (
             context.batch.segmentation_target,
             context.output.segmentation,
@@ -453,7 +480,11 @@ class MultiTaskLossManager(nn.Module):
             semantic_losses(
                 segmentation.logits,
                 target,
-                segmentation.boundary,
+                (
+                    segmentation.boundary
+                    if self.config.semantic.boundary_alignment > 0
+                    else None
+                ),
                 context.output.fused,
                 self.config.semantic.ignore_index,
                 class_weights,
@@ -467,7 +498,11 @@ class MultiTaskLossManager(nn.Module):
             }
         )
         coarse = context.output.coarse_segmentation
-        if coarse is not None and context.output.coarse is not None:
+        if (
+            self.config.semantic.coarse_supervision > 0
+            and coarse is not None
+            and context.output.coarse is not None
+        ):
             components["semantic/coarse"] = semantic_losses(
                 coarse.logits,
                 target,
@@ -488,7 +523,8 @@ class MultiTaskLossManager(nn.Module):
     def _shared(self, context, components, weights, skipped) -> None:
         output = context.output
         if output.router_diagnostics and (
-            self.config.frequency.enabled or self.config.infrared.enabled
+            self.config.frequency.enabled
+            or (self.config.infrared.enabled and context.task is TaskType.VIF)
         ):
             specialization = frequency_specialization(output.router_diagnostics)
             if self.config.frequency.enabled:
@@ -508,7 +544,7 @@ class MultiTaskLossManager(nn.Module):
                         * self.config.frequency.semantic_boundary,
                     }
                 )
-            if self.config.infrared.enabled:
+            if self.config.infrared.enabled and context.task is TaskType.VIF:
                 components["infrared/saliency_alignment"] = specialization[
                     "infrared/saliency_alignment"
                 ]
@@ -543,7 +579,7 @@ class MultiTaskLossManager(nn.Module):
                 weights["moe/entropy_target"] = (
                     self.config.moe.weight * self.config.moe.entropy_weight
                 )
-        if self.config.infrared.enabled and context.batch.has_infrared:
+        if self.config.infrared.enabled and context.task is TaskType.VIF:
             _, infrared = self._visible_ir(context.batch)
             saliency = next(
                 (

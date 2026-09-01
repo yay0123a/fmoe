@@ -146,6 +146,29 @@ def test_semantic_rt_batch_provider_builds_all_tasks_and_restores_order(
         )
 
 
+def test_semantic_rt_provider_uses_dataloader_worker_and_pin_memory_settings(
+    tmp_path: Path,
+) -> None:
+    root, mfif, manifest = _write_fixture(tmp_path)
+    config = load_config(ROOT / "configs/default.yaml")
+    config.data.root = str(root)
+    config.data.mfif_root = str(mfif)
+    config.data.manifest = str(manifest)
+    config.data.crop_size = 16
+    config.data.num_workers = 1
+    config.data.pin_memory = True
+    config.training.batch_size = 1
+    provider = SemanticRTBatchProvider(config)
+    try:
+        batch = provider.next_batch(TaskType.VIF)
+        loader = provider.loaders[TaskType.VIF]
+        assert loader.num_workers == 1
+        assert loader.pin_memory is True
+        assert batch.batch_size == 1
+    finally:
+        provider.close()
+
+
 def test_semantic_rt_single_gpu_config_is_valid() -> None:
     config = load_config(ROOT / "configs/semantic_rt_single_gpu.yaml")
     assert config.data.dataset == "semantic_rt"
@@ -155,8 +178,8 @@ def test_semantic_rt_single_gpu_config_is_valid() -> None:
     assert [
         (phase.name, phase.start, phase.end) for phase in config.training.phases.phases
     ] == [
-        ("stabilization", 0, 6),
-        ("frequency_alignment", 6, 12),
-        ("joint", 12, 44),
+        ("stabilization", 0, 5),
+        ("semantic_ramp", 5, 15),
+        ("joint", 15, 44),
         ("routing_finetune", 44, 50),
     ]

@@ -21,6 +21,7 @@ def _smoke_config(assets: tuple[Path, Path, Path] | None = None):
     config.model.guidance.semantic.enabled = False
     config.model.feedback.guide_channels = 8
     config.data.crop_size = 32
+    config.data.num_workers = 0
     config.data.horizontal_flip_probability = 0.0
     config.data.rotation_probability = 0.0
     if assets is not None:
@@ -111,7 +112,11 @@ def test_frequency_specialization_reports_both_leakages() -> None:
     assert values["frequency/detail_leakage"] > 0
 
 
-from tfs_moe_fusion.losses import mfif_losses, vif_losses
+from tfs_moe_fusion.losses import (
+    mfif_losses,
+    seg_fusion_anchor_losses,
+    vif_losses,
+)
 
 
 def test_vif_and_mfif_losses_are_finite_and_differentiable() -> None:
@@ -123,6 +128,16 @@ def test_vif_and_mfif_losses_are_finite_and_differentiable() -> None:
         **mfif_losses(fused, visible, False),
     }
     assert values
+    sum(values.values()).backward()
+    assert fused.grad is not None and torch.isfinite(fused.grad).all()
+
+
+def test_seg_fusion_anchor_is_minimal_and_differentiable() -> None:
+    fused = torch.rand(2, 3, 15, 17, requires_grad=True)
+    visible = torch.rand_like(fused)
+    infrared = torch.rand(2, 1, 15, 17)
+    values = seg_fusion_anchor_losses(fused, visible, infrared)
+    assert set(values) == {"seg_fusion/intensity", "seg_fusion/gradient"}
     sum(values.values()).backward()
     assert fused.grad is not None and torch.isfinite(fused.grad).all()
 
@@ -180,6 +195,37 @@ def test_loss_manager_returns_structured_vif_output() -> None:
     assert value.diagnostics["task"] == "vif" and torch.isfinite(value.total)
 
 
+def test_seg_loss_has_fusion_anchor_without_vif_ssim_or_color() -> None:
+    config = _smoke_config()
+    model = build_model(config).train()
+    batch = make_probe_batch(config, TaskType.SEG)
+    value = MultiTaskLossManager(config.training.losses)(
+        LossContext(
+            batch,
+            model(batch),
+            TaskType.SEG,
+            0,
+            0,
+            model,
+            phase="stabilization",
+            loss_multipliers={"seg_fusion": 1.0, "semantic": 0.25},
+        )
+    )
+    assert "seg_fusion/intensity" in value.components
+    assert "seg_fusion/gradient" in value.components
+    assert "fusion/ssim" not in value.components
+    assert "fusion/color" not in value.components
+    assert "semantic/boundary" not in value.components
+    assert "semantic/coarse" not in value.components
+    assert not any(name.startswith("frequency/") for name in value.components)
+    assert not any(name.startswith("consistency/") for name in value.components)
+    assert "infrared/preservation" not in value.components
+    torch.testing.assert_close(
+        value.weighted_components["seg_fusion/intensity"],
+        value.components["seg_fusion/intensity"],
+    )
+
+
 from tfs_moe_fusion.losses import moe_balance_loss
 
 
@@ -200,7 +246,42 @@ from tfs_moe_fusion.trainer import (
     ExpertOnlyParameterPolicy,
     MoEExecutionScheduler,
     RouterLoadMonitor,
+    expert_regularizer_flags,
+    loss_group_gradient_statistics,
 )
+
+
+def test_seg_loss_group_gradient_ratio_is_reported() -> None:
+    parameter = torch.nn.Parameter(torch.tensor(2.0))
+    fusion = parameter.square()
+    semantic = (3 * parameter).square()
+    result = LossOutput(
+        fusion + semantic,
+        {},
+        {"seg_fusion/intensity": fusion, "semantic/ce": semantic},
+        {},
+        {},
+    )
+    values = loss_group_gradient_statistics(result, (parameter,))
+    assert values["grad_norm/seg_fusion"] == pytest.approx(4.0)
+    assert values["grad_norm/semantic"] == pytest.approx(36.0)
+    assert values["grad_ratio/semantic_to_fusion"] == pytest.approx(9.0)
+
+
+def test_loss_group_gradient_statistics_skips_detached_namespace() -> None:
+    parameter = torch.nn.Parameter(torch.tensor(2.0))
+    fusion = parameter.square()
+    result = LossOutput(
+        fusion,
+        {},
+        {
+            "seg_fusion/intensity": fusion,
+            "semantic/ce": torch.tensor(1.0),
+        },
+        {},
+        {},
+    )
+    assert loss_group_gradient_statistics(result, (parameter,)) == {}
 
 
 def test_moe_execution_schedule_is_continuous_and_refreshes() -> None:
@@ -208,22 +289,40 @@ def test_moe_execution_schedule_is_continuous_and_refreshes() -> None:
     monitor = RouterLoadMonitor(config)
     scheduler = MoEExecutionScheduler(config, monitor)
 
-    uniform = scheduler.resolve(249)
-    uniform_boundary = scheduler.resolve(250)
-    soft_boundary = scheduler.resolve(750)
-    sparse_boundary = scheduler.resolve(1500)
-    refresh = scheduler.resolve(1700)
+    uniform = scheduler.resolve(49)
+    uniform_boundary = scheduler.resolve(50)
+    uniform_to_soft_last = scheduler.resolve(149)
+    soft_boundary = scheduler.resolve(150)
+    soft_to_topk_last = scheduler.resolve(299)
+    sparse_boundary = scheduler.resolve(300)
+    refresh = scheduler.resolve(500)
 
     assert uniform is not None and uniform.mode == "dense_uniform"
     assert uniform_boundary is not None
     assert uniform_boundary.mode == "dense_annealed"
     assert uniform_boundary.uniform_to_soft == pytest.approx(0.0)
+    assert uniform_to_soft_last is not None
+    assert uniform_to_soft_last.mode == "dense_annealed"
     assert soft_boundary is not None
+    assert soft_boundary.mode == "dense_annealed"
     assert soft_boundary.uniform_to_soft == pytest.approx(1.0)
     assert soft_boundary.soft_to_topk == pytest.approx(0.0)
+    assert soft_to_topk_last is not None
+    assert soft_to_topk_last.mode == "dense_annealed"
     assert sparse_boundary is not None and sparse_boundary.mode == "sparse_batch"
     assert refresh is not None and refresh.mode == "expert_refresh"
     assert refresh.expert_only and refresh.detach_router
+
+
+def test_zero_frequency_multiplier_skips_only_frequency_regularizers() -> None:
+    config = _smoke_config().training.losses
+    config.frequency.enabled = True
+    config.infrared.enabled = True
+    frequency, infrared = expert_regularizer_flags(
+        config, {"frequency": 0.0}, TaskType.VIF
+    )
+    assert frequency is False
+    assert infrared is True
 
 
 def test_router_monitor_recovery_state_round_trips() -> None:

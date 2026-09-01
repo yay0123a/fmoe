@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import random
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -708,6 +708,21 @@ class MoEExecutionScheduler:
         return routing.initial_noise_std * (1 - progress)
 
 
+def expert_regularizer_flags(
+    loss_config: Any,
+    loss_multipliers: dict[str, float],
+    task: TaskType,
+) -> tuple[bool, bool]:
+    """Resolve independent frequency and infrared MoE auxiliary work."""
+    return (
+        loss_config.frequency.enabled
+        and loss_multipliers.get("frequency", 1.0) > 0,
+        loss_config.infrared.enabled
+        and task is TaskType.VIF
+        and loss_multipliers.get("infrared", 1.0) > 0,
+    )
+
+
 class TaskParameterPolicy:
     def __init__(
         self, registry: ParameterGroupRegistry, config: TaskUpdatePolicyConfig
@@ -842,6 +857,45 @@ def expert_gradient_statistics(
     return result
 
 
+def loss_group_gradient_statistics(
+    result: LossOutput, parameters: tuple[nn.Parameter, ...]
+) -> dict[str, float]:
+    """Compare effective SEG fusion/semantic gradients on representative weights."""
+    totals: dict[str, Tensor] = {}
+    for namespace in ("seg_fusion", "semantic"):
+        values = [
+            value
+            for name, value in result.weighted_components.items()
+            if name.split("/", 1)[0] == namespace and value.requires_grad
+        ]
+        if values:
+            totals[namespace] = torch.stack(values).sum()
+    if len(totals) != 2 or not parameters:
+        return {}
+
+    norms: dict[str, float] = {}
+    for namespace, total in totals.items():
+        gradients = torch.autograd.grad(
+            total,
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        squared = [
+            gradient.detach().float().square().sum()
+            for gradient in gradients
+            if gradient is not None
+        ]
+        norm = torch.stack(squared).sum().sqrt() if squared else total.new_zeros(())
+        norms[namespace] = float(norm)
+    fusion = max(norms["seg_fusion"], 1e-12)
+    return {
+        "grad_norm/seg_fusion": norms["seg_fusion"],
+        "grad_norm/semantic": norms["semantic"],
+        "grad_ratio/semantic_to_fusion": norms["semantic"] / fusion,
+    }
+
+
 def router_statistics(values: tuple[RouterDiagnostics, ...]) -> dict[str, float]:
     if not values:
         return {"router_entropy": 0.0, "router_max_load": 0.0}
@@ -875,6 +929,7 @@ import logging
 from dataclasses import dataclass
 
 import torch
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from tfs_moe_fusion.data import (
@@ -895,17 +950,48 @@ class TrainerState:
     phase: str = "stabilization"
     router_temperature: float = 1.0
     collapse_count: int = 0
+    last_loss_gradient_bucket: int = -1
+
+
+class _InfiniteBatchSampler:
+    """Reproduce one task's resumable order while DataLoader prefetches ahead."""
+
+    def __init__(
+        self,
+        order: list[int],
+        cursor: int,
+        batch_size: int,
+        random_state: object,
+    ) -> None:
+        self.order = list(order)
+        self.cursor = cursor
+        self.batch_size = batch_size
+        self.random = random.Random()
+        self.random.setstate(random_state)
+
+    def __iter__(self):
+        while True:
+            indices: list[int] = []
+            while len(indices) < self.batch_size:
+                if self.cursor == len(self.order):
+                    self.random.shuffle(self.order)
+                    self.cursor = 0
+                take = min(
+                    self.batch_size - len(indices), len(self.order) - self.cursor
+                )
+                indices.extend(self.order[self.cursor : self.cursor + take])
+                self.cursor += take
+            yield indices
 
 
 class SemanticRTBatchProvider:
-    """Synchronous, exactly resumable provider for the three SemanticRT tasks."""
+    """Prefetched provider with checkpointable consumed order for all three tasks."""
 
     def __init__(self, config: ProjectConfig) -> None:
-        if config.data.num_workers != 0:
-            raise ValueError(
-                "The exactly resumable SemanticRT provider requires data.num_workers=0"
-            )
         self.batch_size = config.training.batch_size
+        self.num_workers = config.data.num_workers
+        self.pin_memory = config.data.pin_memory
+        self.seed = config.experiment.seed
         augmentation = SynchronizedImageAugmentation(
             SynchronizedAugmentationConfig(
                 crop_size=config.data.crop_size,
@@ -948,8 +1034,18 @@ class SemanticRTBatchProvider:
             self.randoms[task].shuffle(self.orders[task])
         self.cursors = {task: 0 for task in TaskType}
         self.cycles = {task: 0 for task in TaskType}
+        self.loaders: dict[TaskType, DataLoader] = {}
+        self.iterators: dict[TaskType, Any] = {}
+        self._rebuild_loaders()
 
     def next_batch(self, task: TaskType) -> FusionBatch:
+        if task not in self.iterators:
+            self.iterators[task] = iter(self.loaders[task])
+        batch = next(self.iterators[task])
+        self._advance_consumed_order(task)
+        return batch
+
+    def _advance_consumed_order(self, task: TaskType) -> None:
         indices: list[int] = []
         while len(indices) < self.batch_size:
             cursor = self.cursors[task]
@@ -962,7 +1058,40 @@ class SemanticRTBatchProvider:
             take = min(self.batch_size - len(indices), len(order) - cursor)
             indices.extend(order[cursor : cursor + take])
             self.cursors[task] = cursor + take
-        return collate_fusion_samples([self.datasets[task][index] for index in indices])
+
+    def _rebuild_loaders(self) -> None:
+        self._shutdown_loaders()
+        for task in TaskType:
+            sampler = _InfiniteBatchSampler(
+                self.orders[task],
+                self.cursors[task],
+                self.batch_size,
+                self.randoms[task].getstate(),
+            )
+            generator = torch.Generator().manual_seed(
+                self.seed + 7919 * (task.index + 1) + self.cycles[task]
+            )
+            loader = DataLoader(
+                self.datasets[task],
+                batch_sampler=sampler,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                collate_fn=collate_fusion_samples,
+                persistent_workers=self.num_workers > 0,
+                generator=generator,
+            )
+            self.loaders[task] = loader
+
+    def _shutdown_loaders(self) -> None:
+        for iterator in getattr(self, "iterators", {}).values():
+            shutdown = getattr(iterator, "_shutdown_workers", None)
+            if shutdown is not None:
+                shutdown()
+        self.iterators = {}
+        self.loaders = {}
+
+    def close(self) -> None:
+        self._shutdown_loaders()
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -1003,6 +1132,7 @@ class SemanticRTBatchProvider:
         }
         for key, value in state["random_states"].items():
             self.randoms[TaskType.parse(key)].setstate(value)
+        self._rebuild_loaders()
 
     @staticmethod
     def _project_path(value: str) -> Path:
@@ -1155,6 +1285,21 @@ class Trainer:
                         values,
                         extra={"terminal": False},
                     )
+                loss_gradient_values = " ".join(
+                    f"{name}={value:.5f}"
+                    for name, value in result.diagnostics.items()
+                    if name.startswith(
+                        ("grad_norm/seg_fusion", "grad_norm/semantic", "grad_ratio/")
+                    )
+                )
+                if loss_gradient_values:
+                    self.logger.info(
+                        "step=%d task=%s loss_group_gradients %s",
+                        self.state.global_step,
+                        task.value,
+                        loss_gradient_values,
+                        extra={"terminal": False},
+                    )
                 if (
                     self.rank == 0
                     and self.state.global_step
@@ -1213,7 +1358,7 @@ class Trainer:
         task_namespaces = {
             TaskType.VIF: {"fusion"},
             TaskType.MFIF: {"fusion", "focus"},
-            TaskType.SEG: {"semantic"},
+            TaskType.SEG: {"seg_fusion", "semantic"},
         }[task]
         task_components = [
             value.detach()
@@ -1233,7 +1378,20 @@ class Trainer:
         self.state.epoch = self.state.global_step // config.steps_per_epoch
         phase = active_phase(config.phases.phases, self.state.epoch)
         self.state.phase = phase.name
+        loss_multipliers = dict(phase.loss_multipliers)
         execution_policy = self.moe_scheduler.resolve(self.state.global_step)
+        if execution_policy is None:
+            execution_policy = MoEExecutionPolicy.legacy(
+                self.config.model.moe.train_execution == "sparse_batch"
+            )
+        compute_frequency, compute_infrared = expert_regularizer_flags(
+            config.losses, loss_multipliers, task
+        )
+        execution_policy = replace(
+            execution_policy,
+            compute_frequency_regularizers=compute_frequency,
+            compute_infrared_regularizers=compute_infrared,
+        )
         self._set_moe_execution_policy(execution_policy)
         self.state.router_temperature = (
             execution_policy.temperature
@@ -1247,7 +1405,10 @@ class Trainer:
             self._set_router_noise(execution_policy.noise_std)
         self.optimizer.zero_grad(set_to_none=True)
         aggregate: LossOutput | None = None
-        loss_multipliers = dict(phase.loss_multipliers)
+        loss_gradient_info: dict[str, float] = {}
+        loss_gradient_bucket = (
+            self.state.global_step // config.diagnostics.loss_gradient_interval
+        )
         if execution_policy is not None and execution_policy.expert_only:
             loss_multipliers.update({"moe": 0.0, "consistency": 0.0})
         with ExitStack() as stack:
@@ -1257,8 +1418,13 @@ class Trainer:
                     execution_policy is not None and execution_policy.expert_only
                 )
             )
-            for _ in range(config.gradient_accumulation_steps):
-                batch = self.provider.next_batch(task).to(self.device)
+            for micro_index in range(config.gradient_accumulation_steps):
+                batch = self.provider.next_batch(task).to(
+                    self.device,
+                    non_blocking=(
+                        self.device.type == "cuda" and self.config.data.pin_memory
+                    ),
+                )
                 with self.amp.autocast():
                     output = self.model(batch)
                     auxiliary: dict[str, Any] = {}
@@ -1281,6 +1447,18 @@ class Trainer:
                             loss_multipliers,
                         )
                     )
+                    if (
+                        micro_index == 0
+                        and task is TaskType.SEG
+                        and self.state.global_step
+                        < config.diagnostics.loss_gradient_until_step
+                        and loss_gradient_bucket > self.state.last_loss_gradient_bucket
+                    ):
+                        loss_gradient_info = loss_group_gradient_statistics(
+                            result, self._loss_gradient_parameters()
+                        )
+                        if loss_gradient_info:
+                            self.state.last_loss_gradient_bucket = loss_gradient_bucket
                     scaled_loss = result.total / config.gradient_accumulation_steps
                 self.amp.backward(scaled_loss)
                 aggregate = result
@@ -1302,6 +1480,7 @@ class Trainer:
         if self.ema is not None:
             self.ema.update(self.raw_model)
         aggregate.diagnostics.update(gradient_info)
+        aggregate.diagnostics.update(loss_gradient_info)
         diagnostics_config = config.diagnostics
         if (
             diagnostics_config.gradient_conflict_enabled
@@ -1444,6 +1623,18 @@ class Trainer:
             router = getattr(module, "router", None)
             if router is not None and hasattr(router, "temperature"):
                 router.temperature = temperature
+
+    def _loss_gradient_parameters(self) -> tuple[nn.Parameter, ...]:
+        selected: list[nn.Parameter] = []
+        for group in ("refinement_decoder", "shared_backbone"):
+            selected.extend(
+                parameter
+                for parameter in self.registry.parameters(group)
+                if parameter.requires_grad
+            )
+            if selected:
+                break
+        return tuple(selected[:8])
 
     def _set_router_noise(self, standard_deviation: float) -> None:
         for module in self.model.modules():

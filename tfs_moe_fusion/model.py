@@ -330,9 +330,9 @@ class ClosedLoopRefinement(nn.Module):
         ):
             return None
         detach = (
-            self.config.model.guidance.semantic.detach_guidance_input
-            or self.config.model.ablation.detach_semantic_input
-        )
+            not final
+            and self.config.model.guidance.semantic.detach_guidance_input
+        ) or self.config.model.ablation.detach_semantic_input
         return self.semantic_backend(image.detach() if detach else image)
 
     @staticmethod

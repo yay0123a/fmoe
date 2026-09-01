@@ -29,6 +29,7 @@ def _smoke_config(assets: tuple[Path, Path, Path] | None = None):
     config.model.guidance.semantic.enabled = False
     config.model.feedback.guide_channels = 8
     config.data.crop_size = 32
+    config.data.num_workers = 0
     config.data.horizontal_flip_probability = 0.0
     config.data.rotation_probability = 0.0
     if assets is not None:

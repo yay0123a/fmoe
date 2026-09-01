@@ -89,8 +89,12 @@ class SourceBatch:
                 f"got {self.image.shape[1]}"
             )
 
-    def to(self, device: torch.device | str) -> SourceBatch:
-        return SourceBatch(self.image.to(device), self.modality)
+    def to(
+        self, device: torch.device | str, *, non_blocking: bool = False
+    ) -> SourceBatch:
+        return SourceBatch(
+            self.image.to(device, non_blocking=non_blocking), self.modality
+        )
 
 
 @dataclass(slots=True)
@@ -149,11 +153,17 @@ class FusionBatch:
     def has_infrared(self) -> bool:
         return self.source_a.modality.is_infrared or self.source_b.modality.is_infrared
 
-    def to(self, device: torch.device | str) -> FusionBatch:
-        move = lambda value: value.to(device) if value is not None else None
+    def to(
+        self, device: torch.device | str, *, non_blocking: bool = False
+    ) -> FusionBatch:
+        move = (
+            lambda value: value.to(device, non_blocking=non_blocking)
+            if value is not None
+            else None
+        )
         return FusionBatch(
-            source_a=self.source_a.to(device),
-            source_b=self.source_b.to(device),
+            source_a=self.source_a.to(device, non_blocking=non_blocking),
+            source_b=self.source_b.to(device, non_blocking=non_blocking),
             task=self.task,
             sample_ids=self.sample_ids,
             target=move(self.target),

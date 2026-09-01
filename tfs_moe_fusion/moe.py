@@ -329,7 +329,7 @@ class SemanticExpert(FunctionalExpert):
             residual * gate,
             self.expert_type,
             _valid(tensor),
-            diagnostics={"gate": gate},
+            diagnostics={"gate": gate, "gate_logits": gate_logits},
         )
 
 
@@ -863,6 +863,8 @@ class MoEExecutionPolicy:
     expert_only: bool = False
     temperature: float | None = None
     noise_std: float = 0.0
+    compute_frequency_regularizers: bool = True
+    compute_infrared_regularizers: bool = True
 
     @property
     def sparse(self) -> bool:
@@ -925,10 +927,12 @@ class FunctionalMoEBlock(nn.Module):
         )
         regularizers: dict[str, list[Tensor]] = {}
         residual_rms: dict[str, Tensor] = {}
+        expert_sample_assignments = 0
         for index, expert in enumerate(self.experts):
             sample_indices = self._expert_indices(tensor, routing, index, policy)
             if sample_indices.numel() == 0:
                 continue
+            expert_sample_assignments += sample_indices.numel()
             selected_tensor = tensor.index_select(0, sample_indices)
             selected_context = self._select_context(expert_context, sample_indices)
             expert_output = expert(selected_tensor, selected_context)
@@ -947,10 +951,11 @@ class FunctionalMoEBlock(nn.Module):
                 ]
                 contribution = contribution * gates
             mixed_residual = mixed_residual.index_add(0, sample_indices, contribution)
-            for name, value in self._expert_regularizers(
-                expert_output, selected_context
-            ).items():
-                regularizers.setdefault(name, []).append(value)
+            if self._regularizers_enabled(expert_output.expert, policy):
+                for name, value in self._expert_regularizers(
+                    expert_output, selected_context
+                ).items():
+                    regularizers.setdefault(name, []).append(value)
             if retained_outputs is not None:
                 retained_outputs[self.expert_names[index]] = self._restore_output(
                     tensor, sample_indices, expert_output
@@ -958,6 +963,7 @@ class FunctionalMoEBlock(nn.Module):
         scaled_residual = self.residual_scale * mixed_residual
         output = tensor + scaled_residual
         auxiliary = dict(routing.auxiliary)
+        auxiliary["expert_sample_assignments"] = expert_sample_assignments
         auxiliary["expert_residual_rms"] = residual_rms
         auxiliary["residual_scale_rms"] = (
             self.residual_scale.detach().float().square().mean().sqrt()
@@ -1076,6 +1082,20 @@ class FunctionalMoEBlock(nn.Module):
         )
 
     @staticmethod
+    def _regularizers_enabled(
+        expert: ExpertType, policy: MoEExecutionPolicy
+    ) -> bool:
+        if expert in {
+            ExpertType.LOW_FREQUENCY,
+            ExpertType.DETAIL,
+            ExpertType.SEMANTIC,
+        }:
+            return policy.compute_frequency_regularizers
+        if expert is ExpertType.INFRARED_SALIENCY:
+            return policy.compute_infrared_regularizers
+        return False
+
+    @staticmethod
     def _expert_regularizers(
         output: ExpertOutput, context: ExpertContext
     ) -> dict[str, Tensor]:
@@ -1087,18 +1107,20 @@ class FunctionalMoEBlock(nn.Module):
             smooth = functional.avg_pool2d(residual, 5, stride=1, padding=2)
             return {"frequency/detail_leakage": smooth.abs().mean()}
         if output.expert is ExpertType.SEMANTIC:
-            gate = output.diagnostics.get("gate")
+            gate_logits = output.diagnostics.get("gate_logits")
             boundary = context.semantic_boundary
-            if isinstance(gate, Tensor) and boundary is not None:
+            if isinstance(gate_logits, Tensor) and boundary is not None:
                 target = functional.interpolate(
-                    boundary.to(gate),
-                    gate.shape[-2:],
+                    boundary.to(gate_logits),
+                    gate_logits.shape[-2:],
                     mode="bilinear",
                     align_corners=False,
                 ).clamp(0, 1)
                 return {
-                    "frequency/semantic_boundary": functional.binary_cross_entropy(
-                        gate.clamp(1e-6, 1 - 1e-6), target
+                    "frequency/semantic_boundary": (
+                        functional.binary_cross_entropy_with_logits(
+                            gate_logits, target
+                        )
                     )
                 }
         if output.expert is ExpertType.INFRARED_SALIENCY:

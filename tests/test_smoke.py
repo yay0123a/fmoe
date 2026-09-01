@@ -30,6 +30,46 @@ def test_default_config_selects_real_semantic_rt_training() -> None:
     assert config.model.guidance.semantic.model_dir == (
         "weights/segformer_b0_cityscapes"
     )
+    assert config.model.moe.block_counts == {"s1": 0, "s2": 1, "s3": 1, "s4": 1}
+    assert config.model.moe.top_k == 2
+    assert config.model.guidance.semantic.detach_guidance_input is True
+    assert config.data.num_workers == 4
+    assert config.data.pin_memory is True
+    warmup = config.training.moe_execution.warmup
+    assert (
+        warmup.uniform_steps,
+        warmup.uniform_to_soft_end,
+        warmup.soft_to_topk_end,
+    ) == (50, 150, 300)
+
+
+def test_default_config_uses_minimal_seg_loss_schedule() -> None:
+    config = load_config(DEFAULT_CONFIG)
+    losses = config.training.losses
+    assert losses.seg_fusion.enabled
+    assert (losses.seg_fusion.intensity, losses.seg_fusion.gradient) == (1.0, 1.0)
+    assert losses.semantic.cross_entropy == 1.0
+    assert losses.semantic.dice == 0.5
+    assert losses.semantic.coarse_supervision == 0.0
+    assert losses.semantic.boundary_alignment == 0.0
+    assert not losses.frequency.enabled
+    assert not losses.consistency.enabled
+
+    phases = config.training.phases.phases
+    assert [(phase.start, phase.end) for phase in phases] == [
+        (0, 5),
+        (5, 15),
+        (15, 44),
+        (44, 50),
+    ]
+    assert phases[0].loss_multipliers == {"seg_fusion": 1.0, "semantic": 0.25}
+    assert phases[1].loss_multipliers == {"seg_fusion": 1.0, "semantic": 0.5}
+    assert phases[2].loss_multipliers == {"seg_fusion": 0.75, "semantic": 1.0}
+    assert phases[3].loss_multipliers == {
+        "seg_fusion": 0.75,
+        "semantic": 1.0,
+        "moe": 1.5,
+    }
 
 
 def test_detailed_training_logs_can_be_hidden_from_terminal(

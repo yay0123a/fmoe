@@ -79,7 +79,7 @@ class MoEConfig:
     infrared_requires_ir_modality: bool = True
     placements: list[str] = field(default_factory=lambda: ["s2", "s3", "s4"])
     block_counts: dict[str, int] = field(
-        default_factory=lambda: {"s1": 0, "s2": 1, "s3": 2, "s4": 2}
+        default_factory=lambda: {"s1": 0, "s2": 1, "s3": 1, "s4": 1}
     )
     router_hidden_channels: int = 64
     expert_expansion: int = 2
@@ -119,7 +119,7 @@ class SemanticGuidanceConfig:
     input_size: int = 256
     num_classes: int = 19
     strict_loading: bool = True
-    detach_guidance_input: bool = False
+    detach_guidance_input: bool = True
     guidance_policy: str = "all"
     guidance_tasks: list[str] = field(default_factory=lambda: ["vif", "mfif", "seg"])
     final_pass_policy: str = "seg_only"
@@ -178,8 +178,8 @@ class ModelConfig:
 @dataclass(slots=True)
 class DataConfig:
     dataset: str = "semantic_rt"
-    num_workers: int = 0
-    pin_memory: bool = False
+    num_workers: int = 4
+    pin_memory: bool = True
     root: str = "data/semantic_rt"
     mfif_root: str = "data/mfif/semantic_rt"
     manifest: str = "data/splits/semantic_rt_test_uniform_2000_seed3407.txt"
@@ -253,19 +253,26 @@ class FocusLossConfig:
 @dataclass(slots=True)
 class SemanticLossConfig:
     cross_entropy: float = 1.0
-    dice: float = 1.0
-    coarse_supervision: float = 0.25
+    dice: float = 0.5
+    coarse_supervision: float = 0.0
     ignore_index: int = 255
     class_weights: list[float] | None = None
     improvement_enabled: bool = False
     improvement_weight: float = 0.0
     improvement_margin: float = 0.0
-    boundary_alignment: float = 0.05
+    boundary_alignment: float = 0.0
+
+
+@dataclass(slots=True)
+class SegFusionAnchorLossConfig:
+    enabled: bool = True
+    intensity: float = 1.0
+    gradient: float = 1.0
 
 
 @dataclass(slots=True)
 class FrequencyLossConfig:
-    enabled: bool = True
+    enabled: bool = False
     weight: float = 0.01
     low_leakage: float = 1.0
     detail_leakage: float = 1.0
@@ -286,7 +293,7 @@ class MoEBalanceLossConfig:
 
 @dataclass(slots=True)
 class TaskConsistencyLossConfig:
-    enabled: bool = True
+    enabled: bool = False
     weight: float = 0.01
     probability: float = 0.25
     gaussian_kernel_size: int = 9
@@ -313,6 +320,9 @@ class LossConfig:
     vif: VIFFusionLossConfig = field(default_factory=VIFFusionLossConfig)
     mfif: MFIFFusionLossConfig = field(default_factory=MFIFFusionLossConfig)
     focus: FocusLossConfig = field(default_factory=FocusLossConfig)
+    seg_fusion: SegFusionAnchorLossConfig = field(
+        default_factory=SegFusionAnchorLossConfig
+    )
     semantic: SemanticLossConfig = field(default_factory=SemanticLossConfig)
     frequency: FrequencyLossConfig = field(default_factory=FrequencyLossConfig)
     moe: MoEBalanceLossConfig = field(default_factory=MoEBalanceLossConfig)
@@ -354,10 +364,30 @@ class TrainingPhaseConfig:
 
 def _default_training_phases() -> list[TrainingPhaseConfig]:
     return [
-        TrainingPhaseConfig("stabilization", 0, 6),
-        TrainingPhaseConfig("frequency_alignment", 6, 12),
-        TrainingPhaseConfig("joint", 12, 44),
-        TrainingPhaseConfig("routing_finetune", 44, 50),
+        TrainingPhaseConfig(
+            "stabilization",
+            0,
+            5,
+            {"seg_fusion": 1.0, "semantic": 0.25},
+        ),
+        TrainingPhaseConfig(
+            "semantic_ramp",
+            5,
+            15,
+            {"seg_fusion": 1.0, "semantic": 0.5},
+        ),
+        TrainingPhaseConfig(
+            "joint",
+            15,
+            44,
+            {"seg_fusion": 0.75, "semantic": 1.0},
+        ),
+        TrainingPhaseConfig(
+            "routing_finetune",
+            44,
+            50,
+            {"seg_fusion": 0.75, "semantic": 1.0, "moe": 1.5},
+        ),
     ]
 
 
@@ -376,9 +406,9 @@ class RouterTemperatureScheduleConfig:
 
 @dataclass(slots=True)
 class MoEWarmupConfig:
-    uniform_steps: int = 250
-    uniform_to_soft_end: int = 750
-    soft_to_topk_end: int = 1500
+    uniform_steps: int = 50
+    uniform_to_soft_end: int = 150
+    soft_to_topk_end: int = 300
 
 
 @dataclass(slots=True)
@@ -431,6 +461,8 @@ class TrainingDiagnosticsConfig:
     gradient_conflict_interval: int = 1000
     router_collapse_threshold: float = 0.95
     collapse_patience: int = 10
+    loss_gradient_interval: int = 100
+    loss_gradient_until_step: int = 1000
 
 
 @dataclass(slots=True)
@@ -603,8 +635,8 @@ class ProjectConfig:
             raise ConfigurationError(
                 "moe.block_counts must define non-negative s1/s2/s3/s4 counts"
             )
-        if model.moe.block_counts != {"s1": 0, "s2": 1, "s3": 2, "s4": 2}:
-            raise ConfigurationError("The encoder requires MoE counts 0/1/2/2")
+        if model.moe.block_counts != {"s1": 0, "s2": 1, "s3": 1, "s4": 1}:
+            raise ConfigurationError("The encoder requires MoE counts 0/1/1/1")
         if model.moe.train_execution not in {
             "dense_masked",
             "sparse_batch",
@@ -866,6 +898,8 @@ class ProjectConfig:
         if (
             training.diagnostics.interval <= 0
             or training.diagnostics.collapse_patience <= 0
+            or training.diagnostics.loss_gradient_interval <= 0
+            or training.diagnostics.loss_gradient_until_step < 0
         ):
             raise ConfigurationError("training diagnostic intervals must be positive")
         if not 0 < training.diagnostics.router_collapse_threshold <= 1:
@@ -881,6 +915,9 @@ class ProjectConfig:
             raise ConfigurationError("checkpoint.keep_last must be positive")
         if training.losses.focus.selection < 0 or training.losses.focus.boundary < 0:
             raise ConfigurationError("Focus loss weights cannot be negative")
+        seg_fusion = training.losses.seg_fusion
+        if min(seg_fusion.intensity, seg_fusion.gradient) < 0:
+            raise ConfigurationError("SEG fusion anchor weights cannot be negative")
         balance = training.losses.moe
         if balance.hard_load_weight is not None:
             import warnings
@@ -904,6 +941,16 @@ class ProjectConfig:
         if training.losses.infrared.saliency_alignment < 0:
             raise ConfigurationError("infrared.saliency_alignment cannot be negative")
         semantic_loss = training.losses.semantic
+        if (
+            min(
+                semantic_loss.cross_entropy,
+                semantic_loss.dice,
+                semantic_loss.coarse_supervision,
+                semantic_loss.boundary_alignment,
+            )
+            < 0
+        ):
+            raise ConfigurationError("Semantic loss weights cannot be negative")
         if (
             semantic_loss.class_weights is not None
             and len(semantic_loss.class_weights) != semantic.num_classes

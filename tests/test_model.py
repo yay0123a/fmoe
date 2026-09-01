@@ -263,7 +263,11 @@ from pathlib import Path
 
 import torch
 
-from tfs_moe_fusion.guidance import FrozenSegformerBackend, LightweightFocusHead
+from tfs_moe_fusion.guidance import (
+    FrozenSegformerBackend,
+    LightweightFocusHead,
+    SemanticGuideOutput,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SEMANTIC_DIR = ROOT / "weights/segformer_b0_cityscapes"
@@ -356,6 +360,21 @@ def _expert_context(feature: torch.Tensor, has_ir: bool) -> ExpertContext:
         source_a_feature=torch.randn_like(feature),
         source_b_feature=torch.randn_like(feature),
     )
+
+
+def test_semantic_boundary_regularizer_uses_logits_and_is_differentiable() -> None:
+    feature = torch.randn(2, 8, 9, 11, requires_grad=True)
+    context = _expert_context(feature, has_ir=True)
+    context.semantic_boundary = torch.rand(2, 1, 9, 11)
+    semantic = build_functional_expert(ExpertType.SEMANTIC, 8)
+    output = semantic(feature, context)
+
+    assert "gate_logits" in output.diagnostics
+    regularizers = FunctionalMoEBlock._expert_regularizers(output, context)
+    loss = regularizers["frequency/semantic_boundary"]
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert feature.grad is not None and torch.isfinite(feature.grad).all()
 
 
 def test_joint_router_normalization_mask_and_diagnostics() -> None:
@@ -494,6 +513,81 @@ def test_sparse_execution_never_calls_an_unselected_expert() -> None:
     assert all(calls[index] == int(index in selected) for index in range(len(calls)))
 
 
+def test_sparse_execution_has_exactly_batch_times_topk_assignments() -> None:
+    config = MoEConfig(
+        experts=EXPERTS,
+        top_k=2,
+        router_hidden_channels=16,
+        expert_expansion=1,
+    )
+    block = FunctionalMoEBlock(8, config, "s2").eval()
+    feature = torch.randn(2, 8, 9, 11)
+    output = block(
+        feature,
+        _router_context(feature, has_ir=True),
+        _expert_context(feature, has_ir=True),
+        sparse_execution=True,
+    )
+    assert output.diagnostics.auxiliary["expert_sample_assignments"] == 4
+
+
+def test_dense_execution_assignments_equal_valid_expert_mask() -> None:
+    config = MoEConfig(
+        experts=EXPERTS,
+        top_k=2,
+        router_hidden_channels=16,
+        expert_expansion=1,
+    )
+    block = FunctionalMoEBlock(8, config, "s2").eval()
+    feature = torch.randn(2, 8, 9, 11)
+    output = block(
+        feature,
+        _router_context(feature, has_ir=True),
+        _expert_context(feature, has_ir=True),
+        sparse_execution=False,
+    )
+    assert output.diagnostics.auxiliary["expert_sample_assignments"] == int(
+        output.router.valid_expert_mask.sum()
+    )
+
+
+def test_disabled_frequency_regularizers_preserve_infrared_regularizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tfs_moe_fusion.moe import MoEExecutionPolicy
+
+    config = MoEConfig(
+        experts=EXPERTS,
+        top_k=2,
+        router_hidden_channels=16,
+        expert_expansion=1,
+    )
+    block = FunctionalMoEBlock(8, config, "s2").train()
+    block.set_execution_policy(
+        MoEExecutionPolicy(
+            "dense_uniform",
+            compute_frequency_regularizers=False,
+            compute_infrared_regularizers=True,
+        )
+    )
+    called: list[ExpertType] = []
+
+    def record(output, context):
+        called.append(output.expert)
+        return {}
+
+    monkeypatch.setattr(
+        FunctionalMoEBlock, "_expert_regularizers", staticmethod(record)
+    )
+    feature = torch.randn(2, 8, 9, 11)
+    block(
+        feature,
+        _router_context(feature, has_ir=True),
+        _expert_context(feature, has_ir=True),
+    )
+    assert called == [ExpertType.INFRARED_SALIENCY]
+
+
 def test_annealed_topk_boundary_matches_sparse_without_retaining_residuals() -> None:
     from tfs_moe_fusion.moe import MoEExecutionPolicy
 
@@ -598,9 +692,7 @@ def test_final_closed_loop_contract_for_every_task(task: TaskType) -> None:
     assert [item.block_id for item in output.router_diagnostics] == [
         "s2.moe0",
         "s3.moe0",
-        "s3.moe1",
         "s4.moe0",
-        "s4.moe1",
         "feedback.s3.moe0",
         "feedback.s2.moe0",
     ]
@@ -609,9 +701,7 @@ def test_final_closed_loop_contract_for_every_task(task: TaskType) -> None:
         "input_b",
         "s2.moe0.input",
         "s3.moe0.input",
-        "s3.moe1.input",
         "s4.moe0.input",
-        "s4.moe1.input",
         "feedback.s3.moe0.input",
         "feedback.s2.moe0.input",
     ]
@@ -641,6 +731,48 @@ def test_final_backward_without_external_semantic_assets() -> None:
     ]
     assert trainable_gradients
     assert all(torch.isfinite(value).all() for value in trainable_gradients)
+
+
+@pytest.mark.parametrize("detach", [True, False])
+def test_semantic_guidance_input_detach_is_configurable(detach: bool) -> None:
+    class DifferentiableSemanticBackend(torch.nn.Module):
+        def forward(self, image: torch.Tensor) -> SemanticGuideOutput:
+            logits = image.mean(1, keepdim=True)
+            probabilities = logits.sigmoid()
+            uncertainty = probabilities * (1 - probabilities)
+            boundary = probabilities.square()
+            return SemanticGuideOutput(
+                logits,
+                probabilities,
+                uncertainty,
+                boundary,
+                (image.mean((-2, -1), keepdim=True),),
+            )
+
+    config = _config()
+    config.model.guidance.semantic.detach_guidance_input = detach
+    model = build_model(config)
+    model.feedback.semantic_backend = DifferentiableSemanticBackend()
+    coarse = torch.randn(1, 3, 9, 11, requires_grad=True)
+
+    output = model.feedback._semantic(coarse, TaskType.SEG)
+
+    assert output is not None
+    assert output.logits.shape == output.probabilities.shape == (1, 1, 9, 11)
+    assert output.uncertainty.shape == output.boundary.shape == (1, 1, 9, 11)
+    assert len(output.features) == 1
+    assert output.logits.requires_grad is not detach
+    if not detach:
+        output.logits.sum().backward()
+        assert coarse.grad is not None and torch.count_nonzero(coarse.grad)
+    else:
+        assert coarse.grad is None
+
+    final = torch.randn(1, 3, 9, 11, requires_grad=True)
+    final_output = model.feedback._semantic(final, TaskType.SEG, final=True)
+    assert final_output is not None and final_output.logits.requires_grad
+    final_output.logits.sum().backward()
+    assert final.grad is not None and torch.count_nonzero(final.grad)
 
 
 def test_initial_and_feedback_moe_parameters_are_independent() -> None:
