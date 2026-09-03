@@ -1,0 +1,16 @@
+_base_: semantic_rt_y_only_stage1.yaml
+
+experiment:
+  name: semantic_rt_y_only_experiment_b_directional_gradient
+
+training:
+  losses:
+    vif:
+      intensity: 1.0
+      gradient: 0.5
+      ssim: 0.5
+      color: 0.0
+      coarse_supervision: 0.1
+      gradient_mode: directional_visible_anchor
+      ir_gradient_dominance_ratio: 1.2
+      visible_gradient_support_kernel: 3

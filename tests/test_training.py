@@ -113,8 +113,14 @@ def test_frequency_specialization_reports_both_leakages() -> None:
 
 
 from tfs_moe_fusion.losses import (
+    directional_gradient_loss,
+    directional_gradient_targets,
+    luminance,
     mfif_losses,
+    normalized_edge_energy,
     seg_fusion_anchor_losses,
+    ssim,
+    vif_intensity_target,
     vif_losses,
 )
 
@@ -130,6 +136,132 @@ def test_vif_and_mfif_losses_are_finite_and_differentiable() -> None:
     assert values
     sum(values.values()).backward()
     assert fused.grad is not None and torch.isfinite(fused.grad).all()
+
+
+def test_ssim_stays_bounded_under_bf16_autocast() -> None:
+    vertical = torch.linspace(0, 1, 64).view(1, 1, 64, 1)
+    horizontal = torch.linspace(0, 1, 64).view(1, 1, 1, 64)
+    left = 0.4 + 0.005 * (horizontal + vertical - 1)
+    right = 0.4 + 0.005 * (horizontal - vertical)
+
+    expected = ssim(left, right)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        actual = ssim(left, right)
+
+    assert torch.isfinite(actual)
+    assert -1 <= actual <= 1
+    torch.testing.assert_close(actual, expected)
+
+
+def test_ssim_is_one_for_identical_constant_images() -> None:
+    image = torch.full((2, 3, 17, 19), 0.4, requires_grad=True)
+    score = ssim(image, image)
+
+    torch.testing.assert_close(score, torch.tensor(1.0), atol=5e-4, rtol=0)
+    (1 - score).backward()
+    assert image.grad is not None and torch.isfinite(image.grad).all()
+
+
+def test_vif_visible_anchor_ssim_uses_y_not_free_rgb_chroma() -> None:
+    predicted_y = torch.rand(1, 1, 17, 19, requires_grad=True)
+    visible = torch.rand(1, 3, 17, 19)
+    infrared = torch.rand(1, 1, 17, 19)
+    fused_with_unrelated_chroma = torch.rand_like(visible)
+
+    values = vif_losses(
+        fused_with_unrelated_chroma,
+        visible,
+        infrared,
+        predicted_y,
+        ssim_mode="visible_anchor",
+    )
+
+    expected = 1 - ssim(predicted_y, luminance(visible))
+    torch.testing.assert_close(values["fusion/ssim"], expected)
+    values["fusion/ssim"].backward()
+    assert predicted_y.grad is not None and torch.isfinite(predicted_y.grad).all()
+
+
+def test_directional_gradient_protects_nearby_visible_edges() -> None:
+    visible = torch.zeros(2, 1, 15, 15)
+    infrared = torch.zeros_like(visible)
+    visible[0, :, :, 5:] = 0.5
+    infrared[0, :, :, 6:] = 0.55
+    infrared[1, :, :, 9:] = 0.8
+
+    _, _, choose_ir = directional_gradient_targets(
+        visible,
+        infrared,
+        ir_dominance_ratio=1.2,
+        visible_support_kernel=3,
+    )
+
+    assert not choose_ir[0, :, :, 4:8].any()
+    assert choose_ir[1, :, :, 8:11].any()
+    torch.testing.assert_close(
+        directional_gradient_loss(
+            visible[:1],
+            visible[:1],
+            infrared[:1],
+            ir_dominance_ratio=1.2,
+            visible_support_kernel=3,
+        ),
+        torch.tensor(0.0),
+    )
+
+
+def test_directional_gradient_loss_is_differentiable() -> None:
+    fused_y = torch.rand(2, 1, 15, 17, requires_grad=True)
+    loss = directional_gradient_loss(
+        fused_y,
+        torch.rand_like(fused_y),
+        torch.rand_like(fused_y),
+    )
+    loss.backward()
+    assert fused_y.grad is not None and torch.isfinite(fused_y.grad).all()
+
+
+def test_normalized_edge_energy_has_no_flat_region_floor() -> None:
+    flat = torch.full((2, 1, 15, 17), 0.4)
+    energy = normalized_edge_energy(flat)
+    assert torch.count_nonzero(energy[..., 2:-2, 2:-2]) == 0
+
+
+def test_weighted_intensity_is_visible_anchored_and_bounded() -> None:
+    visible = torch.full((1, 1, 17, 19), 0.4)
+    infrared = visible.clone()
+    infrared[..., 5:12, 6:13] = 0.9
+    target, weight = vif_intensity_target(
+        visible,
+        infrared,
+        mode="gradient_weighted_visible_anchor",
+        energy_normalization="per_sample_mean",
+        ir_max_weight=0.3,
+        visible_support_kernel=3,
+        weight_smoothing_kernel=3,
+    )
+
+    assert weight is not None
+    assert weight.min() >= 0
+    assert weight.max() <= 0.3 + 1e-7
+    assert torch.count_nonzero(weight[..., 4:13, 5:14]) > 0
+    assert torch.all(target >= torch.minimum(visible, infrared))
+    assert torch.all(target <= torch.maximum(visible, infrared))
+    torch.testing.assert_close(target[weight == 0], visible[weight == 0])
+
+
+def test_weighted_intensity_keeps_flat_modalities_at_visible_y() -> None:
+    visible = torch.full((1, 1, 15, 17), 0.2)
+    infrared = torch.full_like(visible, 0.9)
+    target, weight = vif_intensity_target(
+        visible,
+        infrared,
+        mode="gradient_weighted_visible_anchor",
+    )
+
+    assert weight is not None
+    torch.testing.assert_close(weight, torch.zeros_like(weight), atol=1e-6, rtol=0)
+    torch.testing.assert_close(target, visible, atol=1e-6, rtol=0)
 
 
 def test_seg_fusion_anchor_is_minimal_and_differentiable() -> None:
@@ -193,6 +325,73 @@ def test_loss_manager_returns_structured_vif_output() -> None:
     )
     assert value.total.requires_grad and "fusion/intensity" in value.components
     assert value.diagnostics["task"] == "vif" and torch.isfinite(value.total)
+    for name in (
+        "chroma_cb_error",
+        "chroma_cr_error",
+        "y_gamut_clip_ratio",
+        "coarse_final_y_mae",
+        "y_gradient_loss",
+    ):
+        assert name in value.diagnostics
+        assert torch.isfinite(torch.as_tensor(value.diagnostics[name]))
+
+
+def test_loss_manager_uses_configured_directional_vif_gradient() -> None:
+    config = _smoke_config()
+    config.training.losses.vif.gradient_mode = "directional_visible_anchor"
+    config.training.losses.vif.ir_gradient_dominance_ratio = 1.2
+    config.training.losses.vif.visible_gradient_support_kernel = 3
+    model = build_model(config).train()
+    batch = make_probe_batch(config, TaskType.VIF)
+    output = model(batch)
+    value = MultiTaskLossManager(config.training.losses)(
+        LossContext(batch, output, TaskType.VIF, 0, 0, model)
+    )
+    expected = directional_gradient_loss(
+        output.fused_y,
+        batch.visible_source.image,
+        batch.infrared_source.image,
+        ir_dominance_ratio=1.2,
+        visible_support_kernel=3,
+    )
+
+    torch.testing.assert_close(value.components["fusion/gradient"], expected)
+    assert value.diagnostics["vif/gradient_mode"] == "directional_visible_anchor"
+
+
+def test_loss_manager_uses_configured_weighted_intensity_target() -> None:
+    config = _smoke_config()
+    vif = config.training.losses.vif
+    vif.intensity_mode = "gradient_weighted_visible_anchor"
+    vif.ir_intensity_max_weight = 0.3
+    model = build_model(config).train()
+    batch = make_probe_batch(config, TaskType.VIF)
+    output = model(batch)
+    value = MultiTaskLossManager(config.training.losses)(
+        LossContext(batch, output, TaskType.VIF, 0, 0, model)
+    )
+    target, weight = vif_intensity_target(
+        batch.visible_source.image,
+        batch.infrared_source.image,
+        mode="gradient_weighted_visible_anchor",
+        energy_normalization=vif.intensity_energy_normalization,
+        ir_max_weight=0.3,
+        visible_support_kernel=vif.intensity_visible_support_kernel,
+        weight_smoothing_kernel=vif.intensity_weight_smoothing_kernel,
+    )
+
+    assert output.fused_y is not None and weight is not None
+    torch.testing.assert_close(
+        value.components["fusion/intensity"],
+        (output.fused_y - target).abs().mean(),
+    )
+    assert value.diagnostics["vif/intensity_mode"] == (
+        "gradient_weighted_visible_anchor"
+    )
+    torch.testing.assert_close(
+        value.diagnostics["ir_intensity_weight_mean"], weight.mean()
+    )
+    assert value.diagnostics["ir_intensity_weight_max"] <= 0.3 + 1e-7
 
 
 def test_seg_loss_has_fusion_anchor_without_vif_ssim_or_color() -> None:
@@ -248,6 +447,7 @@ from tfs_moe_fusion.trainer import (
     RouterLoadMonitor,
     expert_regularizer_flags,
     loss_group_gradient_statistics,
+    scheduled_task,
 )
 
 
@@ -266,6 +466,23 @@ def test_seg_loss_group_gradient_ratio_is_reported() -> None:
     assert values["grad_norm/seg_fusion"] == pytest.approx(4.0)
     assert values["grad_norm/semantic"] == pytest.approx(36.0)
     assert values["grad_ratio/semantic_to_fusion"] == pytest.approx(9.0)
+
+
+def test_scheduled_task_resets_each_phase_pattern() -> None:
+    config = load_config(ROOT / "configs/default.yaml")
+    phases = config.training.task_schedule
+    steps = config.training.steps_per_epoch
+
+    assert scheduled_task(phases, 0, steps) is TaskType.VIF
+    assert scheduled_task(phases, 20 * steps, steps) is TaskType.SEG
+    assert scheduled_task(phases, 20 * steps + 1, steps) is TaskType.VIF
+    assert scheduled_task(phases, 21 * steps, steps) is TaskType.SEG
+    assert scheduled_task(phases, 21 * steps + 2, steps) is TaskType.VIF
+    assert scheduled_task(phases, 25 * steps, steps) is TaskType.VIF
+    assert scheduled_task(phases, 30 * steps, steps) is TaskType.MFIF
+    assert scheduled_task(phases, 30 * steps + 3, steps) is TaskType.VIF
+    assert scheduled_task(phases, 40 * steps, steps) is TaskType.VIF
+    assert scheduled_task(phases, 40 * steps + 1, steps) is TaskType.SEG
 
 
 def test_loss_group_gradient_statistics_skips_detached_namespace() -> None:
@@ -387,6 +604,8 @@ def test_optimizer_groups_cover_trainable_parameters_exactly_once() -> None:
     assert {id(parameter) for parameter in optimized} == {
         id(parameter) for parameter in model.parameters() if parameter.requires_grad
     }
+    assert registry.names["core.fusion_y_head.0.weight"] == "coarse_decoder"
+    assert registry.names["core.mfif_rgb_head.0.weight"] == "coarse_decoder"
 
 
 from pathlib import Path
@@ -497,8 +716,8 @@ def test_train_displays_one_progress_bar_per_epoch(
     trainer.train()
 
     assert [item.kwargs["desc"] for item in progress_bars] == [
-        "Epoch 1/2 [stabilization]",
-        "Epoch 2/2 [stabilization]",
+        "Epoch 1/2 [vif_base]",
+        "Epoch 2/2 [vif_base]",
     ]
     assert [item.updates for item in progress_bars] == [2, 2]
     assert all(set(item.postfix) == {"task", "loss", "lr"} for item in progress_bars)

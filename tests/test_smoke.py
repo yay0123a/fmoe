@@ -20,19 +20,21 @@ DEFAULT_CONFIG = ROOT / "configs/default.yaml"
 
 def test_default_config_selects_real_semantic_rt_training() -> None:
     config = load_config(DEFAULT_CONFIG)
+    assert config.experiment.name == "semantic_rt_vif_curriculum_2000_single_gpu"
     assert config.data.dataset == "semantic_rt"
     assert config.data.root == "data/semantic_rt"
     assert config.data.mfif_root == "data/mfif/semantic_rt"
     assert config.data.manifest == (
         "data/splits/semantic_rt_test_uniform_2000_seed3407.txt"
     )
-    assert config.training.device == "cuda:0"
+    assert config.training.device.startswith("cuda:")
     assert config.model.guidance.semantic.model_dir == (
         "weights/segformer_b0_cityscapes"
     )
     assert config.model.moe.block_counts == {"s1": 0, "s2": 1, "s3": 1, "s4": 1}
     assert config.model.moe.top_k == 2
     assert config.model.guidance.semantic.detach_guidance_input is True
+    assert config.model.feedback.vif_seg_refinement_enabled is False
     assert config.data.num_workers == 4
     assert config.data.pin_memory is True
     warmup = config.training.moe_execution.warmup
@@ -41,9 +43,105 @@ def test_default_config_selects_real_semantic_rt_training() -> None:
         warmup.uniform_to_soft_end,
         warmup.soft_to_topk_end,
     ) == (50, 150, 300)
+    assert config.training.task_sampling.strategy == "scheduled"
+    assert [phase.pattern for phase in config.training.task_schedule] == [
+        ["vif"],
+        ["seg", "vif"],
+        ["seg", "seg", "vif"],
+        ["seg", "seg", "seg", "vif"],
+        ["vif"],
+        ["mfif", "mfif", "mfif", "vif"],
+        ["vif"],
+        ["vif", "seg", "vif", "mfif"],
+    ]
+    assert config.training.diagnostics.loss_gradient_interval == 250
+    assert config.training.diagnostics.loss_gradient_until_step == 20_000
+    assert config.training.checkpoint.every_epochs == 5
+    assert config.training.losses.vif.color == 0.0
 
 
-def test_default_config_uses_minimal_seg_loss_schedule() -> None:
+def test_stage1_y_only_config_is_a_five_epoch_vif_probe() -> None:
+    config = load_config(ROOT / "configs/semantic_rt_y_only_stage1.yaml")
+    assert config.experiment.name == "semantic_rt_y_only_stage1_vif_5epoch"
+    assert config.training.epochs == 5
+    assert config.training.task_sampling.strategy == "scheduled"
+    assert len(config.training.task_schedule) == 1
+    assert config.training.task_schedule[0].pattern == ["vif"]
+    assert config.training.task_schedule[0].end_epoch == 5
+    assert config.training.phases.phases[0].end == 5
+    assert config.training.losses.vif.color == 0.0
+    assert config.training.checkpoint.every_epochs == 1
+
+
+def test_experiment_b_changes_only_vif_gradient_family_and_weights() -> None:
+    config = load_config(ROOT / "configs/semantic_rt_y_only_experiment_b.yaml")
+    vif = config.training.losses.vif
+    assert config.experiment.name == (
+        "semantic_rt_y_only_experiment_b_directional_gradient"
+    )
+    assert config.training.epochs == 5
+    assert len(config.training.task_schedule) == 1
+    assert config.training.task_schedule[0].pattern == ["vif"]
+    assert (vif.intensity, vif.gradient, vif.ssim) == (1.0, 0.5, 0.5)
+    assert (vif.color, vif.coarse_supervision) == (0.0, 0.1)
+    assert vif.gradient_mode == "directional_visible_anchor"
+    assert vif.ir_gradient_dominance_ratio == 1.2
+    assert vif.visible_gradient_support_kernel == 3
+    assert config.model.feedback.vif_seg_refinement_enabled is False
+
+
+def test_experiment_c_adds_only_visible_anchored_weighted_intensity() -> None:
+    config = load_config(ROOT / "configs/semantic_rt_y_only_experiment_c.yaml")
+    vif = config.training.losses.vif
+    assert config.experiment.name == (
+        "semantic_rt_y_only_experiment_c_weighted_intensity"
+    )
+    assert config.training.epochs == 5
+    assert config.training.task_schedule[0].pattern == ["vif"]
+    assert vif.intensity_mode == "gradient_weighted_visible_anchor"
+    assert vif.intensity_energy_normalization == "per_sample_mean"
+    assert vif.ir_intensity_max_weight == 0.3
+    assert vif.intensity_visible_support_kernel == 3
+    assert vif.intensity_weight_smoothing_kernel == 3
+    assert vif.gradient_mode == "directional_visible_anchor"
+    assert (vif.intensity, vif.gradient, vif.ssim) == (1.0, 0.5, 0.5)
+    assert (vif.color, vif.coarse_supervision) == (0.0, 0.1)
+    assert config.model.feedback.vif_seg_refinement_enabled is False
+
+
+def test_experiment_d0_is_a_500_step_no_ssim_probe() -> None:
+    config = load_config(ROOT / "configs/semantic_rt_y_only_experiment_d0_no_ssim.yaml")
+    vif = config.training.losses.vif
+
+    assert config.experiment.name == (
+        "semantic_rt_y_only_experiment_d0_no_ssim_500step"
+    )
+    assert config.training.epochs == 1
+    assert config.training.steps_per_epoch == 500
+    assert config.training.scheduler.warmup_steps == 100
+    assert config.training.task_schedule[0].pattern == ["vif"]
+    assert config.training.task_schedule[0].end_epoch == 1
+    assert config.training.phases.phases[0].end == 1
+    assert vif.ssim == 0.0
+    assert vif.ssim_mode == "visible_anchor"
+
+
+def test_experiment_d_uses_low_weight_visible_anchored_y_ssim() -> None:
+    config = load_config(
+        ROOT / "configs/semantic_rt_y_only_experiment_d_stable_ssim.yaml"
+    )
+    vif = config.training.losses.vif
+
+    assert config.experiment.name == "semantic_rt_y_only_experiment_d_stable_y_ssim"
+    assert config.training.epochs == 5
+    assert config.training.steps_per_epoch == 750
+    assert vif.ssim == 0.1
+    assert vif.ssim_mode == "visible_anchor"
+    assert vif.intensity_mode == "gradient_weighted_visible_anchor"
+    assert vif.gradient_mode == "directional_visible_anchor"
+
+
+def test_default_config_uses_vif_anchored_loss_schedule() -> None:
     config = load_config(DEFAULT_CONFIG)
     losses = config.training.losses
     assert losses.seg_fusion.enabled
@@ -57,19 +155,21 @@ def test_default_config_uses_minimal_seg_loss_schedule() -> None:
 
     phases = config.training.phases.phases
     assert [(phase.start, phase.end) for phase in phases] == [
-        (0, 5),
-        (5, 15),
-        (15, 44),
-        (44, 50),
+        (0, 20),
+        (20, 21),
+        (21, 23),
+        (23, 25),
+        (25, 30),
+        (30, 35),
+        (35, 40),
+        (40, 50),
     ]
     assert phases[0].loss_multipliers == {"seg_fusion": 1.0, "semantic": 0.25}
-    assert phases[1].loss_multipliers == {"seg_fusion": 1.0, "semantic": 0.5}
-    assert phases[2].loss_multipliers == {"seg_fusion": 0.75, "semantic": 1.0}
-    assert phases[3].loss_multipliers == {
-        "seg_fusion": 0.75,
-        "semantic": 1.0,
-        "moe": 1.5,
-    }
+    assert phases[1].loss_multipliers == {"seg_fusion": 1.0, "semantic": 0.25}
+    assert phases[2].loss_multipliers == {"seg_fusion": 1.0, "semantic": 0.5}
+    assert phases[3].loss_multipliers == {"seg_fusion": 1.0, "semantic": 1.0}
+    assert all(not phase.loss_multipliers for phase in phases[4:7])
+    assert phases[7].loss_multipliers == {"seg_fusion": 1.0, "semantic": 1.0}
 
 
 def test_detailed_training_logs_can_be_hidden_from_terminal(

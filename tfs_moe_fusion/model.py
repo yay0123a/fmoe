@@ -9,6 +9,7 @@ from torch import Tensor, nn
 from torch.nn import functional
 
 from tfs_moe_fusion.backbone import ArbitrarySizePadder, BackboneOutput, FeaturePyramid
+from tfs_moe_fusion.color import rgb_to_ycbcr
 from tfs_moe_fusion.config import ProjectConfig
 from tfs_moe_fusion.frequency import spectral_statistics
 from tfs_moe_fusion.guidance import (
@@ -213,6 +214,9 @@ class FeedbackResult:
     final: Tensor
     coarse: Tensor
     refinement: Tensor
+    final_y: Tensor | None
+    coarse_y: Tensor | None
+    refinement_y: Tensor | None
     auxiliary: AuxiliaryOutputs
     coarse_semantic: SemanticGuideOutput | None
     final_semantic: SemanticGuideOutput | None
@@ -350,6 +354,14 @@ class ClosedLoopRefinement(nn.Module):
         )
 
     def forward(self, batch: FusionBatch, backbone: BackboneOutput) -> FeedbackResult:
+        if batch.task in {TaskType.VIF, TaskType.SEG}:
+            if self.config.model.feedback.vif_seg_refinement_enabled:
+                raise RuntimeError(
+                    "VIF/SEG refinement is disabled in Stage 1; Stage 2 must use a "
+                    "dedicated Y-only residual head"
+                )
+            return self._y_only_coarse_result(batch, backbone)
+
         coarse = backbone.padded_fused_image
         image_a, _ = self.configured_pad(batch.source_a.image)
         image_b, _ = self.configured_pad(batch.source_b.image)
@@ -468,15 +480,18 @@ class ClosedLoopRefinement(nn.Module):
             coarse_semantic.boundary if coarse_semantic else None,
         )
         return FeedbackResult(
-            crop(final_padded),
-            crop(coarse),
-            crop(residual),
-            auxiliary,
-            coarse_semantic,
-            final_semantic,
-            tuple(diagnostics),
-            tuple(statistics),
-            {
+            final=crop(final_padded),
+            coarse=crop(coarse),
+            refinement=crop(residual),
+            final_y=None,
+            coarse_y=None,
+            refinement_y=None,
+            auxiliary=auxiliary,
+            coarse_semantic=coarse_semantic,
+            final_semantic=final_semantic,
+            router_diagnostics=tuple(diagnostics),
+            spectral_statistics=tuple(statistics),
+            debug={
                 "focus": focus_crop,
                 "coarse_semantic": coarse_semantic,
                 "final_semantic": final_semantic,
@@ -490,6 +505,72 @@ class ClosedLoopRefinement(nn.Module):
                 "guidance_pyramid_disabled": self.config.model.ablation.disable_guidance_pyramid,
                 "task_film_disabled": self.config.model.ablation.disable_task_film,
                 "refinement_decoder_disabled": self.config.model.ablation.disable_refinement_decoder,
+            },
+        )
+
+    def _y_only_coarse_result(
+        self, batch: FusionBatch, backbone: BackboneOutput
+    ) -> FeedbackResult:
+        coarse = backbone.fused_image
+        coarse_y = backbone.fused_y
+        if coarse_y is None:
+            raise RuntimeError("VIF/SEG backbone output is missing its Y prediction")
+
+        final_semantic = self._crop_semantic(
+            self._semantic(coarse, batch.task, final=True), *batch.spatial_size
+        )
+        # Coarse and final are intentionally identical during Stage 1. Reusing the
+        # same prediction avoids a duplicate frozen-SegFormer pass for SEG.
+        coarse_semantic = final_semantic if batch.task is TaskType.SEG else None
+        auxiliary = AuxiliaryOutputs(
+            semantic_probabilities=(
+                coarse_semantic.probabilities if coarse_semantic else None
+            ),
+            semantic_logits=coarse_semantic.logits if coarse_semantic else None,
+            semantic_uncertainty=(
+                coarse_semantic.uncertainty if coarse_semantic else None
+            ),
+            semantic_boundary=coarse_semantic.boundary if coarse_semantic else None,
+        )
+        visible_ycc = rgb_to_ycbcr(batch.visible_source.image)
+        fused_ycc = rgb_to_ycbcr(coarse)
+        zero_rgb = torch.zeros_like(coarse)
+        zero_y = torch.zeros_like(coarse_y)
+        zero_scalar = coarse.new_zeros(())
+        return FeedbackResult(
+            final=coarse,
+            coarse=coarse,
+            refinement=zero_rgb,
+            final_y=coarse_y,
+            coarse_y=coarse_y,
+            refinement_y=zero_y,
+            auxiliary=auxiliary,
+            coarse_semantic=coarse_semantic,
+            final_semantic=final_semantic,
+            router_diagnostics=(),
+            spectral_statistics=(),
+            debug={
+                "focus": None,
+                "coarse_semantic": coarse_semantic,
+                "final_semantic": final_semantic,
+                "final_preclamp": coarse,
+                "clamp_low_ratio": zero_scalar,
+                "clamp_high_ratio": zero_scalar,
+                "focus_active": False,
+                "semantic_available": final_semantic is not None,
+                "feedback_placements": (),
+                "feedback_moe_shared": self.share_feedback_moe,
+                "guidance_pyramid_disabled": True,
+                "task_film_disabled": True,
+                "refinement_decoder_disabled": True,
+                "vif_seg_refinement_active": False,
+                "chroma_cb_error": (fused_ycc[:, 1:2] - visible_ycc[:, 1:2])
+                .abs()
+                .mean(),
+                "chroma_cr_error": (fused_ycc[:, 2:3] - visible_ycc[:, 2:3])
+                .abs()
+                .mean(),
+                "coarse_final_y_mae": zero_scalar,
             },
         )
 
@@ -531,6 +612,9 @@ class TFSMoEFusion(nn.Module):
             task=batch.task,
             coarse=feedback.coarse,
             refinement=feedback.refinement,
+            fused_y=feedback.final_y,
+            coarse_y=feedback.coarse_y,
+            refinement_y=feedback.refinement_y,
             spectral_statistics=(
                 *backbone.spectral_statistics,
                 *feedback.spectral_statistics,

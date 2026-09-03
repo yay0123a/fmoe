@@ -21,9 +21,9 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("configs/default.yaml"))
-    parser.add_argument("--checkpoint", type=Path,default=Path("runs/test2_2000image_50epoch/checkpoints/final_ema.pt"))
-    parser.add_argument("--input-a", type=Path,default=Path("data/msrs/test/vi"))
-    parser.add_argument("--input-b", type=Path,default=Path("data/msrs/test/ir"))
+    parser.add_argument("--checkpoint", type=Path,default=Path("runs/semantic_rt_y_only_experiment_d_stable_y_ssim/checkpoints/final_ema.pt"))
+    parser.add_argument("--input-a", type=Path,default=Path("data/msrs/test/vi/00315D.png")) #vi
+    parser.add_argument("--input-b", type=Path,default=Path("data/msrs/test/ir/00315D.png")) #ir
     parser.add_argument("--output", type=Path, default=Path("runs/test"))
     parser.add_argument(
         "--task", required=True, choices=[item.value for item in TaskType]
@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--device",
         #default=None,
-        default="cuda:2",
+        default="cuda:4",
         help="Override training.device from the config (for example cpu or cuda:1)",
     )
     parser.add_argument("--save-coarse", action="store_true")

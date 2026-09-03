@@ -134,6 +134,7 @@ class GuidanceConfig:
 @dataclass(slots=True)
 class FeedbackConfig:
     enabled: bool = True
+    vif_seg_refinement_enabled: bool = False
     independent_moe_parameters: bool = True
     task_film: bool = True
     placements: list[str] = field(default_factory=lambda: ["s3", "s2"])
@@ -219,6 +220,14 @@ class TaskSamplingConfig:
 
 
 @dataclass(slots=True)
+class TaskSchedulePhaseConfig:
+    name: str
+    start_epoch: int
+    end_epoch: int
+    pattern: list[str]
+
+
+@dataclass(slots=True)
 class EMAConfig:
     enabled: bool = True
     decay: float = 0.999
@@ -231,6 +240,14 @@ class VIFFusionLossConfig:
     ssim: float = 0.5
     color: float = 0.2
     coarse_supervision: float = 0.25
+    intensity_mode: str = "pixel_max"
+    intensity_energy_normalization: str = "per_sample_mean"
+    ir_intensity_max_weight: float = 0.3
+    intensity_visible_support_kernel: int = 3
+    intensity_weight_smoothing_kernel: int = 3
+    gradient_mode: str = "magnitude_max"
+    ir_gradient_dominance_ratio: float = 1.2
+    visible_gradient_support_kernel: int = 3
     ssim_mode: str = "source_max"
 
 
@@ -490,6 +507,7 @@ class TrainingConfig:
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     task_sampling: TaskSamplingConfig = field(default_factory=TaskSamplingConfig)
+    task_schedule: list[TaskSchedulePhaseConfig] = field(default_factory=list)
     gradient_strategy: str = "alternating"
     gradient_accumulation_steps: int = 2
     gradient_clip: GradientClipConfig = field(default_factory=GradientClipConfig)
@@ -684,6 +702,10 @@ class ProjectConfig:
                 raise ConfigurationError("semantic.model_dir cannot be empty")
         if not feedback.enabled:
             raise ConfigurationError("The final model requires feedback refinement")
+        if feedback.vif_seg_refinement_enabled:
+            raise ConfigurationError(
+                "Stage 1 requires VIF/SEG refinement to remain disabled"
+            )
         if not set(feedback.placements) <= legal_stages:
             raise ConfigurationError(
                 f"feedback.placements must be a subset of {sorted(legal_stages)}"
@@ -784,9 +806,13 @@ class ProjectConfig:
             )
         if scheduler.step_size <= 0 or not 0 < scheduler.gamma <= 1:
             raise ConfigurationError("scheduler step_size/gamma are invalid")
-        if training.task_sampling.strategy not in {"alternating", "weighted_random"}:
+        if training.task_sampling.strategy not in {
+            "alternating",
+            "weighted_random",
+            "scheduled",
+        }:
             raise ConfigurationError(
-                "task sampling must be alternating or weighted_random"
+                "task sampling must be alternating, weighted_random, or scheduled"
             )
         if set(self.training.task_sampling.weights) != {"vif", "mfif", "seg"}:
             raise ConfigurationError(
@@ -794,6 +820,36 @@ class ProjectConfig:
             )
         if any(weight <= 0 for weight in self.training.task_sampling.weights.values()):
             raise ConfigurationError("task sampling weights must be positive")
+        schedule = training.task_schedule
+        if training.task_sampling.strategy == "scheduled":
+            if not schedule:
+                raise ConfigurationError(
+                    "task_schedule is required when task sampling is scheduled"
+                )
+            previous_end = 0
+            legal_tasks = {"vif", "mfif", "seg"}
+            for phase in schedule:
+                if (
+                    not phase.name.strip()
+                    or phase.start_epoch != previous_end
+                    or phase.end_epoch <= phase.start_epoch
+                ):
+                    raise ConfigurationError(
+                        "Task schedule phases must be named, contiguous, and ordered"
+                    )
+                if not phase.pattern or not set(phase.pattern) <= legal_tasks:
+                    raise ConfigurationError(
+                        "Task schedule patterns must contain only vif, mfif, and seg"
+                    )
+                previous_end = phase.end_epoch
+            if previous_end != training.epochs:
+                raise ConfigurationError(
+                    "Task schedule must cover every configured training epoch"
+                )
+        elif schedule:
+            raise ConfigurationError(
+                "task_schedule requires task_sampling.strategy=scheduled"
+            )
         if training.gradient_strategy != "alternating":
             raise ConfigurationError(
                 "Only homogeneous alternating task updates are supported"
@@ -913,6 +969,71 @@ class ProjectConfig:
             raise ConfigurationError("checkpoint intervals must be positive")
         if training.checkpoint.keep_last <= 0:
             raise ConfigurationError("checkpoint.keep_last must be positive")
+        vif_loss = training.losses.vif
+        if (
+            min(
+                vif_loss.intensity,
+                vif_loss.gradient,
+                vif_loss.ssim,
+                vif_loss.color,
+                vif_loss.coarse_supervision,
+            )
+            < 0
+        ):
+            raise ConfigurationError("VIF loss weights cannot be negative")
+        if vif_loss.gradient_mode not in {
+            "magnitude_max",
+            "directional_visible_anchor",
+        }:
+            raise ConfigurationError(
+                "VIF gradient_mode must be magnitude_max or directional_visible_anchor"
+            )
+        if vif_loss.ssim_mode not in {"source_max", "visible_anchor"}:
+            raise ConfigurationError(
+                "VIF ssim_mode must be source_max or visible_anchor"
+            )
+        if vif_loss.intensity_mode not in {
+            "pixel_max",
+            "gradient_weighted_visible_anchor",
+        }:
+            raise ConfigurationError(
+                "VIF intensity_mode must be pixel_max or "
+                "gradient_weighted_visible_anchor"
+            )
+        if vif_loss.intensity_energy_normalization not in {
+            "none",
+            "per_sample_mean",
+        }:
+            raise ConfigurationError(
+                "VIF intensity_energy_normalization must be none or per_sample_mean"
+            )
+        if not 0.0 <= vif_loss.ir_intensity_max_weight <= 1.0:
+            raise ConfigurationError(
+                "VIF ir_intensity_max_weight must be between 0 and 1"
+            )
+        for name, kernel in (
+            (
+                "intensity_visible_support_kernel",
+                vif_loss.intensity_visible_support_kernel,
+            ),
+            (
+                "intensity_weight_smoothing_kernel",
+                vif_loss.intensity_weight_smoothing_kernel,
+            ),
+        ):
+            if kernel <= 0 or kernel % 2 == 0:
+                raise ConfigurationError(f"VIF {name} must be positive and odd")
+        if vif_loss.ir_gradient_dominance_ratio < 1.0:
+            raise ConfigurationError(
+                "VIF ir_gradient_dominance_ratio must be at least 1"
+            )
+        if (
+            vif_loss.visible_gradient_support_kernel <= 0
+            or vif_loss.visible_gradient_support_kernel % 2 == 0
+        ):
+            raise ConfigurationError(
+                "VIF visible_gradient_support_kernel must be positive and odd"
+            )
         if training.losses.focus.selection < 0 or training.losses.focus.boundary < 0:
             raise ConfigurationError("Focus loss weights cannot be negative")
         seg_fusion = training.losses.seg_fusion

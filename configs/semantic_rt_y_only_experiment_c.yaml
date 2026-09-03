@@ -1,0 +1,13 @@
+_base_: semantic_rt_y_only_experiment_b.yaml
+
+experiment:
+  name: semantic_rt_y_only_experiment_c_weighted_intensity
+
+training:
+  losses:
+    vif:
+      intensity_mode: gradient_weighted_visible_anchor
+      intensity_energy_normalization: per_sample_mean
+      ir_intensity_max_weight: 0.3
+      intensity_visible_support_kernel: 3
+      intensity_weight_smoothing_kernel: 3

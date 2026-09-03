@@ -8,22 +8,7 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 
-
-def luminance(image: Tensor) -> Tensor:
-    if image.shape[1] == 1:
-        return image
-    weights = image.new_tensor((0.299, 0.587, 0.114)).view(1, 3, 1, 1)
-    return (image[:, :3] * weights).sum(1, keepdim=True)
-
-
-def rgb_to_ycbcr(image: Tensor) -> Tensor:
-    if image.shape[1] != 3:
-        raise ValueError("YCbCr conversion requires RGB input")
-    r, g, b = image.unbind(1)
-    y = 0.299 * r + 0.587 * g + 0.114 * b
-    cb = 0.5 - 0.168736 * r - 0.331264 * g + 0.5 * b
-    cr = 0.5 + 0.5 * r - 0.418688 * g - 0.081312 * b
-    return torch.stack((y, cb, cr), 1)
+from tfs_moe_fusion.color import luminance, rgb_to_ycbcr
 
 
 def _depthwise(image: Tensor, kernel: Tensor) -> Tensor:
@@ -73,30 +58,55 @@ def charbonnier(left: Tensor, right: Tensor, epsilon: float = 1e-3) -> Tensor:
 
 
 def ssim(left: Tensor, right: Tensor, size: int = 7, sigma: float = 1.5) -> Tensor:
+    """Return a numerically stable mean SSIM score in ``[-1, 1]``.
+
+    SSIM's local variance is a subtraction of two nearly equal values. Running
+    that calculation under BF16 autocast can make the variance negative and
+    collapse the denominator, producing scores in the hundreds or thousands.
+    Keep the local statistics in FP32 and explicitly enforce their mathematical
+    bounds so mixed-precision training cannot optimize that numerical failure.
+    """
+    if left.shape[0] != right.shape[0] or left.shape[-2:] != right.shape[-2:]:
+        raise ValueError("SSIM inputs must share batch and spatial dimensions")
+    if size <= 0 or size % 2 == 0:
+        raise ValueError("SSIM window size must be positive and odd")
     if right.shape[1] == 1 and left.shape[1] == 3:
         right = right.expand(-1, 3, -1, -1)
     if left.shape[1] == 1 and right.shape[1] == 3:
         left = left.expand(-1, 3, -1, -1)
-    channels = left.shape[1]
-    window = gaussian_kernel(size, sigma, left).expand(channels, 1, size, size)
-    mu_x = F.conv2d(left, window, padding=size // 2, groups=channels)
-    mu_y = F.conv2d(right, window, padding=size // 2, groups=channels)
-    sigma_x = (
-        F.conv2d(left * left, window, padding=size // 2, groups=channels)
-        - mu_x.square()
-    )
-    sigma_y = (
-        F.conv2d(right * right, window, padding=size // 2, groups=channels)
-        - mu_y.square()
-    )
-    sigma_xy = (
-        F.conv2d(left * right, window, padding=size // 2, groups=channels) - mu_x * mu_y
-    )
-    c1, c2 = 0.01**2, 0.03**2
-    score = ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)) / (
-        (mu_x.square() + mu_y.square() + c1) * (sigma_x + sigma_y + c2)
-    ).clamp_min(torch.finfo(left.dtype).eps)
-    return score.mean()
+    if left.shape[1] != right.shape[1]:
+        raise ValueError("SSIM inputs must have equal channels or a gray/RGB pair")
+
+    with torch.autocast(device_type=left.device.type, enabled=False):
+        left_fp32 = left.float()
+        right_fp32 = right.float()
+        channels = left_fp32.shape[1]
+        window = gaussian_kernel(size, sigma, left_fp32).expand(channels, 1, size, size)
+        padding = size // 2
+        left_padded = F.pad(
+            left_fp32, (padding, padding, padding, padding), mode="replicate"
+        )
+        right_padded = F.pad(
+            right_fp32, (padding, padding, padding, padding), mode="replicate"
+        )
+        mu_x = F.conv2d(left_padded, window, groups=channels)
+        mu_y = F.conv2d(right_padded, window, groups=channels)
+        sigma_x = (
+            F.conv2d(left_padded.square(), window, groups=channels) - mu_x.square()
+        ).clamp_min(0.0)
+        sigma_y = (
+            F.conv2d(right_padded.square(), window, groups=channels) - mu_y.square()
+        ).clamp_min(0.0)
+        sigma_xy = (
+            F.conv2d(left_padded * right_padded, window, groups=channels) - mu_x * mu_y
+        )
+        c1, c2 = 0.01**2, 0.03**2
+        numerator = (2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)
+        denominator = (mu_x.square() + mu_y.square() + c1) * (sigma_x + sigma_y + c2)
+        score = numerator / denominator.clamp_min(torch.finfo(torch.float32).eps)
+        if not torch.isfinite(score).all():
+            raise FloatingPointError("SSIM produced a non-finite local score")
+        return score.clamp(-1.0, 1.0).mean()
 
 
 def entropy(probabilities: Tensor) -> Tensor:
@@ -219,33 +229,224 @@ def frequency_specialization(
     }
 
 
-def vif_losses(fused: Tensor, visible: Tensor, infrared: Tensor) -> dict[str, Tensor]:
-    target_intensity = torch.maximum(luminance(visible), luminance(infrared))
-    target_gradient = torch.maximum(
-        gradient_magnitude(visible), gradient_magnitude(infrared)
+def directional_gradient_targets(
+    visible_y: Tensor,
+    infrared: Tensor,
+    *,
+    ir_dominance_ratio: float = 1.2,
+    visible_support_kernel: int = 3,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Build signed targets, admitting IR only beyond nearby visible support."""
+    if ir_dominance_ratio < 1.0:
+        raise ValueError("ir_dominance_ratio must be at least 1")
+    if visible_support_kernel <= 0 or visible_support_kernel % 2 == 0:
+        raise ValueError("visible_support_kernel must be positive and odd")
+    visible_y, infrared = luminance(visible_y), luminance(infrared)
+    gx_v, gy_v = sobel(visible_y)
+    gx_i, gy_i = sobel(infrared)
+    magnitude_v = torch.sqrt(gx_v.square() + gy_v.square() + 1e-6)
+    magnitude_i = torch.sqrt(gx_i.square() + gy_i.square() + 1e-6)
+    visible_support = F.max_pool2d(
+        magnitude_v,
+        kernel_size=visible_support_kernel,
+        stride=1,
+        padding=visible_support_kernel // 2,
     )
+    choose_ir = magnitude_i > visible_support * ir_dominance_ratio
+    return (
+        torch.where(choose_ir, gx_i, gx_v),
+        torch.where(choose_ir, gy_i, gy_v),
+        choose_ir,
+    )
+
+
+def directional_gradient_loss(
+    fused_y: Tensor,
+    visible_y: Tensor,
+    infrared: Tensor,
+    *,
+    ir_dominance_ratio: float = 1.2,
+    visible_support_kernel: int = 3,
+) -> Tensor:
+    """Match signed Sobel components to a visible-anchored multimodal target."""
+    target_gx, target_gy, _ = directional_gradient_targets(
+        visible_y,
+        infrared,
+        ir_dominance_ratio=ir_dominance_ratio,
+        visible_support_kernel=visible_support_kernel,
+    )
+    fused_gx, fused_gy = sobel(fused_y)
+    return F.l1_loss(fused_gx, target_gx) + F.l1_loss(fused_gy, target_gy)
+
+
+def normalized_edge_energy(
+    image: Tensor,
+    *,
+    normalization: str = "per_sample_mean",
+    epsilon: float = 1e-6,
+    scale_floor: float = 1e-4,
+) -> Tensor:
+    """Return edge energy without the positive epsilon floor in flat regions."""
+    # Replicated padding prevents a constant image from becoming a strong edge at
+    # the frame boundary through the zero padding used by the general Sobel helper.
+    padded = F.pad(luminance(image), (1, 1, 1, 1), mode="replicate")
+    gx, gy = sobel(padded)
+    gx, gy = gx[..., 1:-1, 1:-1], gy[..., 1:-1, 1:-1]
+    magnitude = (
+        torch.sqrt(gx.square() + gy.square() + epsilon) - math.sqrt(epsilon)
+    ).clamp_min(0.0)
+    if normalization == "none":
+        return magnitude
+    if normalization != "per_sample_mean":
+        raise ValueError(f"Unknown edge-energy normalization: {normalization}")
+    scale = magnitude.mean(dim=(-2, -1), keepdim=True).clamp_min(scale_floor)
+    return magnitude / scale
+
+
+def vif_intensity_target(
+    visible: Tensor,
+    infrared: Tensor,
+    *,
+    mode: str = "pixel_max",
+    energy_normalization: str = "per_sample_mean",
+    ir_max_weight: float = 0.3,
+    visible_support_kernel: int = 3,
+    weight_smoothing_kernel: int = 3,
+) -> tuple[Tensor, Tensor | None]:
+    """Construct a VIF Y target and optional per-pixel IR contribution weight."""
+    visible_y, infrared_y = luminance(visible), luminance(infrared)
+    if mode == "pixel_max":
+        return torch.maximum(visible_y, infrared_y), None
+    if mode != "gradient_weighted_visible_anchor":
+        raise ValueError(f"Unknown VIF intensity mode: {mode}")
+    if not 0.0 <= ir_max_weight <= 1.0:
+        raise ValueError("ir_max_weight must be between 0 and 1")
+    for name, kernel in (
+        ("visible_support_kernel", visible_support_kernel),
+        ("weight_smoothing_kernel", weight_smoothing_kernel),
+    ):
+        if kernel <= 0 or kernel % 2 == 0:
+            raise ValueError(f"{name} must be positive and odd")
+
+    normalized_visible = normalized_edge_energy(
+        visible_y, normalization=energy_normalization
+    )
+    normalized_infrared = normalized_edge_energy(
+        infrared_y, normalization=energy_normalization
+    )
+    visible_support = F.max_pool2d(
+        normalized_visible,
+        kernel_size=visible_support_kernel,
+        stride=1,
+        padding=visible_support_kernel // 2,
+    )
+    ir_share = normalized_infrared / (normalized_infrared + visible_support + 1e-6)
+    ir_advantage = (2.0 * ir_share - 1.0).clamp(0.0, 1.0)
+    weight = ir_max_weight * ir_advantage
+    smoothing_padding = weight_smoothing_kernel // 2
+    if smoothing_padding:
+        weight = F.avg_pool2d(
+            F.pad(
+                weight,
+                (
+                    smoothing_padding,
+                    smoothing_padding,
+                    smoothing_padding,
+                    smoothing_padding,
+                ),
+                mode="replicate",
+            ),
+            kernel_size=weight_smoothing_kernel,
+            stride=1,
+        )
+    target = visible_y + weight * (infrared_y - visible_y)
+    return target, weight
+
+
+def vif_losses(
+    fused: Tensor,
+    visible: Tensor,
+    infrared: Tensor,
+    fused_y: Tensor | None = None,
+    *,
+    target_intensity: Tensor | None = None,
+    intensity_mode: str = "pixel_max",
+    intensity_energy_normalization: str = "per_sample_mean",
+    ir_intensity_max_weight: float = 0.3,
+    intensity_visible_support_kernel: int = 3,
+    intensity_weight_smoothing_kernel: int = 3,
+    gradient_mode: str = "magnitude_max",
+    ir_gradient_dominance_ratio: float = 1.2,
+    visible_gradient_support_kernel: int = 3,
+    ssim_mode: str = "source_max",
+) -> dict[str, Tensor]:
+    predicted_y = fused_y if fused_y is not None else luminance(fused)
+    visible_y = luminance(visible)
+    if target_intensity is None:
+        target_intensity, _ = vif_intensity_target(
+            visible_y,
+            infrared,
+            mode=intensity_mode,
+            energy_normalization=intensity_energy_normalization,
+            ir_max_weight=ir_intensity_max_weight,
+            visible_support_kernel=intensity_visible_support_kernel,
+            weight_smoothing_kernel=intensity_weight_smoothing_kernel,
+        )
+    if gradient_mode == "magnitude_max":
+        target_gradient = torch.maximum(
+            gradient_magnitude(visible_y), gradient_magnitude(infrared)
+        )
+        gradient_loss = (gradient_magnitude(predicted_y) - target_gradient).abs().mean()
+    elif gradient_mode == "directional_visible_anchor":
+        gradient_loss = directional_gradient_loss(
+            predicted_y,
+            visible_y,
+            infrared,
+            ir_dominance_ratio=ir_gradient_dominance_ratio,
+            visible_support_kernel=visible_gradient_support_kernel,
+        )
+    else:
+        raise ValueError(f"Unknown VIF gradient mode: {gradient_mode}")
     color = fused.new_zeros(())
     if fused.shape[1] == visible.shape[1] == 3:
         color = (rgb_to_ycbcr(fused)[:, 1:] - rgb_to_ycbcr(visible)[:, 1:]).abs().mean()
+    visible_ssim, infrared_ssim = vif_ssim_scores(predicted_y, visible_y, infrared)
+    if ssim_mode == "source_max":
+        selected_ssim = torch.maximum(visible_ssim, infrared_ssim)
+    elif ssim_mode == "visible_anchor":
+        selected_ssim = visible_ssim
+    else:
+        raise ValueError(f"Unknown VIF SSIM mode: {ssim_mode}")
     return {
-        "fusion/intensity": (luminance(fused) - target_intensity).abs().mean(),
-        "fusion/gradient": (gradient_magnitude(fused) - target_gradient).abs().mean(),
-        "fusion/ssim": 1 - torch.maximum(ssim(fused, visible), ssim(fused, infrared)),
+        "fusion/intensity": (predicted_y - target_intensity).abs().mean(),
+        "fusion/gradient": gradient_loss,
+        "fusion/ssim": 1 - selected_ssim,
         "fusion/color": color,
     }
 
 
+def vif_ssim_scores(
+    predicted_y: Tensor, visible: Tensor, infrared: Tensor
+) -> tuple[Tensor, Tensor]:
+    """Compare a VIF prediction to both sources in luminance space."""
+    return ssim(predicted_y, luminance(visible)), ssim(predicted_y, luminance(infrared))
+
+
 def seg_fusion_anchor_losses(
-    fused: Tensor, visible: Tensor, infrared: Tensor
+    fused: Tensor,
+    visible: Tensor,
+    infrared: Tensor,
+    fused_y: Tensor | None = None,
 ) -> dict[str, Tensor]:
     """Minimal fusion-quality anchor for segmentation-conditioned output."""
+    predicted_y = fused_y if fused_y is not None else luminance(fused)
     target_intensity = torch.maximum(luminance(visible), luminance(infrared))
     target_gradient = torch.maximum(
         gradient_magnitude(visible), gradient_magnitude(infrared)
     )
     return {
-        "seg_fusion/intensity": (luminance(fused) - target_intensity).abs().mean(),
-        "seg_fusion/gradient": (gradient_magnitude(fused) - target_gradient)
+        "seg_fusion/intensity": (predicted_y - target_intensity).abs().mean(),
+        "seg_fusion/gradient": (gradient_magnitude(predicted_y) - target_gradient)
         .abs()
         .mean(),
     }
@@ -346,7 +547,7 @@ def semantic_losses(
 
 
 from tfs_moe_fusion.config import LossConfig
-from tfs_moe_fusion.types import ContractError, ModalityType
+from tfs_moe_fusion.types import ContractError
 
 
 class MultiTaskLossManager(nn.Module):
@@ -363,24 +564,67 @@ class MultiTaskLossManager(nn.Module):
         components: dict[str, Tensor] = {}
         weights: dict[str, float] = {}
         skipped: dict[str, str] = {}
+        intensity_weight: Tensor | None = None
         output, batch = context.output, context.batch
         if context.task is TaskType.VIF:
             visible, infrared = self._visible_ir(batch)
-            components.update(vif_losses(output.fused, visible, infrared))
+            vif_config = self.config.vif
+            target_intensity, intensity_weight = vif_intensity_target(
+                visible,
+                infrared,
+                mode=vif_config.intensity_mode,
+                energy_normalization=vif_config.intensity_energy_normalization,
+                ir_max_weight=vif_config.ir_intensity_max_weight,
+                visible_support_kernel=vif_config.intensity_visible_support_kernel,
+                weight_smoothing_kernel=(vif_config.intensity_weight_smoothing_kernel),
+            )
+            final_vif = vif_losses(
+                output.fused,
+                visible,
+                infrared,
+                output.fused_y,
+                target_intensity=target_intensity,
+                gradient_mode=vif_config.gradient_mode,
+                ir_gradient_dominance_ratio=vif_config.ir_gradient_dominance_ratio,
+                visible_gradient_support_kernel=(
+                    vif_config.visible_gradient_support_kernel
+                ),
+                ssim_mode=vif_config.ssim_mode,
+            )
+            components.update(final_vif)
             weights.update(
                 {
-                    "fusion/intensity": self.config.vif.intensity,
-                    "fusion/gradient": self.config.vif.gradient,
-                    "fusion/ssim": self.config.vif.ssim,
-                    "fusion/color": self.config.vif.color,
+                    "fusion/intensity": vif_config.intensity,
+                    "fusion/gradient": vif_config.gradient,
+                    "fusion/ssim": vif_config.ssim,
+                    "fusion/color": vif_config.color,
                 }
             )
             if output.coarse is not None:
-                coarse = vif_losses(output.coarse, visible, infrared)
+                coarse = (
+                    final_vif
+                    if output.coarse is output.fused
+                    and output.coarse_y is output.fused_y
+                    else vif_losses(
+                        output.coarse,
+                        visible,
+                        infrared,
+                        output.coarse_y,
+                        target_intensity=target_intensity,
+                        gradient_mode=vif_config.gradient_mode,
+                        ir_gradient_dominance_ratio=(
+                            vif_config.ir_gradient_dominance_ratio
+                        ),
+                        visible_gradient_support_kernel=(
+                            vif_config.visible_gradient_support_kernel
+                        ),
+                        ssim_mode=vif_config.ssim_mode,
+                    )
+                )
                 components["fusion/coarse"] = (
                     coarse["fusion/intensity"] + coarse["fusion/gradient"]
                 )
-                weights["fusion/coarse"] = self.config.vif.coarse_supervision
+                weights["fusion/coarse"] = vif_config.coarse_supervision
         elif context.task is TaskType.MFIF:
             if batch.target is None:
                 self._missing("fusion/mfif", "MFIF fused target is missing", skipped)
@@ -422,14 +666,44 @@ class MultiTaskLossManager(nn.Module):
             "component_count": len(components),
             "router_blocks": len(output.router_diagnostics),
         }
+        for name in (
+            "chroma_cb_error",
+            "chroma_cr_error",
+            "y_gamut_clip_ratio",
+            "coarse_final_y_mae",
+        ):
+            if name in output.debug:
+                value = output.debug[name]
+                diagnostics[name] = (
+                    value.detach() if isinstance(value, Tensor) else value
+                )
         if context.task is TaskType.VIF:
             visible, infrared = self._visible_ir(batch)
+            visible_ssim, infrared_ssim = vif_ssim_scores(
+                output.fused_y if output.fused_y is not None else output.fused,
+                visible,
+                infrared,
+            )
             diagnostics.update(
                 {
-                    "vif/ssim_visible": ssim(output.fused, visible).detach(),
-                    "vif/ssim_infrared": ssim(output.fused, infrared).detach(),
+                    "vif/ssim_visible": visible_ssim.detach(),
+                    "vif/ssim_infrared": infrared_ssim.detach(),
+                    "vif/ssim_mode": self.config.vif.ssim_mode,
+                    "vif/gradient_mode": self.config.vif.gradient_mode,
+                    "vif/intensity_mode": self.config.vif.intensity_mode,
+                    "y_gradient_loss": components["fusion/gradient"].detach(),
                 }
             )
+            if intensity_weight is not None:
+                diagnostics.update(
+                    {
+                        "ir_intensity_weight_mean": intensity_weight.mean().detach(),
+                        "ir_intensity_weight_max": intensity_weight.amax().detach(),
+                        "ir_intensity_weight_active_ratio": (
+                            (intensity_weight > 0).float().mean().detach()
+                        ),
+                    }
+                )
         return LossOutput(total, components, weighted, diagnostics, skipped)
 
     def _focus(self, context, components, weights, skipped) -> None:
@@ -454,7 +728,12 @@ class MultiTaskLossManager(nn.Module):
         if self.config.seg_fusion.enabled:
             visible, infrared = self._visible_ir(context.batch)
             components.update(
-                seg_fusion_anchor_losses(context.output.fused, visible, infrared)
+                seg_fusion_anchor_losses(
+                    context.output.fused,
+                    visible,
+                    infrared,
+                    context.output.fused_y,
+                )
             )
             weights.update(
                 {
@@ -596,8 +875,13 @@ class MultiTaskLossManager(nn.Module):
             saliency = torch.nn.functional.interpolate(
                 saliency, output.fused.shape[-2:], mode="bilinear", align_corners=False
             )
+            predicted_y = (
+                output.fused_y
+                if output.fused_y is not None
+                else luminance(output.fused)
+            )
             components["infrared/preservation"] = (
-                (luminance(output.fused) - luminance(infrared)).abs() * saliency
+                (predicted_y - luminance(infrared)).abs() * saliency
             ).mean()
             weights["infrared/preservation"] = self.config.infrared.weight
         paired = context.aux.get("paired_output")
@@ -627,11 +911,7 @@ class MultiTaskLossManager(nn.Module):
 
     @staticmethod
     def _visible_ir(batch):
-        if batch.source_a.modality is ModalityType.INFRARED_GRAY:
-            return batch.source_b.image, batch.source_a.image
-        if batch.source_b.modality is ModalityType.INFRARED_GRAY:
-            return batch.source_a.image, batch.source_b.image
-        raise ContractError("VIF/SEG loss requires a real infrared source")
+        return batch.visible_source.image, batch.infrared_source.image
 
     @staticmethod
     def _phase_multiplier(name: str, context: LossContext) -> float:

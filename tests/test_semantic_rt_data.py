@@ -178,8 +178,12 @@ def test_semantic_rt_single_gpu_config_is_valid() -> None:
     assert [
         (phase.name, phase.start, phase.end) for phase in config.training.phases.phases
     ] == [
-        ("stabilization", 0, 5),
-        ("semantic_ramp", 5, 15),
-        ("joint", 15, 44),
-        ("routing_finetune", 44, 50),
+        ("vif_base", 0, 20),
+        ("seg_injection_low", 20, 21),
+        ("seg_injection_mid", 21, 23),
+        ("seg_injection_high", 23, 25),
+        ("vif_recovery1", 25, 30),
+        ("mfif_injection", 30, 35),
+        ("vif_recovery2", 35, 40),
+        ("joint_convergence", 40, 50),
     ]

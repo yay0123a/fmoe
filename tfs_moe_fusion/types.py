@@ -133,11 +133,18 @@ class FusionBatch:
             if value is not None:
                 _validate_supervision(value, name, batch_size, shape_a[-2:])
 
-        has_ir = (
-            self.source_a.modality.is_infrared or self.source_b.modality.is_infrared
-        )
+        modalities = (self.source_a.modality, self.source_b.modality)
+        has_ir = ModalityType.INFRARED_GRAY in modalities
         if self.task in {TaskType.VIF, TaskType.SEG} and not has_ir:
             raise ContractError(f"{self.task.value} requires one real infrared source")
+        if self.task in {TaskType.VIF, TaskType.SEG} and (
+            modalities.count(ModalityType.VISIBLE_RGB) != 1
+            or modalities.count(ModalityType.INFRARED_GRAY) != 1
+        ):
+            raise ContractError(
+                f"{self.task.value} requires exactly one visible RGB and one real "
+                "infrared source"
+            )
         if self.task is TaskType.MFIF and has_ir:
             raise ContractError("MFIF cannot use an infrared source")
 
@@ -152,6 +159,20 @@ class FusionBatch:
     @property
     def has_infrared(self) -> bool:
         return self.source_a.modality.is_infrared or self.source_b.modality.is_infrared
+
+    @property
+    def visible_source(self) -> SourceBatch:
+        for source in (self.source_a, self.source_b):
+            if source.modality is ModalityType.VISIBLE_RGB:
+                return source
+        raise ContractError(f"{self.task.value} batch has no visible RGB source")
+
+    @property
+    def infrared_source(self) -> SourceBatch:
+        for source in (self.source_a, self.source_b):
+            if source.modality is ModalityType.INFRARED_GRAY:
+                return source
+        raise ContractError(f"{self.task.value} batch has no real infrared source")
 
     def to(
         self, device: torch.device | str, *, non_blocking: bool = False
@@ -357,6 +378,9 @@ class FusionOutput:
     task: TaskType
     coarse: Tensor | None = None
     refinement: Tensor | None = None
+    fused_y: Tensor | None = None
+    coarse_y: Tensor | None = None
+    refinement_y: Tensor | None = None
     spectral_statistics: tuple[SpectralStatistics, ...] = field(default_factory=tuple)
     router_diagnostics: tuple[RouterDiagnostics, ...] = field(default_factory=tuple)
     auxiliary: AuxiliaryOutputs | None = None
@@ -395,6 +419,30 @@ class FusionOutput:
             raise ContractError("FusionOutput.coarse must match fused shape")
         if self.refinement is not None and self.refinement.shape != self.fused.shape:
             raise ContractError("FusionOutput.refinement must match fused shape")
+        for name, value in (
+            ("fused_y", self.fused_y),
+            ("coarse_y", self.coarse_y),
+            ("refinement_y", self.refinement_y),
+        ):
+            if value is not None and (
+                value.ndim != 4
+                or value.shape[1] != 1
+                or value.shape[0] != self.fused.shape[0]
+                or value.shape[-2:] != self.fused.shape[-2:]
+                or not torch.isfinite(value).all()
+            ):
+                raise ContractError(
+                    f"FusionOutput.{name} must be finite [B,1,H,W] matching fused"
+                )
+        if self.task in {TaskType.VIF, TaskType.SEG} and any(
+            value is None for value in (self.fused_y, self.coarse_y, self.refinement_y)
+        ):
+            raise ContractError("VIF/SEG FusionOutput requires typed Y predictions")
+        if self.task is TaskType.MFIF and any(
+            value is not None
+            for value in (self.fused_y, self.coarse_y, self.refinement_y)
+        ):
+            raise ContractError("MFIF FusionOutput must remain an RGB-only prediction")
 
     @property
     def coarse_fused(self) -> Tensor | None:

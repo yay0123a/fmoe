@@ -1,6 +1,6 @@
 schema_version: 1
 experiment:
-  name: semantic_rt_test_uniform_2000_single_gpu
+  name: semantic_rt_vif_curriculum_2000_single_gpu
   seed: 3407
   deterministic: true
   output_dir: runs
@@ -127,6 +127,7 @@ model:
       final_pass_policy: seg_only
   feedback:
     enabled: true
+    vif_seg_refinement_enabled: false
     independent_moe_parameters: true
     task_film: true
     placements:
@@ -166,7 +167,7 @@ data:
   num_workers: 4
   pin_memory: true
 training:
-  device: cuda:0
+  device: cuda:7
   epochs: 50
   steps_per_epoch: 750
   max_steps: null
@@ -191,11 +192,64 @@ training:
     step_size: 10000
     gamma: 0.5
   task_sampling:
-    strategy: weighted_random
+    strategy: scheduled
     weights:
       vif: 1.0
       mfif: 1.0
       seg: 1.0
+  task_schedule:
+  - name: vif_base
+    start_epoch: 0
+    end_epoch: 20
+    pattern:
+    - vif
+  - name: seg_injection_low
+    start_epoch: 20
+    end_epoch: 21
+    pattern:
+    - seg
+    - vif
+  - name: seg_injection_mid
+    start_epoch: 21
+    end_epoch: 23
+    pattern:
+    - seg
+    - seg
+    - vif
+  - name: seg_injection_high
+    start_epoch: 23
+    end_epoch: 25
+    pattern:
+    - seg
+    - seg
+    - seg
+    - vif
+  - name: vif_recovery1
+    start_epoch: 25
+    end_epoch: 30
+    pattern:
+    - vif
+  - name: mfif_injection
+    start_epoch: 30
+    end_epoch: 35
+    pattern:
+    - mfif
+    - mfif
+    - mfif
+    - vif
+  - name: vif_recovery2
+    start_epoch: 35
+    end_epoch: 40
+    pattern:
+    - vif
+  - name: joint_convergence
+    start_epoch: 40
+    end_epoch: 50
+    pattern:
+    - vif
+    - seg
+    - vif
+    - mfif
   gradient_strategy: alternating
   gradient_accumulation_steps: 2
   gradient_clip:
@@ -211,31 +265,48 @@ training:
       - focus_head
   phases:
     phases:
-    - name: stabilization
+    - name: vif_base
       start: 0
-      end: 5
+      end: 20
       loss_multipliers:
         seg_fusion: 1.0
         semantic: 0.25
-    - name: semantic_ramp
-      start: 5
-      end: 15
+    - name: seg_injection_low
+      start: 20
+      end: 21
+      loss_multipliers:
+        seg_fusion: 1.0
+        semantic: 0.25
+    - name: seg_injection_mid
+      start: 21
+      end: 23
       loss_multipliers:
         seg_fusion: 1.0
         semantic: 0.5
-    - name: joint
-      start: 15
-      end: 44
+    - name: seg_injection_high
+      start: 23
+      end: 25
       loss_multipliers:
-        seg_fusion: 0.75
+        seg_fusion: 1.0
         semantic: 1.0
-    - name: routing_finetune
-      start: 44
+    - name: vif_recovery1
+      start: 25
+      end: 30
+      loss_multipliers: {}
+    - name: mfif_injection
+      start: 30
+      end: 35
+      loss_multipliers: {}
+    - name: vif_recovery2
+      start: 35
+      end: 40
+      loss_multipliers: {}
+    - name: joint_convergence
+      start: 40
       end: 50
       loss_multipliers:
-        seg_fusion: 0.75
+        seg_fusion: 1.0
         semantic: 1.0
-        moe: 1.5
   router_temperature:
     start: 1.5
     end: 0.7
@@ -274,8 +345,8 @@ training:
     gradient_conflict_interval: 1000
     router_collapse_threshold: 0.95
     collapse_patience: 10
-    loss_gradient_interval: 100
-    loss_gradient_until_step: 1000
+    loss_gradient_interval: 250
+    loss_gradient_until_step: 20000
   log_every_steps: 10
   ema:
     enabled: true
@@ -286,8 +357,16 @@ training:
       intensity: 1.0
       gradient: 1.0
       ssim: 0.5
-      color: 0.2
+      color: 0.0
       coarse_supervision: 0.25
+      intensity_mode: pixel_max
+      intensity_energy_normalization: per_sample_mean
+      ir_intensity_max_weight: 0.3
+      intensity_visible_support_kernel: 3
+      intensity_weight_smoothing_kernel: 3
+      gradient_mode: magnitude_max
+      ir_gradient_dominance_ratio: 1.2
+      visible_gradient_support_kernel: 3
       ssim_mode: source_max
     mfif:
       reconstruction: 1.0
@@ -361,7 +440,7 @@ training:
       residual_magnitude: 0.001
       range_penalty: 0.001
   checkpoint:
-    every_epochs: 10
+    every_epochs: 5
     every_steps: 60001
     keep_last: 3
     resume: null

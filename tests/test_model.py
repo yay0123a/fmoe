@@ -36,6 +36,15 @@ def test_source_order_is_not_fixed() -> None:
     infrared = SourceBatch(torch.rand(1, 1, 16, 16), ModalityType.INFRARED_GRAY)
     batch = FusionBatch(infrared, rgb, TaskType.VIF, ("reversed",))
     assert batch.has_infrared
+    assert batch.visible_source is rgb
+    assert batch.infrared_source is infrared
+
+
+def test_vif_rejects_generic_rgb_as_visible_source() -> None:
+    rgb = SourceBatch(torch.rand(1, 3, 16, 16), ModalityType.GENERIC_RGB)
+    infrared = SourceBatch(torch.rand(1, 1, 16, 16), ModalityType.INFRARED_GRAY)
+    with pytest.raises(ContractError, match="exactly one visible RGB"):
+        FusionBatch(rgb, infrared, TaskType.VIF, ("generic",))
 
 
 from tfs_moe_fusion.backbone import ArbitrarySizePadder
@@ -688,30 +697,58 @@ def test_final_closed_loop_contract_for_every_task(task: TaskType) -> None:
     with torch.no_grad():
         output = model(batch)
     assert output.fused.shape == output.coarse.shape == (1, 3, 33, 35)
-    assert not torch.equal(output.fused, output.coarse)
-    assert [item.block_id for item in output.router_diagnostics] == [
+    core_router_ids = [
         "s2.moe0",
         "s3.moe0",
         "s4.moe0",
-        "feedback.s3.moe0",
-        "feedback.s2.moe0",
     ]
-    assert [item.stage for item in output.spectral_statistics] == [
+    core_spectral_ids = [
         "input_a",
         "input_b",
         "s2.moe0.input",
         "s3.moe0.input",
         "s4.moe0.input",
-        "feedback.s3.moe0.input",
-        "feedback.s2.moe0.input",
     ]
+    if task in {TaskType.VIF, TaskType.SEG}:
+        torch.testing.assert_close(output.fused, output.coarse)
+        assert [item.block_id for item in output.router_diagnostics] == core_router_ids
+        assert [item.stage for item in output.spectral_statistics] == core_spectral_ids
+        assert output.fused_y is not None and output.coarse_y is not None
+        assert output.refinement_y is not None
+        assert output.fused_y.shape == output.coarse_y.shape == (1, 1, 33, 35)
+        torch.testing.assert_close(output.fused_y, output.coarse_y)
+        assert torch.count_nonzero(output.refinement) == 0
+        assert torch.count_nonzero(output.refinement_y) == 0
+        assert output.debug["coarse_head"] == "fusion_y"
+        assert output.debug["vif_seg_refinement_active"] is False
+        assert output.debug["chroma_cb_error"] < 2e-6
+        assert output.debug["chroma_cr_error"] < 2e-6
+    else:
+        assert not torch.equal(output.fused, output.coarse)
+        assert [item.block_id for item in output.router_diagnostics] == [
+            *core_router_ids,
+            "feedback.s3.moe0",
+            "feedback.s2.moe0",
+        ]
+        assert [item.stage for item in output.spectral_statistics] == [
+            *core_spectral_ids,
+            "feedback.s3.moe0.input",
+            "feedback.s2.moe0.input",
+        ]
+        assert output.fused_y is output.coarse_y is output.refinement_y is None
+        assert output.debug["coarse_head"] == "mfif_rgb"
     assert output.auxiliary is not None
     assert output.auxiliary.semantic_probabilities is None
     assert output.auxiliary.semantic_uncertainty is None
     assert output.auxiliary.semantic_boundary is None
-    assert output.auxiliary.focus_reliability.shape == (1, 2, 33, 35)
-    assert output.auxiliary.focus_selection.shape == (1, 2, 33, 35)
-    assert output.auxiliary.focus_confidence.shape == (1, 1, 33, 35)
+    if task is TaskType.MFIF:
+        assert output.auxiliary.focus_reliability.shape == (1, 2, 33, 35)
+        assert output.auxiliary.focus_selection.shape == (1, 2, 33, 35)
+        assert output.auxiliary.focus_confidence.shape == (1, 1, 33, 35)
+    else:
+        assert output.auxiliary.focus_reliability is None
+        assert output.auxiliary.focus_selection is None
+        assert output.auxiliary.focus_confidence is None
     assert output.debug["semantic_available"] is False
     assert output.aux["final_preclamp"].shape == output.fused.shape
     assert output.aux["clamp_low_ratio"].ndim == 0
@@ -731,6 +768,29 @@ def test_final_backward_without_external_semantic_assets() -> None:
     ]
     assert trainable_gradients
     assert all(torch.isfinite(value).all() for value in trainable_gradients)
+
+
+def test_vif_backward_updates_only_the_y_output_head() -> None:
+    config = _config()
+    batch = make_probe_batch(config, TaskType.VIF, spatial_size=(33, 35))
+    model = build_model(config)
+    output = model(batch)
+    assert output.fused_y is not None
+
+    output.fused_y.mean().backward()
+
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad)
+        for parameter in model.core.fusion_y_head.parameters()
+    )
+    assert all(
+        parameter.grad is None for parameter in model.core.mfif_rgb_head.parameters()
+    )
+    assert all(
+        parameter.grad is None
+        for name, parameter in model.feedback.decoder.named_parameters()
+        if "task_embedding" not in name
+    )
 
 
 @pytest.mark.parametrize("detach", [True, False])
@@ -837,5 +897,13 @@ def test_null_semantic_backend_runs_every_task(task: TaskType) -> None:
     assert output.auxiliary is not None
     assert output.auxiliary.semantic_probabilities is None
     assert output.debug["semantic_available"] is False
-    for item in output.router_diagnostics[-2:]:
-        assert item.auxiliary["semantic_available"] is False
+    feedback = [
+        item
+        for item in output.router_diagnostics
+        if item.block_id.startswith("feedback.")
+    ]
+    if task is TaskType.MFIF:
+        assert len(feedback) == 2
+        assert all(item.auxiliary["semantic_available"] is False for item in feedback)
+    else:
+        assert not feedback

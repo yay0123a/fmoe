@@ -1,0 +1,10 @@
+_base_: semantic_rt_y_only_experiment_c.yaml
+
+experiment:
+  name: semantic_rt_y_only_experiment_d_stable_y_ssim
+
+training:
+  losses:
+    vif:
+      ssim: 0.1
+      ssim_mode: visible_anchor

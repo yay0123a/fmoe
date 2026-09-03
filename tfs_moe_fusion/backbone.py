@@ -100,6 +100,9 @@ class BackboneOutput:
     decoder_feature: Tensor
     fused_image: Tensor
     padded_fused_image: Tensor
+    fused_y: Tensor | None
+    padded_fused_y: Tensor | None
+    gamut_projection_mask: Tensor | None
     spectral_statistics: tuple[SpectralStatistics, ...]
     router_diagnostics: tuple[RouterDiagnostics, ...]
     padding: object
@@ -127,6 +130,7 @@ class FusionBackbone(nn.Module, ABC):
 import torch
 from torch import nn
 
+from tfs_moe_fusion.color import compose_luminance_with_visible_chroma
 from tfs_moe_fusion.config import BackboneConfig, FrequencyConfig, MoEConfig
 from tfs_moe_fusion.frequency import (
     FrequencyFoundationBlock,
@@ -138,7 +142,7 @@ from tfs_moe_fusion.moe import (
     RouterContext,
     TaskEmbedding,
 )
-from tfs_moe_fusion.types import ModalityType
+from tfs_moe_fusion.types import ModalityType, TaskType
 
 
 def _groups(channels: int) -> int:
@@ -440,7 +444,10 @@ class CustomMultiscaleBackbone(FusionBackbone):
         self.decoder_stages = nn.ModuleList(
             [SkipFusionBlock(channels[i], channels[i - 1]) for i in range(3, 0, -1)]
         )
-        self.output_head = nn.Sequential(
+        self.fusion_y_head = nn.Sequential(
+            nn.Conv2d(channels[0], 1, 3, padding=1), nn.Sigmoid()
+        )
+        self.mfif_rgb_head = nn.Sequential(
             nn.Conv2d(channels[0], output_channels, 3, padding=1), nn.Sigmoid()
         )
 
@@ -520,7 +527,22 @@ class CustomMultiscaleBackbone(FusionBackbone):
             self.decoder_stages, reversed(fused_values[:-1]), strict=True
         ):
             decoded = decoder(decoded, skip)
-        padded_image = self.output_head(decoded)
+        padded_y: Tensor | None = None
+        gamut_projection_mask: Tensor | None = None
+        if batch.task in {TaskType.VIF, TaskType.SEG}:
+            predicted_y = self.fusion_y_head(decoded)
+            visible = (
+                image_a
+                if batch.source_a.modality is ModalityType.VISIBLE_RGB
+                else image_b
+            )
+            padded_image, padded_y, gamut_projection_mask = (
+                compose_luminance_with_visible_chroma(predicted_y, visible)
+            )
+            head_name = "fusion_y"
+        else:
+            padded_image = self.mfif_rgb_head(decoded)
+            head_name = "mfif_rgb"
         pyramids = (
             FeaturePyramid(*source_a),
             FeaturePyramid(*source_b),
@@ -528,20 +550,37 @@ class CustomMultiscaleBackbone(FusionBackbone):
         )
         for pyramid in pyramids:
             pyramid.validate()
+        debug: dict[str, object] = {
+            "scientific_model": True,
+            "padding": padding,
+            "source_encoder_shared": True,
+            "coarse_head": head_name,
+            "cross_modal": tuple(cross_modal),
+            "frequency_placements": tuple(sorted(self.frequency_blocks)),
+            "moe_placements": tuple(sorted(self.moe_blocks)),
+        }
+        if gamut_projection_mask is not None:
+            debug["y_gamut_clip_ratio"] = self.padder.unpad(
+                gamut_projection_mask, padding
+            ).mean()
         return BackboneOutput(
-            *pyramids,
-            decoded,
-            self.padder.unpad(padded_image, padding),
-            padded_image,
-            tuple(spectral),
-            tuple(diagnostics),
-            padding,
-            {
-                "scientific_model": True,
-                "padding": padding,
-                "source_encoder_shared": True,
-                "cross_modal": tuple(cross_modal),
-                "frequency_placements": tuple(sorted(self.frequency_blocks)),
-                "moe_placements": tuple(sorted(self.moe_blocks)),
-            },
+            source_a=pyramids[0],
+            source_b=pyramids[1],
+            fused=pyramids[2],
+            decoder_feature=decoded,
+            fused_image=self.padder.unpad(padded_image, padding),
+            padded_fused_image=padded_image,
+            fused_y=(
+                self.padder.unpad(padded_y, padding) if padded_y is not None else None
+            ),
+            padded_fused_y=padded_y,
+            gamut_projection_mask=(
+                self.padder.unpad(gamut_projection_mask, padding)
+                if gamut_projection_mask is not None
+                else None
+            ),
+            spectral_statistics=tuple(spectral),
+            router_diagnostics=tuple(diagnostics),
+            padding=padding,
+            debug=debug,
         )

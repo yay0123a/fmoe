@@ -332,7 +332,9 @@ GROUP_NAMES = (
 
 
 def parameter_group_name(name: str) -> str:
-    if name.startswith(("core.decoder_stages", "core.output_head")):
+    if name.startswith(
+        ("core.decoder_stages", "core.fusion_y_head", "core.mfif_rgb_head")
+    ):
         return "coarse_decoder"
     if ".expert_pool.modules_by_name.common" in name:
         return "common_experts" if name.startswith("core.") else "feedback_experts"
@@ -446,6 +448,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from tfs_moe_fusion.config import (
     RouterTemperatureScheduleConfig,
     SchedulerConfig,
+    TaskSchedulePhaseConfig,
     TrainingPhaseConfig,
 )
 
@@ -478,6 +481,19 @@ def active_phase(phases: list[TrainingPhaseConfig], epoch: int) -> TrainingPhase
         if phase.start <= epoch < phase.end:
             return phase
     return phases[-1]
+
+
+def scheduled_task(
+    phases: list[TaskSchedulePhaseConfig],
+    global_step: int,
+    steps_per_epoch: int,
+) -> TaskType:
+    epoch = global_step // steps_per_epoch
+    for phase in phases:
+        if phase.start_epoch <= epoch < phase.end_epoch:
+            phase_step = global_step - phase.start_epoch * steps_per_epoch
+            return TaskType.parse(phase.pattern[phase_step % len(phase.pattern)])
+    raise ValueError(f"No task schedule phase covers epoch {epoch}")
 
 
 def router_temperature(
@@ -1270,6 +1286,23 @@ class Trainer:
                         f"{name}={float(value.detach()):.5f}"
                         for name, value in result.weighted_components.items()
                     )
+                    y_only_values = " ".join(
+                        f"{name}={float(result.diagnostics[name]):.7f}"
+                        for name in (
+                            "chroma_cb_error",
+                            "chroma_cr_error",
+                            "y_gamut_clip_ratio",
+                            "coarse_final_y_mae",
+                            "y_gradient_loss",
+                            "ir_intensity_weight_mean",
+                            "ir_intensity_weight_max",
+                            "ir_intensity_weight_active_ratio",
+                        )
+                        if name in result.diagnostics
+                    )
+                    values = " ".join(
+                        value for value in (values, y_only_values) if value
+                    )
                     self.logger.info(
                         "step=%d epoch=%d/%d task=%s phase=%s total=%.5f "
                         "task_loss=%.5f aux_loss=%.5f lr=%.3e %s",
@@ -1592,7 +1625,14 @@ class Trainer:
             self.router_monitor.load_state_dict(state["router_monitor"])
 
     def _next_task(self) -> TaskType:
-        if self.config.training.task_sampling.strategy == "alternating":
+        strategy = self.config.training.task_sampling.strategy
+        if strategy == "scheduled":
+            return scheduled_task(
+                self.config.training.task_schedule,
+                self.state.global_step,
+                self.config.training.steps_per_epoch,
+            )
+        if strategy == "alternating":
             return tuple(TaskType)[self.state.global_step % len(TaskType)]
         return self.task_sampler.next_task()
 

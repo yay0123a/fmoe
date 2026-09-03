@@ -1,0 +1,31 @@
+_base_: default.yaml
+
+experiment:
+  name: semantic_rt_y_only_stage1_vif_5epoch
+
+model:
+  feedback:
+    vif_seg_refinement_enabled: false
+
+training:
+  epochs: 5
+  max_steps: null
+  task_sampling:
+    strategy: scheduled
+  task_schedule:
+  - name: y_only_vif_probe
+    start_epoch: 0
+    end_epoch: 5
+    pattern:
+    - vif
+  phases:
+    phases:
+    - name: y_only_vif_probe
+      start: 0
+      end: 5
+      loss_multipliers: {}
+  losses:
+    vif:
+      color: 0.0
+  checkpoint:
+    every_epochs: 1
