@@ -475,10 +475,18 @@ def moe_balance_loss(
     importance_losses, load_losses, entropies = [], [], []
     for item in diagnostics:
         valid = item.valid_expert_mask.float()
-        target = valid.sum(0) / valid.sum().clamp_min(1)
-        importance = item.probabilities.mean(0)
+        reduce_dims = tuple(index for index in range(valid.ndim) if index != 1)
+        target = valid.mean(reduce_dims)
+        target = target / target.sum().clamp_min(1)
+        importance = item.probabilities.mean(
+            tuple(index for index in range(item.probabilities.ndim) if index != 1)
+        )
         hard_load = (
-            torch.nn.functional.one_hot(item.topk_indices, item.probabilities.shape[1])
+            item.hard_load.detach()
+            if item.hard_load is not None
+            else torch.nn.functional.one_hot(
+                item.topk_indices, item.probabilities.shape[1]
+            )
             .float()
             .mean((0, 1))
             .detach()

@@ -261,8 +261,8 @@ class RouterDiagnostics:
     block_id: str
     logits: Tensor
     probabilities: Tensor
-    topk_indices: Tensor
-    topk_weights: Tensor
+    topk_indices: Tensor | None
+    topk_weights: Tensor | None
     valid_expert_mask: Tensor
     spatial_gates: Tensor | None = None
     branch_weights: Tensor | None = None
@@ -272,40 +272,56 @@ class RouterDiagnostics:
     auxiliary: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.logits.ndim != 2 or self.probabilities.shape != self.logits.shape:
+        if self.logits.ndim not in {2, 4} or self.probabilities.shape != self.logits.shape:
             raise ContractError(
-                "Router logits/probabilities must be equal [B,E] tensors"
+                "Router logits/probabilities must be equal [B,E] or [B,E,H,W] tensors"
             )
-        batch, experts = self.logits.shape
-        if self.valid_expert_mask.shape != (batch, experts):
-            raise ContractError("Router valid_expert_mask must match [B,E]")
+        batch, experts = self.logits.shape[:2]
+        expected_mask = (
+            (batch, experts)
+            if self.logits.ndim == 2
+            else (batch, experts, 1, 1)
+        )
+        if self.valid_expert_mask.shape != expected_mask:
+            raise ContractError("Router valid_expert_mask shape does not match routing")
         if self.valid_expert_mask.dtype is not torch.bool:
             raise ContractError("Router valid_expert_mask must be boolean")
-        if (
-            self.topk_indices.ndim != 2
-            or self.topk_weights.shape != self.topk_indices.shape
-            or self.topk_indices.shape[0] != batch
-        ):
-            raise ContractError(
-                "Router Top-k indices/weights must be equal [B,K] tensors"
-            )
+        if (self.topk_indices is None) != (self.topk_weights is None):
+            raise ContractError("Router Top-k indices and weights must be both set or none")
+        if self.logits.ndim == 2:
+            if self.topk_indices is None or self.topk_weights is None:
+                raise ContractError("Global router diagnostics require Top-k values")
+            if (
+                self.topk_indices.ndim != 2
+                or self.topk_weights.shape != self.topk_indices.shape
+                or self.topk_indices.shape[0] != batch
+            ):
+                raise ContractError(
+                    "Router Top-k indices/weights must be equal [B,K] tensors"
+                )
+        elif self.topk_indices is not None:
+            raise ContractError("Spatial router diagnostics must not carry Top-k values")
         if torch.isnan(self.logits).any() or torch.isposinf(self.logits).any():
             raise ContractError("Router logits contain NaN or positive infinity")
-        if (
-            not torch.isfinite(self.probabilities).all()
-            or not torch.isfinite(self.topk_weights).all()
+        if not torch.isfinite(self.probabilities).all() or (
+            self.topk_weights is not None and not torch.isfinite(self.topk_weights).all()
         ):
             raise ContractError("Router probabilities or Top-k weights are non-finite")
-        if not self.valid_expert_mask.gather(1, self.topk_indices).all():
+        if self.topk_indices is not None and not self.valid_expert_mask.gather(
+            1, self.topk_indices
+        ).all():
             raise ContractError("Router selected an unavailable expert")
-        ones = torch.ones(
-            batch, device=self.probabilities.device, dtype=self.probabilities.dtype
-        )
+        ones = torch.ones_like(self.probabilities.select(1, 0))
         if not torch.allclose(
             self.probabilities.sum(dim=1), ones, atol=1e-5, rtol=1e-5
         ):
             raise ContractError("Router probabilities must sum to one")
-        if not torch.allclose(self.topk_weights.sum(dim=1), ones, atol=1e-5, rtol=1e-5):
+        if self.topk_weights is not None and not torch.allclose(
+            self.topk_weights.sum(dim=1),
+            torch.ones(batch, device=self.probabilities.device, dtype=self.probabilities.dtype),
+            atol=1e-5,
+            rtol=1e-5,
+        ):
             raise ContractError("Router Top-k weights must sum to one")
         if self.spatial_gates is not None:
             if self.spatial_gates.ndim != 4 or self.spatial_gates.shape[:2] != (

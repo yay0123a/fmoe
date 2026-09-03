@@ -1,0 +1,454 @@
+schema_version: 1
+experiment:
+  name: shared_pool_stage1_global_soft
+  seed: 3407
+  deterministic: true
+  output_dir: runs
+model:
+  name: tfs_moe_fusion
+  output_channels: 3
+  pad_multiple: 8
+  backbone:
+    name: custom_multiscale
+    channels:
+    - 48
+    - 96
+    - 192
+    - 384
+    depths:
+    - 2
+    - 2
+    - 4
+    - 4
+    max_downsample: 8
+    normalization: group_norm
+    shared_source_encoder: true
+    separate_modality_stems: true
+    preserve_source_pyramids: true
+    preserve_fused_pyramid: true
+    dw_kernel_size: 3
+    mlp_ratio: 2.0
+    layer_scale_init: 1.0e-06
+    drop_path: 0.0
+  frequency:
+    enabled: true
+    dwt: true
+    afno: true
+    fdconv: true
+    cross_frequency: true
+    placements:
+    - s2
+    - s3
+    - s4
+    afno_num_blocks: 8
+    afno_sparsity_threshold: 0.01
+    afno_hard_thresholding_fraction: 1.0
+    fdconv_kernel_size: 3
+    fdconv_kernel_num: 8
+    residual_scale: 0.1
+    statistics_detach: false
+    force_fp32_fft: true
+    frequency_bands:
+    - 0.0
+    - 0.0625
+    - 0.125
+    - 0.25
+    - 0.5
+  moe:
+    enabled: true
+    architecture_version: v2
+    routing_mode: global_soft
+    common_always_on: true
+    common_scale_init: 0.1
+    specialist_scale_init: 0.03
+    experts:
+    - common
+    - low_frequency
+    - detail
+    - semantic
+    - infrared_saliency
+    top_k: 2
+    sparse_execution: true
+    train_execution: sparse_batch
+    inference_execution: sparse_batch
+    spatial_gating: false
+    router_branches:
+    - feature
+    - task
+    - spectrum
+    - modality
+    - auxiliary
+    infrared_requires_ir_modality: true
+    placements:
+    - s2
+    - s3
+    - s4
+    block_counts:
+      s1: 0
+      s2: 1
+      s3: 1
+      s4: 1
+    router_hidden_channels: 64
+    expert_expansion: 2
+    residual_scale: 0.001
+    router_temperature: 1.0
+    task_embedding_dim: 64
+    modality_embedding_dim: 32
+    force_fp32_routing: true
+    spatial_identity_init: true
+    branch_dropout: 0.0
+    noisy_topk: false
+    noisy_topk_std: 0.1
+  guidance:
+    focus:
+      enabled: true
+      backend: lightweight_focus
+      predicted_guidance_only: true
+      hidden_channels: 32
+      run_policy: all
+      source_stages:
+      - s1
+      - s2
+      use_sobel: true
+      use_laplacian: true
+      use_fdconv: true
+      detach_backbone_features: false
+      gradient_normalization: per_sample
+    semantic:
+      enabled: true
+      backend: segformer_b0_local
+      frozen: true
+      predicted_guidance_only: true
+      model_dir: weights/segformer_b0_cityscapes
+      input_size: 256
+      num_classes: 19
+      strict_loading: true
+      detach_guidance_input: true
+      guidance_policy: all
+      guidance_tasks:
+      - vif
+      - mfif
+      - seg
+      final_pass_policy: seg_only
+  feedback:
+    enabled: true
+    vif_seg_refinement_enabled: false
+    independent_moe_parameters: true
+    task_film: true
+    placements:
+    - s3
+    - s2
+    guide_channels: 32
+    transformer_heads: 4
+    transformer_window_size: 4
+    mfif_interaction: true
+    residual_scale: 0.001
+    max_residual: 0.25
+    num_iterations: 1
+    share_with_encoder_moe: false
+  ablation:
+    disable_focus_head: false
+    disable_focus_feedback: false
+    disable_semantic_feedback: false
+    detach_focus_from_backbone: false
+    detach_semantic_input: false
+    disable_guidance_pyramid: false
+    disable_feedback_moe: false
+    disable_task_film: false
+    disable_refinement_decoder: false
+    disable_final_residual: false
+    share_feedback_encoder_moe: false
+data:
+  dataset: semantic_rt
+  root: data/semantic_rt
+  mfif_root: data/mfif/semantic_rt
+  manifest: data/splits/semantic_rt_test_uniform_2000_seed3407.txt
+  crop_size: 256
+  horizontal_flip_probability: 0.5
+  rotation_degrees: 10.0
+  rotation_probability: 0.5
+  segmentation_min_valid_pixels: 64
+  segmentation_crop_attempts: 10
+  num_workers: 4
+  pin_memory: true
+training:
+  device: cuda:7
+  epochs: 50
+  steps_per_epoch: 750
+  max_steps: null
+  batch_size: 2
+  precision: bf16
+  optimizer:
+    name: adamw
+    learning_rate: 0.0002
+    weight_decay: 0.0001
+    betas:
+    - 0.9
+    - 0.999
+    epsilon: 1.0e-08
+    lr_multipliers:
+      semantic_experts: 0.5
+      feedback_experts: 0.5
+      feedback_routers: 0.5
+  scheduler:
+    name: cosine_with_warmup
+    warmup_steps: 2000
+    minimum_learning_rate: 1.0e-06
+    step_size: 10000
+    gamma: 0.5
+  task_sampling:
+    strategy: scheduled
+    weights:
+      vif: 1.0
+      mfif: 1.0
+      seg: 1.0
+  task_schedule:
+  - name: vif_base
+    start_epoch: 0
+    end_epoch: 20
+    pattern:
+    - vif
+  - name: seg_injection_low
+    start_epoch: 20
+    end_epoch: 21
+    pattern:
+    - seg
+    - vif
+  - name: seg_injection_mid
+    start_epoch: 21
+    end_epoch: 23
+    pattern:
+    - seg
+    - seg
+    - vif
+  - name: seg_injection_high
+    start_epoch: 23
+    end_epoch: 25
+    pattern:
+    - seg
+    - seg
+    - seg
+    - vif
+  - name: vif_recovery1
+    start_epoch: 25
+    end_epoch: 30
+    pattern:
+    - vif
+  - name: mfif_injection
+    start_epoch: 30
+    end_epoch: 35
+    pattern:
+    - mfif
+    - mfif
+    - mfif
+    - vif
+  - name: vif_recovery2
+    start_epoch: 35
+    end_epoch: 40
+    pattern:
+    - vif
+  - name: joint_convergence
+    start_epoch: 40
+    end_epoch: 50
+    pattern:
+    - vif
+    - seg
+    - vif
+    - mfif
+  gradient_strategy: alternating
+  gradient_accumulation_steps: 2
+  gradient_clip:
+    enabled: true
+    max_norm: 1.0
+  task_update_policy:
+    freeze:
+      vif: []
+      mfif:
+      - ir_experts
+      - semantic_experts
+      seg:
+      - focus_head
+  phases:
+    phases:
+    - name: vif_base
+      start: 0
+      end: 20
+      loss_multipliers:
+        seg_fusion: 1.0
+        semantic: 0.25
+    - name: seg_injection_low
+      start: 20
+      end: 21
+      loss_multipliers:
+        seg_fusion: 1.0
+        semantic: 0.25
+    - name: seg_injection_mid
+      start: 21
+      end: 23
+      loss_multipliers:
+        seg_fusion: 1.0
+        semantic: 0.5
+    - name: seg_injection_high
+      start: 23
+      end: 25
+      loss_multipliers:
+        seg_fusion: 1.0
+        semantic: 1.0
+    - name: vif_recovery1
+      start: 25
+      end: 30
+      loss_multipliers: {}
+    - name: mfif_injection
+      start: 30
+      end: 35
+      loss_multipliers: {}
+    - name: vif_recovery2
+      start: 35
+      end: 40
+      loss_multipliers: {}
+    - name: joint_convergence
+      start: 40
+      end: 50
+      loss_multipliers:
+        seg_fusion: 1.0
+        semantic: 1.0
+  router_temperature:
+    start: 1.5
+    end: 0.7
+    schedule: cosine
+    minimum: 0.5
+  moe_execution:
+    enabled: true
+    warmup:
+      uniform_steps: 50
+      uniform_to_soft_end: 150
+      soft_to_topk_end: 300
+    refresh:
+      interval: 200
+      routed_fraction: 0.5
+      expert_only: true
+    routing:
+      initial_temperature: 1.5
+      sparse_start_temperature: 1.0
+      final_temperature: 0.7
+      final_step: 7500
+      initial_noise_std: 0.05
+      noise_end_step: 7500
+    monitor:
+      ema_decay: 0.95
+      starvation_threshold: 0.02
+      overload_threshold: 0.8
+      patience_steps: 500
+    recovery:
+      steps: 200
+      temperature_floor: 1.0
+      noise_std: 0.03
+      refresh_interval: 50
+  diagnostics:
+    interval: 100
+    gradient_conflict_enabled: false
+    gradient_conflict_interval: 1000
+    router_collapse_threshold: 0.95
+    collapse_patience: 10
+    loss_gradient_interval: 250
+    loss_gradient_until_step: 20000
+  log_every_steps: 10
+  ema:
+    enabled: true
+    decay: 0.999
+  losses:
+    strict_targets: true
+    vif:
+      intensity: 1.0
+      gradient: 1.0
+      ssim: 0.5
+      color: 0.0
+      coarse_supervision: 0.25
+      intensity_mode: pixel_max
+      intensity_energy_normalization: per_sample_mean
+      ir_intensity_max_weight: 0.3
+      intensity_visible_support_kernel: 3
+      intensity_weight_smoothing_kernel: 3
+      gradient_mode: magnitude_max
+      ir_gradient_dominance_ratio: 1.2
+      visible_gradient_support_kernel: 3
+      ssim_mode: source_max
+    mfif:
+      reconstruction: 1.0
+      gradient: 1.0
+      ssim: 0.5
+      coarse_supervision: 0.25
+      use_charbonnier: false
+    focus:
+      selection: 1.0
+      boundary: 0.5
+      confidence: 0.1
+    seg_fusion:
+      enabled: true
+      intensity: 1.0
+      gradient: 1.0
+    semantic:
+      cross_entropy: 1.0
+      dice: 0.5
+      coarse_supervision: 0.0
+      ignore_index: 255
+      class_weights:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 3.0
+      - 3.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 2.8
+      - 3.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 3.0
+      - 3.0
+      improvement_enabled: false
+      improvement_weight: 0.0
+      improvement_margin: 0.0
+      boundary_alignment: 0.0
+    frequency:
+      enabled: true
+      weight: 0.01
+      low_leakage: 1.0
+      detail_leakage: 1.0
+      semantic_boundary: 0.1
+    moe:
+      enabled: false
+      weight: 0.01
+      soft_balance_weight: 1.0
+      switch_balance_weight: 0.1
+      entropy_enabled: false
+      entropy_weight: 0.0
+      entropy_target: 1.0
+    consistency:
+      enabled: false
+      weight: 0.01
+      probability: 0.25
+      gaussian_kernel_size: 9
+      gaussian_sigma: 2.0
+    infrared:
+      enabled: true
+      weight: 0.1
+      detach_saliency: true
+      saliency_alignment: 0.1
+    regularization:
+      residual_magnitude: 0.001
+      range_penalty: 0.001
+  checkpoint:
+    every_epochs: 5
+    every_steps: 60001
+    keep_last: 3
+    resume: null
+  distributed:
+    enabled: false
+    find_unused_parameters: true

@@ -141,6 +141,22 @@ def test_experiment_d_uses_low_weight_visible_anchored_y_ssim() -> None:
     assert vif.gradient_mode == "directional_visible_anchor"
 
 
+def test_simple_vif_config_uses_classic_two_source_targets() -> None:
+    config = load_config(ROOT / "configs/semantic_rt_y_only_simple_vif.yaml")
+    vif = config.training.losses.vif
+
+    assert config.experiment.name == "semantic_rt_y_only_simple_vif"
+    assert config.training.epochs == 5
+    assert config.training.steps_per_epoch == 750
+    assert config.training.task_schedule[0].pattern == ["vif"]
+    assert (vif.intensity, vif.gradient, vif.ssim) == (1.0, 1.0, 0.1)
+    assert (vif.color, vif.coarse_supervision) == (0.0, 0.1)
+    assert vif.intensity_mode == "pixel_max"
+    assert vif.gradient_mode == "magnitude_max"
+    assert vif.ssim_mode == "source_max"
+    assert config.model.feedback.vif_seg_refinement_enabled is False
+
+
 def test_default_config_uses_vif_anchored_loss_schedule() -> None:
     config = load_config(DEFAULT_CONFIG)
     losses = config.training.losses

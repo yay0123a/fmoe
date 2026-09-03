@@ -328,15 +328,48 @@ GROUP_NAMES = (
     "feedback_routers",
     "refinement_decoder",
     "residual_head",
+    "shared_common",
+    "shared_low",
+    "shared_detail",
+    "shared_semantic",
+    "shared_ir",
+    "core_site_adapters",
+    "feedback_site_adapters",
+    "core_routers",
 )
 
 
-def parameter_group_name(name: str) -> str:
+def parameter_group_name(name: str, shared_pool_enabled: bool = False) -> str:
+    if shared_pool_enabled:
+        shared_experts = {
+            "shared_expert_bank.common.": "shared_common",
+            "shared_expert_bank.specialists.low_frequency.": "shared_low",
+            "shared_expert_bank.specialists.detail.": "shared_detail",
+            "shared_expert_bank.specialists.semantic.": "shared_semantic",
+            "shared_expert_bank.specialists.infrared_saliency.": "shared_ir",
+        }
+        for prefix, group in shared_experts.items():
+            if name.startswith(prefix):
+                return group
+        if name.startswith("core.task_embedding") or (
+            name.startswith("core.moe_blocks") and ".router." in name
+        ):
+            return "core_routers"
+        if name.startswith("core.moe_blocks"):
+            return "core_site_adapters"
+        if name.startswith("feedback.feedback_moe"):
+            return (
+                "feedback_routers"
+                if ".router." in name
+                else "feedback_site_adapters"
+            )
     if name.startswith(
         ("core.decoder_stages", "core.fusion_y_head", "core.mfif_rgb_head")
     ):
         return "coarse_decoder"
     if ".expert_pool.modules_by_name.common" in name:
+        return "common_experts" if name.startswith("core.") else "feedback_experts"
+    if ".common_expert." in name:
         return "common_experts" if name.startswith("core.") else "feedback_experts"
     if ".expert_pool.modules_by_name.low_frequency" in name:
         return (
@@ -383,10 +416,11 @@ class ParameterGroupRegistry:
         groups: dict[str, list[nn.Parameter]] = {name: [] for name in GROUP_NAMES}
         names: dict[str, str] = {}
         seen: set[int] = set()
+        shared_pool_enabled = getattr(model, "shared_expert_bank", None) is not None
         for name, parameter in model.named_parameters():
             if not parameter.requires_grad or id(parameter) in seen:
                 continue
-            group = parameter_group_name(name)
+            group = parameter_group_name(name, shared_pool_enabled)
             groups[group].append(parameter)
             names[name] = group
             seen.add(id(parameter))
@@ -514,7 +548,12 @@ def router_temperature(
 from contextlib import ExitStack, contextmanager
 
 from tfs_moe_fusion.config import MoEExecutionScheduleConfig, TaskUpdatePolicyConfig
-from tfs_moe_fusion.moe import FunctionalMoEBlock, MoEExecutionPolicy
+from tfs_moe_fusion.moe import (
+    FunctionalMoEBlock,
+    MoEExecutionPolicy,
+    TaskEmbedding,
+    iter_moe_blocks,
+)
 
 
 def _cosine_progress(step: int, start: int, end: int) -> float:
@@ -555,14 +594,18 @@ class RouterLoadMonitor:
         for item in diagnostics:
             experts = item.probabilities.shape[1]
             load = (
-                torch.nn.functional.one_hot(item.topk_indices, experts)
+                item.hard_load
+                if item.hard_load is not None
+                else torch.nn.functional.one_hot(item.topk_indices, experts)
                 .amax(1)
                 .float()
                 .mean(0)
             )
             load = reduce_mean(load).cpu()
-            valid = item.valid_expert_mask.any(0).cpu()
-            top2_mass = item.probabilities.gather(1, item.topk_indices).sum(1).mean()
+            valid = item.valid_expert_mask.any(
+                tuple(index for index in range(item.valid_expert_mask.ndim) if index != 1)
+            ).cpu()
+            top2_mass = item.probabilities.topk(min(2, experts), dim=1).values.sum(1).mean()
             top2_mass = float(reduce_mean(top2_mass).cpu())
             name = item.block_id
             previous = self.usage_ema.get(name, load.tolist())
@@ -770,6 +813,11 @@ class ExpertOnlyParameterPolicy:
             "semantic_experts",
             "ir_experts",
             "feedback_experts",
+            "shared_common",
+            "shared_low",
+            "shared_detail",
+            "shared_semantic",
+            "shared_ir",
         }
     )
 
@@ -873,6 +921,74 @@ def expert_gradient_statistics(
     return result
 
 
+def moe_gradient_statistics(model: nn.Module) -> dict[str, float]:
+    """Summarize router and per-expert gradients without counting shared weights twice."""
+
+    def norm(parameters: dict[int, nn.Parameter]) -> float:
+        gradients = [
+            parameter.grad.detach().float().norm()
+            for parameter in parameters.values()
+            if parameter.grad is not None
+        ]
+        if not gradients:
+            return 0.0
+        return float(torch.linalg.vector_norm(torch.stack(gradients)))
+
+    router_parameters: dict[int, nn.Parameter] = {}
+    expert_parameters: dict[str, dict[int, nn.Parameter]] = {}
+    for block in iter_moe_blocks(model):
+        for parameter in block.router.parameters():
+            router_parameters[id(parameter)] = parameter
+        shared_bank = block.shared_expert_bank
+        if shared_bank is not None:
+            selected = expert_parameters.setdefault("common", {})
+            for parameter in shared_bank.common.parameters():
+                selected[id(parameter)] = parameter
+            experts = shared_bank.specialists.items()
+        else:
+            common_expert = getattr(block, "common_expert", None)
+            if common_expert is not None:
+                selected = expert_parameters.setdefault("common", {})
+                for parameter in common_expert.parameters():
+                    selected[id(parameter)] = parameter
+            experts = block.expert_pool.modules_by_name.items()
+        for expert_name, expert in experts:
+            selected = expert_parameters.setdefault(expert_name, {})
+            for parameter in expert.parameters():
+                selected[id(parameter)] = parameter
+    for module in model.modules():
+        if isinstance(module, TaskEmbedding):
+            for parameter in module.parameters():
+                router_parameters[id(parameter)] = parameter
+
+    result = {"router_grad_norm": norm(router_parameters)}
+    result.update(
+        {
+            f"expert_grad_norm/{expert_name}": norm(parameters)
+            for expert_name, parameters in sorted(expert_parameters.items())
+        }
+    )
+    return result
+
+
+def moe_residual_statistics(
+    values: tuple[RouterDiagnostics, ...],
+) -> dict[str, float]:
+    ratios = {
+        item.block_id: item.auxiliary.get("moe_residual_to_input_ratio")
+        for item in values
+        if item.auxiliary.get("moe_residual_to_input_ratio") is not None
+    }
+    if not ratios:
+        return {"moe_residual_to_input_ratio": 0.0}
+    result = {
+        f"moe_residual_to_input_ratio/{block_id}": float(value)
+        for block_id, value in ratios.items()
+    }
+    result["moe_residual_to_input_ratio"] = sum(result.values()) / len(result)
+    return result
+
+
 def loss_group_gradient_statistics(
     result: LossOutput, parameters: tuple[nn.Parameter, ...]
 ) -> dict[str, float]:
@@ -912,15 +1028,26 @@ def loss_group_gradient_statistics(
     }
 
 
-def router_statistics(values: tuple[RouterDiagnostics, ...]) -> dict[str, float]:
+def router_statistics(values: tuple[RouterDiagnostics, ...]) -> dict[str, Any]:
     if not values:
-        return {"router_entropy": 0.0, "router_max_load": 0.0}
+        return {
+            "router_entropy": 0.0,
+            "router_max_load": 0.0,
+            "router/top1_margin": 0.0,
+            "router/probability_std": 0.0,
+            "router/entropy": 0.0,
+            "routing_override": "learned",
+        }
     entropy = torch.stack(
         [item.entropy.mean() for item in values if item.entropy is not None]
     ).mean()
     load = torch.stack(
         [
-            torch.nn.functional.one_hot(item.topk_indices, item.probabilities.shape[1])
+            item.hard_load
+            if item.hard_load is not None
+            else torch.nn.functional.one_hot(
+                item.topk_indices, item.probabilities.shape[1]
+            )
             .amax(1)
             .float()
             .mean(0)
@@ -931,10 +1058,49 @@ def router_statistics(values: tuple[RouterDiagnostics, ...]) -> dict[str, float]
         "router_entropy": float(entropy.detach()),
         "router_max_load": float(load.max().detach()),
     }
+    router_metrics = {
+        name: [item.auxiliary[name] for item in values if name in item.auxiliary]
+        for name in (
+            "router/top1_margin",
+            "router/probability_std",
+            "router/entropy",
+            "router/spatial_variance",
+        )
+    }
+    for name, metric_values in router_metrics.items():
+        if metric_values:
+            result[name] = float(
+                torch.stack([torch.as_tensor(value).detach() for value in metric_values])
+                .float()
+                .mean()
+            )
+    overrides = {
+        str(item.auxiliary.get("routing_override", "learned")) for item in values
+    }
+    result["routing_override"] = (
+        next(iter(overrides)) if len(overrides) == 1 else "mixed"
+    )
     for item in values:
         residuals = item.auxiliary.get("expert_residual_rms", {})
         for expert, value in residuals.items():
             result[f"expert_residual_rms/{item.block_id}/{expert}"] = float(value)
+        contributions = item.auxiliary.get("expert_weighted_contribution_rms", {})
+        for expert, value in contributions.items():
+            result[
+                f"expert_weighted_contribution_rms/{item.block_id}/{expert}"
+            ] = float(value)
+        for name in (
+            "router/top1_margin",
+            "router/probability_std",
+            "router/entropy",
+            "router/spatial_variance",
+        ):
+            value = item.auxiliary.get(name)
+            if value is not None:
+                result[f"{name}/{item.block_id}"] = float(value)
+        result[f"routing_override/{item.block_id}"] = str(
+            item.auxiliary.get("routing_override", "learned")
+        )
         scale = item.auxiliary.get("residual_scale_rms")
         if scale is not None:
             result[f"moe_residual_scale/{item.block_id}"] = float(scale)
@@ -1498,10 +1664,11 @@ class Trainer:
                 self.state.micro_step += 1
         assert aggregate is not None
         self.amp.unscale_(self.optimizer)
-        gradient_info = {
-            **gradient_statistics(self.model),
-            **expert_gradient_statistics(self.registry),
-        }
+        gradient_info = gradient_statistics(self.model)
+        diagnostics_due = self.state.global_step % config.diagnostics.interval == 0
+        if diagnostics_due:
+            gradient_info.update(expert_gradient_statistics(self.registry))
+            gradient_info.update(moe_gradient_statistics(self.model))
         if gradient_info["nonfinite_gradients"]:
             raise FloatingPointError("Training produced non-finite gradients")
         if config.gradient_clip.enabled:
@@ -1532,6 +1699,10 @@ class Trainer:
                 )
             )
         )
+        if diagnostics_due:
+            aggregate.diagnostics.update(
+                moe_residual_statistics(tuple(output.router_diagnostics))
+            )
         aggregate.diagnostics.update(
             self.router_monitor.update(
                 tuple(output.router_diagnostics), self.state.global_step

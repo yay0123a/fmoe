@@ -59,6 +59,16 @@ class FrequencyConfig:
 @dataclass(slots=True)
 class MoEConfig:
     enabled: bool = True
+    architecture_version: str = "legacy"
+    routing_mode: str = "legacy_topk"
+    shared_pool_enabled: bool = False
+    expert_dim: int = 128
+    patch_size: dict[str, int] = field(
+        default_factory=lambda: {"s2": 4, "s3": 2, "s4": 1}
+    )
+    common_always_on: bool = False
+    common_scale_init: float = 0.1
+    specialist_scale_init: float = 0.03
     experts: list[str] = field(
         default_factory=lambda: [
             "common",
@@ -623,6 +633,52 @@ class ProjectConfig:
             raise ConfigurationError(
                 "model.moe.experts must contain exactly the five functional experts"
             )
+        if model.moe.architecture_version not in {"legacy", "v2"}:
+            raise ConfigurationError(
+                "model.moe.architecture_version must be legacy or v2"
+            )
+        if model.moe.routing_mode not in {
+            "legacy_topk",
+            "global_soft",
+            "spatial_soft",
+        }:
+            raise ConfigurationError(
+                "model.moe.routing_mode must be legacy_topk, global_soft, or spatial_soft"
+            )
+        if model.moe.architecture_version == "legacy" and (
+            model.moe.routing_mode != "legacy_topk" or model.moe.common_always_on
+        ):
+            raise ConfigurationError(
+                "Legacy MoE requires legacy_topk routing and routed common expert"
+            )
+        if model.moe.architecture_version == "v2" and (
+            model.moe.routing_mode not in {"global_soft", "spatial_soft"}
+            or model.moe.spatial_gating
+        ):
+            raise ConfigurationError(
+                "v2 MoE requires global_soft or spatial_soft routing without spatial gating"
+            )
+        if model.moe.shared_pool_enabled and (
+            model.moe.architecture_version != "v2"
+            or not model.moe.common_always_on
+        ):
+            raise ConfigurationError(
+                "Shared expert pools require v2 routing with common always-on"
+            )
+        if model.moe.routing_mode == "spatial_soft" and not model.moe.shared_pool_enabled:
+            raise ConfigurationError("spatial_soft routing requires the shared expert pool")
+        if model.moe.expert_dim <= 0:
+            raise ConfigurationError("model.moe.expert_dim must be positive")
+        if set(model.moe.patch_size) != {"s2", "s3", "s4"} or any(
+            value <= 0 for value in model.moe.patch_size.values()
+        ):
+            raise ConfigurationError(
+                "model.moe.patch_size must define positive s2/s3/s4 values"
+            )
+        if min(
+            model.moe.common_scale_init, model.moe.specialist_scale_init
+        ) < 0:
+            raise ConfigurationError("MoE v2 scale initializers cannot be negative")
         if not 1 <= model.moe.top_k <= len(model.moe.experts) - 1:
             raise ConfigurationError(
                 "model.moe.top_k must fit the four experts available without infrared"
@@ -871,6 +927,14 @@ class ProjectConfig:
             "feedback_routers",
             "refinement_decoder",
             "residual_head",
+            "shared_common",
+            "shared_low",
+            "shared_detail",
+            "shared_semantic",
+            "shared_ir",
+            "core_site_adapters",
+            "feedback_site_adapters",
+            "core_routers",
         }
         if set(training.task_update_policy.freeze) != {"vif", "mfif", "seg"}:
             raise ConfigurationError(

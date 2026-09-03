@@ -1,0 +1,670 @@
+{
+  "batches": 100,
+  "checkpoint": "runs/semantic_rt_y_only_simple_vif/checkpoints/final_ema.pt",
+  "modes": {
+    "learned": {
+      "blocks": {
+        "feedback.s2.moe0": {
+          "entropy": 1.3862943494319915,
+          "expert_names": [
+            "common",
+            "low_frequency",
+            "detail",
+            "semantic",
+            "infrared_saliency"
+          ],
+          "expert_residual_rms": {
+            "detail": 0.06634672252195221,
+            "low_frequency": 0.46433625426343694,
+            "semantic": 0.15152533009648322
+          },
+          "expert_weighted_contribution_rms": {
+            "common": 0.0,
+            "detail": 0.01378885107114911,
+            "infrared_saliency": 0.0,
+            "low_frequency": 0.18259182557463646,
+            "semantic": 0.07577230781316757
+          },
+          "hard_load": [
+            0.0,
+            0.3425,
+            0.1575,
+            0.5,
+            0.0
+          ],
+          "importance": [
+            0.24985386550426483,
+            0.25002566337585447,
+            0.2500225403904915,
+            0.25009792536497116,
+            0.0
+          ],
+          "top1_margin": 6.442919373512269e-05
+        },
+        "feedback.s3.moe0": {
+          "entropy": 1.386294322013855,
+          "expert_names": [
+            "common",
+            "low_frequency",
+            "detail",
+            "semantic",
+            "infrared_saliency"
+          ],
+          "expert_residual_rms": {
+            "common": 0.13410301506519318,
+            "detail": 0.1832834929227829,
+            "low_frequency": 0.3765908831357956
+          },
+          "expert_weighted_contribution_rms": {
+            "common": 0.06705809250473976,
+            "detail": 0.0019434836506843566,
+            "infrared_saliency": 0.0,
+            "low_frequency": 0.18667393505573274,
+            "semantic": 0.0
+          },
+          "hard_load": [
+            0.5,
+            0.4925,
+            0.0075,
+            0.0,
+            0.0
+          ],
+          "importance": [
+            0.25011885315179827,
+            0.2500689119100571,
+            0.24995405346155167,
+            0.24985818654298783,
+            0.0
+          ],
+          "top1_margin": 4.956662654876709e-05
+        },
+        "s2.moe0": {
+          "entropy": 1.386293876171112,
+          "expert_names": [
+            "common",
+            "low_frequency",
+            "detail",
+            "semantic",
+            "infrared_saliency"
+          ],
+          "expert_residual_rms": {
+            "common": 0.2445423723757267,
+            "detail": 0.0339494738727808,
+            "semantic": 0.11465703837573528
+          },
+          "expert_weighted_contribution_rms": {
+            "common": 0.1303321736305952,
+            "detail": 0.0002751218620687723,
+            "infrared_saliency": 0.0,
+            "low_frequency": 0.0,
+            "semantic": 0.057264595739543435
+          },
+          "hard_load": [
+            0.5,
+            0.0,
+            0.005,
+            0.495,
+            0.0
+          ],
+          "importance": [
+            0.25028166323900225,
+            0.2496604374051094,
+            0.24994166031479836,
+            0.25011624068021776,
+            0.0
+          ],
+          "top1_margin": 0.00016539297997951506
+        },
+        "s3.moe0": {
+          "entropy": 1.386294333934784,
+          "expert_names": [
+            "common",
+            "low_frequency",
+            "detail",
+            "semantic",
+            "infrared_saliency"
+          ],
+          "expert_residual_rms": {
+            "common": 0.45183709571042013,
+            "detail": 0.10559509162391935,
+            "low_frequency": 0.3776828910175123,
+            "semantic": 0.09770347578106103
+          },
+          "expert_weighted_contribution_rms": {
+            "common": 0.19539113149046897,
+            "detail": 0.005363048668950796,
+            "infrared_saliency": 0.0,
+            "low_frequency": 0.16228915393352508,
+            "semantic": 0.02021061446517706
+          },
+          "hard_load": [
+            0.4025,
+            0.395,
+            0.0375,
+            0.165,
+            0.0
+          ],
+          "importance": [
+            0.25006396681070325,
+            0.25004235476255415,
+            0.249945265352726,
+            0.2499484111368656,
+            0.0
+          ],
+          "top1_margin": 9.438917040824891e-05
+        },
+        "s4.moe0": {
+          "entropy": 1.386294230222702,
+          "expert_names": [
+            "common",
+            "low_frequency",
+            "detail",
+            "semantic",
+            "infrared_saliency"
+          ],
+          "expert_residual_rms": {
+            "common": 0.06539250679314136,
+            "detail": 0.17463595606386662,
+            "low_frequency": 0.32947533215795244,
+            "semantic": 0.09868488377150224
+          },
+          "expert_weighted_contribution_rms": {
+            "common": 0.03177272293716669,
+            "detail": 0.0048207234591245655,
+            "infrared_saliency": 0.0,
+            "low_frequency": 0.0417273972183466,
+            "semantic": 0.043583869747817514
+          },
+          "hard_load": [
+            0.48,
+            0.0925,
+            0.02,
+            0.4075,
+            0.0
+          ],
+          "importance": [
+            0.25010336890816687,
+            0.2500362291932106,
+            0.24982585221529008,
+            0.25003455206751823,
+            0.0
+          ],
+          "top1_margin": 6.95657730102539e-05
+        }
+      },
+      "loss_components": {
+        "focus/boundary": 0.019973996129119768,
+        "focus/confidence": 0.9836167621612549,
+        "focus/selection": 0.6929797983169556,
+        "fusion/coarse": 0.40322849854826925,
+        "fusion/gradient": 0.03716259015724063,
+        "fusion/reconstruction": 0.40322849854826925,
+        "fusion/ssim": 0.7335950827598572,
+        "moe/soft_balance": 7.589120219364532e-08,
+        "moe/switch_balance": 1.0003840327262878,
+        "regularization/range": 0.0,
+        "regularization/residual": 6.924150511622429e-08
+      },
+      "mode": "learned",
+      "total_loss": 1.7103246080875396,
+      "weighted_loss_components": {
+        "focus/boundary": 0.009986998064559884,
+        "focus/confidence": 0.09836167812347413,
+        "focus/selection": 0.6929797983169556,
+        "fusion/coarse": 0.10080712463706731,
+        "fusion/gradient": 0.03716259015724063,
+        "fusion/reconstruction": 0.40322849854826925,
+        "fusion/ssim": 0.3667975413799286,
+        "moe/soft_balance": 7.58912006015855e-10,
+        "moe/switch_balance": 0.0010003840818535537,
+        "regularization/range": 0.0,
+        "regularization/residual": 6.925802154000849e-11
+      }
+    },
+    "shuffled": {
+      "blocks": {
+        "feedback.s2.moe0": {
+          "entropy": 1.3862943542003632,
+          "expert_names": [
+            "common",
+            "low_frequency",
+            "detail",
+            "semantic",
+            "infrared_saliency"
+          ],
+          "expert_residual_rms": {
+            "common": 0.10980101749300956,
+            "low_frequency": 0.46417836035075394,
+            "semantic": 0.15383403695055417
+          },
+          "expert_weighted_contribution_rms": {
+            "common": 0.05490771416574716,
+            "detail": 0.0,
+            "infrared_saliency": 0.0,
+            "low_frequency": 0.18089905947446824,
+            "semantic": 0.03224361341446638
+          },
+          "hard_load": [
+            0.5,
+            0.34,
+            0.0,
+            0.16,
+            0.0
+          ],
+          "importance": [
+            0.25009785443544386,
+            0.25002565592527387,
+            0.24985393792390823,
+            0.2500225493311882,
+            0.0
+          ],
+          "top1_margin": 6.43777847290039e-05
+        },
+        "feedback.s3.moe0": {
+          "entropy": 1.3862943243980408,
+          "expert_names": [
+            "common",
+            "low_frequency",
+            "detail",
+            "semantic",
+            "infrared_saliency"
+          ],
+          "expert_residual_rms": {
+            "detail": 0.07889199536293745,
+            "low_frequency": 0.37657263517379763,
+            "semantic": 0.1375606656074524
+          },
+          "expert_weighted_contribution_rms": {
+            "common": 0.0,
+            "detail": 0.03945069016888738,
+            "infrared_saliency": 0.0,
+            "low_frequency": 0.1866649517416954,
+            "semantic": 0.001458652690052986
+          },
+          "hard_load": [
+            0.0,
+            0.4925,
+            0.5,
+            0.0075,
+            0.0
+          ],
+          "importance": [
+            0.24985827073454858,
+            0.2500688698887825,
+            0.250118755698204,
+            0.24995410740375518,
+            0.0
+          ],
+          "top1_margin": 4.9508512020111085e-05
+        },
+        "s2.moe0": {
+          "entropy": 1.3862938702106475,
+          "expert_names": [
+            "common",
+            "low_frequency",
+            "detail",
+            "semantic",
+            "infrared_saliency"
+          ],
+          "expert_residual_rms": {
+            "common": 0.2446024076640606,
+            "detail": 0.05413764357566833,
+            "semantic": 0.11177694797515869
+          },
+          "expert_weighted_contribution_rms": {
+            "common": 0.12192292429506779,
+            "detail": 0.02917292483150959,
+            "infrared_saliency": 0.0,
+            "low_frequency": 0.0,
+            "semantic": 0.0009147487208247184
+          },
+          "hard_load": [
+            0.495,
+            0.0,
+            0.5,
+            0.005,
+            0.0
+          ],
+          "importance": [
+            0.25011624068021776,
+            0.2496604374051094,
+            0.25028166323900225,
+            0.24994166031479836,
+            0.0
+          ],
+          "top1_margin": 0.00016539297997951506
+        },
+        "s3.moe0": {
+          "entropy": 1.3862943351268768,
+          "expert_names": [
+            "common",
+            "low_frequency",
+            "detail",
+            "semantic",
+            "infrared_saliency"
+          ],
+          "expert_residual_rms": {
+            "common": 0.4508187274138133,
+            "detail": 0.07087416631966523,
+            "low_frequency": 0.3776477308649766,
+            "semantic": 0.10245747970683235
+          },
+          "expert_weighted_contribution_rms": {
+            "common": 0.09323967412114144,
+            "detail": 0.030948586594313383,
+            "infrared_saliency": 0.0,
+            "low_frequency": 0.1622739315778017,
+            "semantic": 0.005186229646205902
+          },
+          "hard_load": [
+            0.165,
+            0.395,
+            0.4025,
+            0.0375,
+            0.0
+          ],
+          "importance": [
+            0.24994852393865585,
+            0.2500420957803726,
+            0.2500639888644218,
+            0.24994539350271225,
+            0.0
+          ],
+          "top1_margin": 9.428158402442932e-05
+        },
+        "s4.moe0": {
+          "entropy": 1.3862942373752594,
+          "expert_names": [
+            "common",
+            "low_frequency",
+            "detail",
+            "semantic",
+            "infrared_saliency"
+          ],
+          "expert_residual_rms": {
+            "common": 0.06560256712290706,
+            "detail": 0.0856128903850913,
+            "low_frequency": 0.3321871775038102,
+            "semantic": 0.10391959082335234
+          },
+          "expert_weighted_contribution_rms": {
+            "common": 0.028970648013055326,
+            "detail": 0.04183915009722114,
+            "infrared_saliency": 0.0,
+            "low_frequency": 0.04087614454329014,
+            "semantic": 0.002871893495321274
+          },
+          "hard_load": [
+            0.4075,
+            0.09,
+            0.4825,
+            0.02,
+            0.0
+          ],
+          "importance": [
+            0.25003465577960016,
+            0.25003589019179345,
+            0.25010342806577684,
+            0.24982602119445801,
+            0.0
+          ],
+          "top1_margin": 6.951771676540375e-05
+        }
+      },
+      "loss_components": {
+        "focus/boundary": 0.019973996129119768,
+        "focus/confidence": 0.9836167621612549,
+        "focus/selection": 0.6929797983169556,
+        "fusion/coarse": 0.40322033792734147,
+        "fusion/gradient": 0.03716268968768418,
+        "fusion/reconstruction": 0.40322033792734147,
+        "fusion/ssim": 0.7335906952619553,
+        "moe/soft_balance": 7.584909823776798e-08,
+        "moe/switch_balance": 1.0003840458393096,
+        "regularization/range": 0.0,
+        "regularization/residual": 6.923219189047814e-08
+      },
+      "mode": "shuffled",
+      "total_loss": 1.710312317609787,
+      "weighted_loss_components": {
+        "focus/boundary": 0.009986998064559884,
+        "focus/confidence": 0.09836167812347413,
+        "focus/selection": 0.6929797983169556,
+        "fusion/coarse": 0.10080508448183537,
+        "fusion/gradient": 0.03716268968768418,
+        "fusion/reconstruction": 0.40322033792734147,
+        "fusion/ssim": 0.36679534763097765,
+        "moe/soft_balance": 7.584909639257731e-10,
+        "moe/switch_balance": 0.0010003840934950858,
+        "regularization/range": 0.0,
+        "regularization/residual": 6.924892659299076e-11
+      }
+    },
+    "uniform": {
+      "blocks": {
+        "feedback.s2.moe0": {
+          "entropy": 1.3862943649291992,
+          "expert_names": [
+            "common",
+            "low_frequency",
+            "detail",
+            "semantic",
+            "infrared_saliency"
+          ],
+          "expert_residual_rms": {
+            "common": 0.1098022122681141,
+            "detail": 0.05173916917294264,
+            "low_frequency": 0.4645099991559982,
+            "semantic": 0.15150449961423873
+          },
+          "expert_weighted_contribution_rms": {
+            "common": 0.027450553067028524,
+            "detail": 0.01293479229323566,
+            "infrared_saliency": 0.0,
+            "low_frequency": 0.11612749978899956,
+            "semantic": 0.03787612490355968
+          },
+          "hard_load": [
+            0.25,
+            0.25,
+            0.25,
+            0.25,
+            0.0
+          ],
+          "importance": [
+            0.25,
+            0.25,
+            0.25,
+            0.25,
+            0.0
+          ],
+          "top1_margin": 0.0
+        },
+        "feedback.s3.moe0": {
+          "entropy": 1.3862943649291992,
+          "expert_names": [
+            "common",
+            "low_frequency",
+            "detail",
+            "semantic",
+            "infrared_saliency"
+          ],
+          "expert_residual_rms": {
+            "common": 0.13408800557255746,
+            "detail": 0.07886680185794831,
+            "low_frequency": 0.37712025284767153,
+            "semantic": 0.12743730768561362
+          },
+          "expert_weighted_contribution_rms": {
+            "common": 0.033522001393139364,
+            "detail": 0.019716700464487077,
+            "infrared_saliency": 0.0,
+            "low_frequency": 0.09428006321191788,
+            "semantic": 0.031859326921403405
+          },
+          "hard_load": [
+            0.25,
+            0.25,
+            0.25,
+            0.25,
+            0.0
+          ],
+          "importance": [
+            0.25,
+            0.25,
+            0.25,
+            0.25,
+            0.0
+          ],
+          "top1_margin": 0.0
+        },
+        "s2.moe0": {
+          "entropy": 1.3862943649291992,
+          "expert_names": [
+            "common",
+            "low_frequency",
+            "detail",
+            "semantic",
+            "infrared_saliency"
+          ],
+          "expert_residual_rms": {
+            "common": 0.2445423723757267,
+            "detail": 0.05413764357566833,
+            "low_frequency": 0.4685798129439354,
+            "semantic": 0.11464699365198612
+          },
+          "expert_weighted_contribution_rms": {
+            "common": 0.06113559309393168,
+            "detail": 0.013534410893917083,
+            "infrared_saliency": 0.0,
+            "low_frequency": 0.11714495323598385,
+            "semantic": 0.02866174841299653
+          },
+          "hard_load": [
+            0.25,
+            0.25,
+            0.25,
+            0.25,
+            0.0
+          ],
+          "importance": [
+            0.25,
+            0.25,
+            0.25,
+            0.25,
+            0.0
+          ],
+          "top1_margin": 0.0
+        },
+        "s3.moe0": {
+          "entropy": 1.3862943649291992,
+          "expert_names": [
+            "common",
+            "low_frequency",
+            "detail",
+            "semantic",
+            "infrared_saliency"
+          ],
+          "expert_residual_rms": {
+            "common": 0.4512955805659294,
+            "detail": 0.07454835597425699,
+            "low_frequency": 0.37481691867113115,
+            "semantic": 0.09845184199512005
+          },
+          "expert_weighted_contribution_rms": {
+            "common": 0.11282389514148235,
+            "detail": 0.018637088993564248,
+            "infrared_saliency": 0.0,
+            "low_frequency": 0.09370422966778279,
+            "semantic": 0.024612960498780014
+          },
+          "hard_load": [
+            0.25,
+            0.25,
+            0.25,
+            0.25,
+            0.0
+          ],
+          "importance": [
+            0.25,
+            0.25,
+            0.25,
+            0.25,
+            0.0
+          ],
+          "top1_margin": 0.0
+        },
+        "s4.moe0": {
+          "entropy": 1.3862943649291992,
+          "expert_names": [
+            "common",
+            "low_frequency",
+            "detail",
+            "semantic",
+            "infrared_saliency"
+          ],
+          "expert_residual_rms": {
+            "common": 0.06565850608050823,
+            "detail": 0.09191950011998415,
+            "low_frequency": 0.26431380927562714,
+            "semantic": 0.09938492558896542
+          },
+          "expert_weighted_contribution_rms": {
+            "common": 0.016414626520127058,
+            "detail": 0.022979875029996037,
+            "infrared_saliency": 0.0,
+            "low_frequency": 0.06607845231890679,
+            "semantic": 0.024846231397241354
+          },
+          "hard_load": [
+            0.25,
+            0.25,
+            0.25,
+            0.25,
+            0.0
+          ],
+          "importance": [
+            0.25,
+            0.25,
+            0.25,
+            0.25,
+            0.0
+          ],
+          "top1_margin": 0.0
+        }
+      },
+      "loss_components": {
+        "focus/boundary": 0.019973996129119768,
+        "focus/confidence": 0.9836167621612549,
+        "focus/selection": 0.6929797983169556,
+        "fusion/coarse": 0.4032369464635849,
+        "fusion/gradient": 0.03716088480316102,
+        "fusion/reconstruction": 0.4032369464635849,
+        "fusion/ssim": 0.733591645359993,
+        "moe/soft_balance": 0.0,
+        "moe/switch_balance": 1.0,
+        "regularization/range": 0.0,
+        "regularization/residual": 6.923684850335121e-08
+      },
+      "mode": "uniform",
+      "total_loss": 1.7103313529491424,
+      "weighted_loss_components": {
+        "focus/boundary": 0.009986998064559884,
+        "focus/confidence": 0.09836167812347413,
+        "focus/selection": 0.6929797983169556,
+        "fusion/coarse": 0.10080923661589622,
+        "fusion/gradient": 0.03716088480316102,
+        "fusion/reconstruction": 0.4032369464635849,
+        "fusion/ssim": 0.3667958226799965,
+        "moe/soft_balance": 0.0,
+        "moe/switch_balance": 0.0010000000474974513,
+        "regularization/range": 0.0,
+        "regularization/residual": 6.925347406649962e-11
+      }
+    }
+  },
+  "routing_advantage": 3.9435993447479335e-06,
+  "seed": 3407,
+  "shuffle_penalty": -7.186049767701216e-06,
+  "task": "mfif"
+}

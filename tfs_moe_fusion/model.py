@@ -23,6 +23,8 @@ from tfs_moe_fusion.moe import (
     ExpertContext,
     FunctionalMoEBlock,
     RouterContext,
+    SharedExpertBank,
+    SharedExpertMoESite,
     TaskEmbedding,
 )
 from tfs_moe_fusion.types import (
@@ -231,6 +233,7 @@ class ClosedLoopRefinement(nn.Module):
         config: ProjectConfig,
         task_embedding: TaskEmbedding,
         encoder_moe: nn.ModuleDict | None = None,
+        shared_expert_bank: SharedExpertBank | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -277,11 +280,21 @@ class ClosedLoopRefinement(nn.Module):
         else:
             self.feedback_moe = nn.ModuleDict(
                 {
-                    stage: FunctionalMoEBlock(
-                        channels[int(stage[1:]) - 1],
-                        config.model.moe,
-                        f"feedback.{stage}.moe0",
-                        task_embedding,
+                    stage: (
+                        SharedExpertMoESite(
+                            channels[int(stage[1:]) - 1],
+                            config.model.moe,
+                            f"feedback.{stage}.moe0",
+                            task_embedding,
+                            shared_expert_bank,
+                        )
+                        if shared_expert_bank is not None
+                        else FunctionalMoEBlock(
+                            channels[int(stage[1:]) - 1],
+                            config.model.moe,
+                            f"feedback.{stage}.moe0",
+                            task_embedding,
+                        )
                     )
                     for stage in feedback_cfg.placements
                 }
@@ -590,6 +603,11 @@ class TFSMoEFusion(nn.Module):
     def __init__(self, config: ProjectConfig) -> None:
         super().__init__()
         self.config = config
+        if config.model.moe.shared_pool_enabled:
+            self.shared_expert_bank = SharedExpertBank(
+                config.model.moe.expert_dim, config.model.moe.expert_expansion
+            )
+        shared_expert_bank = getattr(self, "shared_expert_bank", None)
         self.core = CustomMultiscaleBackbone(
             channels=config.model.backbone.channels,
             depths=config.model.backbone.depths,
@@ -598,10 +616,14 @@ class TFSMoEFusion(nn.Module):
             pad_multiple=config.model.pad_multiple,
             moe=config.model.moe,
             backbone_config=config.model.backbone,
+            shared_expert_bank=shared_expert_bank,
         )
         assert self.core.task_embedding is not None
         self.feedback = ClosedLoopRefinement(
-            config, self.core.task_embedding, self.core.moe_blocks
+            config,
+            self.core.task_embedding,
+            self.core.moe_blocks,
+            shared_expert_bank,
         )
 
     def forward(self, batch: FusionBatch) -> FusionOutput:

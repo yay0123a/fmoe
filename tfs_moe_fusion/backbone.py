@@ -140,6 +140,8 @@ from tfs_moe_fusion.moe import (
     ExpertContext,
     FunctionalMoEBlock,
     RouterContext,
+    SharedExpertBank,
+    SharedExpertMoESite,
     TaskEmbedding,
 )
 from tfs_moe_fusion.types import ModalityType, TaskType
@@ -361,6 +363,7 @@ class CustomMultiscaleBackbone(FusionBackbone):
         pad_multiple: int = 8,
         moe: MoEConfig | None = None,
         backbone_config: BackboneConfig | None = None,
+        shared_expert_bank: SharedExpertBank | None = None,
     ) -> None:
         super().__init__()
         if len(channels) != 4 or len(depths) != 4:
@@ -428,12 +431,27 @@ class CustomMultiscaleBackbone(FusionBackbone):
         )
         self.moe_blocks = nn.ModuleDict()
         if moe is not None and moe.enabled:
+            if moe.shared_pool_enabled != (shared_expert_bank is not None):
+                raise ValueError("MoE shared-pool config and bank must agree")
             for index, count in enumerate(channels):
                 stage = f"s{index + 1}"
                 blocks = nn.ModuleList(
                     [
-                        FunctionalMoEBlock(
-                            count, moe, f"{stage}.moe{block_index}", self.task_embedding
+                        (
+                            SharedExpertMoESite(
+                                count,
+                                moe,
+                                f"{stage}.moe{block_index}",
+                                self.task_embedding,
+                                shared_expert_bank,
+                            )
+                            if shared_expert_bank is not None
+                            else FunctionalMoEBlock(
+                                count,
+                                moe,
+                                f"{stage}.moe{block_index}",
+                                self.task_embedding,
+                            )
                         )
                         for block_index in range(moe.block_counts.get(stage, 0))
                         if stage in moe.placements

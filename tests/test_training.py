@@ -647,10 +647,23 @@ def test_trainer_performs_real_updates_for_all_tasks(
     tmp_path: Path, semantic_rt_assets: tuple[Path, Path, Path]
 ) -> None:
     config = _smoke_config(semantic_rt_assets)
+    config.training.diagnostics.interval = 2
     trainer = Trainer(build_model(config), config, torch.device("cpu"), tmp_path)
-    for task in TaskType:
+    for index, task in enumerate(TaskType):
         result = trainer.train_step(task)
         assert torch.isfinite(result.total)
+        if index % config.training.diagnostics.interval == 0:
+            assert "router_grad_norm" in result.diagnostics
+            assert "expert_grad_norm/common" in result.diagnostics
+            assert "moe_residual_to_input_ratio" in result.diagnostics
+        else:
+            assert "router_grad_norm" not in result.diagnostics
+            assert "expert_grad_norm/common" not in result.diagnostics
+            assert not any(
+                name.startswith("expert_grad_norm/")
+                for name in result.diagnostics
+            )
+            assert "moe_residual_to_input_ratio" not in result.diagnostics
     assert trainer.state.global_step == 3
 
 

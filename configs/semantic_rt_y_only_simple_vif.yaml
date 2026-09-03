@@ -1,0 +1,16 @@
+_base_: semantic_rt_y_only_stage1.yaml
+
+experiment:
+  name: semantic_rt_y_only_simple_vif
+
+training:
+  losses:
+    vif:
+      intensity: 1.0
+      gradient: 1.0
+      ssim: 0.1
+      color: 0.0
+      coarse_supervision: 0.1
+      intensity_mode: pixel_max
+      gradient_mode: magnitude_max
+      ssim_mode: source_max

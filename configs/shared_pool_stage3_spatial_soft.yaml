@@ -1,0 +1,12 @@
+_base_: shared_pool_stage2_global_soft.yaml
+
+experiment:
+  name: shared_pool_stage3_spatial_soft
+
+model:
+  moe:
+    routing_mode: spatial_soft
+    patch_size:
+      s2: 4
+      s3: 2
+      s4: 1

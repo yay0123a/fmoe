@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Iterator
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from torch import Tensor
 
+from tfs_moe_fusion.frequency import local_spectral_evidence
 from tfs_moe_fusion.types import ModalityType, SpectralStatistics, TaskType
 
 
@@ -50,8 +52,8 @@ class RouterContext:
 class RouterOutput:
     logits: Tensor
     probabilities: Tensor
-    topk_indices: Tensor
-    topk_weights: Tensor
+    topk_indices: Tensor | None
+    topk_weights: Tensor | None
     valid_expert_mask: Tensor
     spatial_gates: Tensor | None = None
     branch_weights: Tensor | None = None
@@ -71,11 +73,10 @@ def summarize_expert_usage(values: tuple[RouterDiagnostics, ...]) -> torch.Tenso
         return torch.empty(0)
     loads = [value.hard_load for value in values if value.hard_load is not None]
     if not loads:
-        experts = values[0].probabilities.shape[1]
         loads = [
-            torch.nn.functional.one_hot(value.topk_indices, experts)
-            .float()
-            .mean((0, 1))
+            value.probabilities.detach().float().mean(
+                tuple(index for index in range(value.probabilities.ndim) if index != 1)
+            )
             for value in values
         ]
     result = torch.stack(loads).mean(0)
@@ -446,6 +447,43 @@ class FunctionalExpertPool(nn.Module):
 
     def __len__(self) -> int:
         return self.num_experts
+
+
+class SharedExpertBank(nn.Module):
+    """One canonical expert set reused by every Stage 2 MoE site."""
+
+    specialist_names = (
+        ExpertType.LOW_FREQUENCY.value,
+        ExpertType.DETAIL.value,
+        ExpertType.SEMANTIC.value,
+        ExpertType.INFRARED_SALIENCY.value,
+    )
+
+    def __init__(self, channels: int, expansion: int = 2) -> None:
+        super().__init__()
+        self.channels = channels
+        self.common = build_functional_expert(
+            ExpertType.COMMON, channels, expansion
+        )
+        self.specialists = nn.ModuleDict(
+            {
+                name: build_functional_expert(name, channels, expansion)
+                for name in self.specialist_names
+            }
+        )
+
+
+class MoESiteAdapter(nn.Module):
+    """Keep a site in its native feature space around canonical MoE deltas."""
+
+    def __init__(self, stage_channels: int, expert_dim: int) -> None:
+        super().__init__()
+        self.feature_in = nn.Conv2d(stage_channels, expert_dim, 1)
+        self.source_in = nn.Conv2d(stage_channels, expert_dim, 1)
+        self.delta_out = nn.Conv2d(expert_dim, stage_channels, 1, bias=False)
+
+    def project_source(self, source: Tensor | None) -> Tensor | None:
+        return self.source_in(source) if source is not None else None
 
 
 from torch import nn
@@ -825,6 +863,144 @@ class JointTopKRouter(nn.Module):
         )
 
 
+class SiteSpatialRouter(nn.Module):
+    """Site-local v2 router that fuses canonical spatial evidence directly."""
+
+    def __init__(
+        self,
+        channels: int,
+        experts: list[str],
+        hidden_channels: int,
+        patch_size: int,
+        temperature: float,
+        task_embedding: TaskEmbedding | None,
+        modality_embedding_dim: int,
+    ) -> None:
+        super().__init__()
+        self.expert_types = tuple(ExpertType.parse(item) for item in experts)
+        self.expert_count = len(experts)
+        self.patch_size, self.temperature = patch_size, temperature
+        if task_embedding is None:
+            self.owned_task_embedding = TaskEmbedding(hidden_channels)
+            object.__setattr__(self, "_shared_task_embedding", None)
+        else:
+            self.owned_task_embedding = None
+            object.__setattr__(self, "_shared_task_embedding", task_embedding)
+        width = max(8, hidden_channels)
+        self.feature_projection = nn.Conv2d(channels, width, 1)
+        self.difference_projection = nn.Conv2d(channels, width, 1)
+        self.task_projection = nn.Linear(
+            self.task_embedding.embedding.embedding_dim, width
+        )
+        self.modality_embedding = nn.Embedding(
+            len(ModalityType) ** 2, modality_embedding_dim
+        )
+        self.modality_projection = nn.Linear(modality_embedding_dim, width)
+        self.body = nn.Sequential(
+            nn.Conv2d(width * 4 + 7, width, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(width, width, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(width, self.expert_count, 1),
+        )
+        nn.init.zeros_(self.body[-1].weight)
+        nn.init.zeros_(self.body[-1].bias)
+
+    @property
+    def task_embedding(self) -> TaskEmbedding:
+        shared = self._shared_task_embedding
+        return shared if shared is not None else self.owned_task_embedding
+
+    def forward(self, context: RouterContext) -> RouterOutput:
+        feature = context.feature
+        batch, _, height, width = feature.shape
+        grid_size = (
+            (height + self.patch_size - 1) // self.patch_size,
+            (width + self.patch_size - 1) // self.patch_size,
+        )
+        with torch.autocast(device_type=feature.device.type, enabled=False):
+            value = feature.float()
+            pooled = functional.adaptive_avg_pool2d(value, grid_size)
+            if context.source_a is None or context.source_b is None:
+                difference = torch.zeros_like(value)
+            else:
+                difference = (context.source_a.float() - context.source_b.float()).abs()
+            difference = functional.adaptive_avg_pool2d(difference, grid_size)
+            low, high = local_spectral_evidence(value, grid_size)
+
+            def evidence_map(item: Tensor | None) -> tuple[Tensor, Tensor]:
+                available = value.new_full(
+                    (batch, 1, *grid_size), float(item is not None)
+                )
+                if item is None:
+                    return value.new_zeros(batch, 1, *grid_size), available
+                resized = functional.interpolate(
+                    item.float(), size=grid_size, mode="bilinear", align_corners=False
+                ).mean(1, keepdim=True)
+                return resized, available
+
+            focus, focus_available = evidence_map(context.focus_confidence)
+            boundary, boundary_available = evidence_map(context.semantic_boundary)
+            uncertainty, _ = evidence_map(context.semantic_uncertainty)
+            task = self.task_projection(
+                self.task_embedding(context.task, batch, feature.device).float()
+            )[:, :, None, None].expand(-1, -1, *grid_size)
+            pair = list(ModalityType).index(context.modality_a) * len(ModalityType)
+            pair += list(ModalityType).index(context.modality_b)
+            modality = self.modality_projection(
+                self.modality_embedding.weight[pair].float()[None].expand(batch, -1)
+            )[:, :, None, None].expand(-1, -1, *grid_size)
+            logits = self.body(
+                torch.cat(
+                    (
+                        self.feature_projection(pooled),
+                        self.difference_projection(difference),
+                        task,
+                        modality,
+                        low,
+                        high,
+                        focus,
+                        focus_available,
+                        boundary,
+                        boundary_available,
+                        uncertainty,
+                    ),
+                    dim=1,
+                )
+            )
+            valid = torch.ones(
+                batch, self.expert_count, 1, 1, dtype=torch.bool, device=feature.device
+            )
+            if not (context.modality_a.is_infrared or context.modality_b.is_infrared):
+                valid[:, self.expert_types.index(ExpertType.INFRARED_SALIENCY)] = False
+            masked = logits.masked_fill(~valid, -torch.inf)
+            probabilities = torch.softmax(masked / self.temperature, dim=1)
+            entropy_map = -(probabilities * probabilities.clamp_min(1e-8).log()).sum(1)
+            top = probabilities.topk(min(2, self.expert_count), dim=1).values
+            importance = probabilities.mean((0, 2, 3))
+            hard_load = functional.one_hot(
+                probabilities.argmax(1), self.expert_count
+            ).float().mean((0, 1, 2))
+        return RouterOutput(
+            masked,
+            probabilities,
+            None,
+            None,
+            valid,
+            entropy=entropy_map.mean(),
+            importance=importance,
+            hard_load=hard_load,
+            auxiliary={
+                "entropy_map": entropy_map.detach(),
+                "router/top1_margin": (top[:, 0] - top[:, 1]).mean().detach(),
+                "router/spatial_variance": probabilities.var(
+                    dim=(-2, -1), unbiased=False
+                ).mean().detach(),
+                "router_grid_size": grid_size,
+            },
+        )
+
+
 UnifiedRouter = JointTopKRouter
 
 from dataclasses import dataclass, field
@@ -876,39 +1052,102 @@ class MoEExecutionPolicy:
 
 
 class FunctionalMoEBlock(nn.Module):
+    routing_override_modes = ("learned", "uniform", "shuffled")
+
     def __init__(
         self,
         channels: int,
         config: MoEConfig,
         block_id: str,
         task_embedding: TaskEmbedding | None = None,
+        shared_expert_bank: SharedExpertBank | None = None,
     ) -> None:
         super().__init__()
         self.block_id = block_id
-        self.expert_names = tuple(config.experts)
-        self.expert_pool = FunctionalExpertPool(
-            channels, self.expert_names, config.expert_expansion
-        )
-        self.router = JointTopKRouter(
-            channels,
-            config.experts,
-            config.top_k,
-            config.router_hidden_channels,
-            config.spatial_gating,
-            config.router_temperature,
-            task_embedding,
-            config.modality_embedding_dim,
-            config.branch_dropout,
-            config.noisy_topk,
-            config.noisy_topk_std,
-        )
+        self.architecture_version = config.architecture_version
+        self.routing_mode = config.routing_mode
+        self.common_always_on = config.common_always_on
+        self.shared_pool_enabled = shared_expert_bank is not None
+        if self.shared_pool_enabled and (
+            self.architecture_version != "v2"
+            or self.routing_mode not in {"global_soft", "spatial_soft"}
+            or not self.common_always_on
+        ):
+            raise ValueError(
+                "Shared expert sites require v2 routing with common always-on"
+            )
+        object.__setattr__(self, "_shared_expert_bank", shared_expert_bank)
+        configured_experts = tuple(config.experts)
+        if self.architecture_version == "v2":
+            self.expert_names = tuple(
+                name
+                for name in configured_experts
+                if name != ExpertType.COMMON.value
+            )
+            if self.shared_pool_enabled:
+                assert shared_expert_bank is not None
+                if self.expert_names != shared_expert_bank.specialist_names:
+                    raise ValueError("Shared expert names must match the canonical bank")
+                self.adapter = MoESiteAdapter(channels, shared_expert_bank.channels)
+                router_channels = shared_expert_bank.channels
+            else:
+                self.common_expert = build_functional_expert(
+                    ExpertType.COMMON, channels, config.expert_expansion
+                )
+                self.expert_pool = FunctionalExpertPool(
+                    channels, self.expert_names, config.expert_expansion
+                )
+                router_channels = channels
+        else:
+            self.expert_names = configured_experts
+            self.expert_pool = FunctionalExpertPool(
+                channels, self.expert_names, config.expert_expansion
+            )
+            router_channels = channels
+        if self.routing_mode == "spatial_soft":
+            stage = next(part for part in block_id.split(".") if part in config.patch_size)
+            self.router = SiteSpatialRouter(
+                router_channels,
+                list(self.expert_names),
+                config.router_hidden_channels,
+                config.patch_size[stage],
+                config.router_temperature,
+                task_embedding,
+                config.modality_embedding_dim,
+            )
+        else:
+            self.router = JointTopKRouter(
+                router_channels,
+                list(self.expert_names),
+                config.top_k,
+                config.router_hidden_channels,
+                config.spatial_gating if self.architecture_version == "legacy" else False,
+                config.router_temperature,
+                task_embedding,
+                config.modality_embedding_dim,
+                config.branch_dropout,
+                config.noisy_topk,
+                config.noisy_topk_std,
+            )
         self.sparse_execution = config.sparse_execution
         self.train_execution = config.train_execution
         self.inference_execution = config.inference_execution
         self.execution_policy: MoEExecutionPolicy | None = None
-        self.residual_scale = nn.Parameter(
-            torch.full((1, channels, 1, 1), config.residual_scale)
-        )
+        self.routing_override = "learned"
+        self.routing_override_seed = 3407
+        if self.architecture_version == "v2":
+            self.common_scale = nn.Parameter(
+                torch.full((1, router_channels, 1, 1), config.common_scale_init)
+            )
+            self.specialist_scale = nn.Parameter(
+                torch.full(
+                    (1, router_channels, 1, 1), config.specialist_scale_init
+                )
+            )
+        else:
+            self.residual_scale = nn.Parameter(
+                torch.full((1, channels, 1, 1), config.residual_scale)
+            )
 
     def forward(
         self,
@@ -918,18 +1157,54 @@ class FunctionalMoEBlock(nn.Module):
         sparse_execution: bool | None = None,
         return_expert_outputs: bool = False,
     ) -> MoEOutput:
-        routing = self.router(router_context)
+        if self.architecture_version == "v2":
+            if self.shared_pool_enabled:
+                return self._forward_shared_v2(
+                    tensor,
+                    router_context,
+                    expert_context,
+                    sparse_execution,
+                    return_expert_outputs,
+                )
+            return self._forward_v2(
+                tensor,
+                router_context,
+                expert_context,
+                sparse_execution,
+                return_expert_outputs,
+            )
+        learned_routing = self.router(router_context)
+        routing = self._apply_routing_override(learned_routing)
         policy = self._resolve_policy(sparse_execution)
-        global_weights, spatial_gates = self._mixture_weights(tensor, routing, policy)
+        if self.routing_override == "uniform" or self.routing_override.startswith(
+            "single:"
+        ):
+            global_weights = routing.probabilities.to(tensor)
+            spatial_gates = None
+            if policy.detach_router:
+                global_weights = global_weights.detach()
+        else:
+            global_weights, spatial_gates = self._mixture_weights(
+                tensor, routing, policy
+            )
         mixed_residual = torch.zeros_like(tensor)
         retained_outputs: dict[str, ExpertOutput] | None = (
             {} if return_expert_outputs else None
         )
         regularizers: dict[str, list[Tensor]] = {}
         residual_rms: dict[str, Tensor] = {}
+        contribution_rms = {
+            name: tensor.detach().float().new_zeros(()) for name in self.expert_names
+        }
         expert_sample_assignments = 0
         for index, expert in enumerate(self.experts):
-            sample_indices = self._expert_indices(tensor, routing, index, policy)
+            if self.routing_override == "learned":
+                sample_indices = self._expert_indices(tensor, routing, index, policy)
+            else:
+                selected = (
+                    global_weights[:, index].detach() != 0
+                ) & routing.valid_expert_mask[:, index]
+                sample_indices = torch.nonzero(selected, as_tuple=False).flatten()
             if sample_indices.numel() == 0:
                 continue
             expert_sample_assignments += sample_indices.numel()
@@ -950,6 +1225,9 @@ class FunctionalMoEBlock(nn.Module):
                     :, index : index + 1
                 ]
                 contribution = contribution * gates
+            contribution_rms[self.expert_names[index]] = (
+                contribution.detach().float().square().sum() / tensor.numel()
+            ).sqrt()
             mixed_residual = mixed_residual.index_add(0, sample_indices, contribution)
             if self._regularizers_enabled(expert_output.expert, policy):
                 for name, value in self._expert_regularizers(
@@ -965,8 +1243,38 @@ class FunctionalMoEBlock(nn.Module):
         auxiliary = dict(routing.auxiliary)
         auxiliary["expert_sample_assignments"] = expert_sample_assignments
         auxiliary["expert_residual_rms"] = residual_rms
+        auxiliary["expert_weighted_contribution_rms"] = contribution_rms
         auxiliary["residual_scale_rms"] = (
             self.residual_scale.detach().float().square().mean().sqrt()
+        )
+        input_rms = tensor.detach().float().square().mean().sqrt()
+        auxiliary["moe_residual_to_input_ratio"] = (
+            scaled_residual.detach().float().square().mean().sqrt()
+            / input_rms.clamp_min(torch.finfo(torch.float32).eps)
+        )
+        probabilities = routing.probabilities.detach().float()
+        largest = probabilities.topk(min(2, probabilities.shape[1]), dim=1).values
+        top1_margin = (
+            (largest[:, 0] - largest[:, 1]).mean()
+            if largest.shape[1] == 2
+            else largest[:, 0].mean()
+        )
+        auxiliary.update(
+            {
+                "expert_names": self.expert_names,
+                "router/top1_margin": top1_margin,
+                "router/probability_std": probabilities.std(
+                    dim=1, unbiased=False
+                ).mean(),
+                "router/entropy": (
+                    routing.entropy.detach().float().mean()
+                    if routing.entropy is not None
+                    else -(probabilities * probabilities.clamp_min(1e-8).log())
+                    .sum(1)
+                    .mean()
+                ),
+                "routing_override": self.routing_override,
+            }
         )
         if regularizers:
             auxiliary["expert_regularizers"] = {
@@ -1007,8 +1315,528 @@ class FunctionalMoEBlock(nn.Module):
             },
         )
 
+    def _forward_shared_v2(
+        self,
+        tensor: Tensor,
+        router_context: RouterContext,
+        expert_context: ExpertContext,
+        sparse_execution: bool | None,
+        return_expert_outputs: bool,
+    ) -> MoEOutput:
+        adapter = self.adapter
+        canonical_feature = adapter.feature_in(tensor)
+        source_a = adapter.project_source(expert_context.source_a_feature)
+        source_b = adapter.project_source(expert_context.source_b_feature)
+        canonical_router_context = replace(
+            router_context,
+            feature=canonical_feature,
+            source_a=source_a,
+            source_b=source_b,
+        )
+        canonical_expert_context = replace(
+            expert_context,
+            source_a_feature=source_a,
+            source_b_feature=source_b,
+        )
+        canonical = self._forward_v2(
+            canonical_feature,
+            canonical_router_context,
+            canonical_expert_context,
+            sparse_execution,
+            return_expert_outputs,
+        )
+        stage_residual = adapter.delta_out(canonical.residual)
+        diagnostics = canonical.diagnostics
+        assert diagnostics is not None
+        diagnostics.auxiliary.update(
+            {
+                "shared_pool_enabled": True,
+                "expert_dim": canonical_feature.shape[1],
+                "moe_residual_to_input_ratio": self._rms(stage_residual)
+                / self._rms(tensor).clamp_min(torch.finfo(torch.float32).eps),
+            }
+        )
+        return MoEOutput(
+            tensor + stage_residual,
+            stage_residual,
+            canonical.router,
+            None,
+            canonical.expert_outputs,
+            diagnostics,
+            {**canonical.aux, "shared_pool_enabled": True},
+        )
+
+    def _forward_v2(
+        self,
+        tensor: Tensor,
+        router_context: RouterContext,
+        expert_context: ExpertContext,
+        sparse_execution: bool | None,
+        return_expert_outputs: bool,
+    ) -> MoEOutput:
+        if self.routing_mode == "spatial_soft":
+            return self._forward_spatial_v2(
+                tensor,
+                router_context,
+                expert_context,
+                sparse_execution,
+                return_expert_outputs,
+            )
+        policy = self._resolve_policy(sparse_execution)
+        retained = {} if return_expert_outputs else None
+        residual_rms: dict[str, Tensor] = {}
+        contribution_rms = {
+            name: tensor.detach().float().new_zeros(())
+            for name in (ExpertType.COMMON.value, *self.expert_names)
+        }
+        regularizers: dict[str, list[Tensor]] = {}
+
+        common_residual = torch.zeros_like(tensor)
+        assignments = 0
+        if self.common_always_on:
+            common = self._common_expert(tensor, expert_context)
+            if not common.valid_samples.all():
+                raise RuntimeError("The v2 always-on common expert became unavailable")
+            common_residual = common.residual
+            assignments += tensor.shape[0]
+            residual_rms[ExpertType.COMMON.value] = self._rms(common_residual)
+            contribution_rms[ExpertType.COMMON.value] = residual_rms[
+                ExpertType.COMMON.value
+            ]
+            if retained is not None:
+                retained[ExpertType.COMMON.value] = common
+        shared = tensor + self.common_scale * common_residual
+
+        learned_routing = self.router(replace(router_context, feature=shared))
+        routing = self._apply_routing_override(learned_routing)
+        weights = routing.probabilities.to(shared)
+        if self.routing_override == "single:common":
+            weights = torch.zeros_like(weights)
+
+        specialist = torch.zeros_like(shared)
+        for index, expert in enumerate(self.experts):
+            selected = (weights[:, index].detach() != 0) & (
+                routing.valid_expert_mask[:, index]
+            )
+            indices = torch.nonzero(selected, as_tuple=False).flatten()
+            if indices.numel() == 0:
+                continue
+            assignments += indices.numel()
+            context = self._select_context(expert_context, indices)
+            expert_output = expert(shared.index_select(0, indices), context)
+            residual = expert_output.residual * expert_output.valid_samples[
+                :, None, None, None
+            ]
+            name = self.expert_names[index]
+            residual_rms[name] = self._rms(residual)
+            contribution = residual * weights.index_select(0, indices)[
+                :, index : index + 1, None, None
+            ]
+            contribution_rms[name] = (
+                contribution.detach().float().square().sum() / tensor.numel()
+            ).sqrt()
+            specialist = specialist.index_add(0, indices, contribution)
+            if self._regularizers_enabled(expert_output.expert, policy):
+                for key, value in self._expert_regularizers(
+                    expert_output, context
+                ).items():
+                    regularizers.setdefault(key, []).append(value)
+            if retained is not None:
+                retained[name] = self._restore_output(shared, indices, expert_output)
+
+        output = shared + self.specialist_scale * specialist
+        total_residual = output - tensor
+        probabilities = routing.probabilities.detach().float()
+        top = probabilities.topk(min(2, probabilities.shape[1]), dim=1).values
+        auxiliary = {
+            **routing.auxiliary,
+            "architecture_version": self.architecture_version,
+            "routing_mode": self.routing_mode,
+            "common_always_on": self.common_always_on,
+            "expert_names": self.expert_names,
+            "expert_sample_assignments": assignments,
+            "expert_residual_rms": residual_rms,
+            "expert_weighted_contribution_rms": contribution_rms,
+            "common_scale_rms": self._rms(self.common_scale),
+            "specialist_scale_rms": self._rms(self.specialist_scale),
+            "specialist_mixture_weights": weights.detach(),
+            "moe_residual_to_input_ratio": self._rms(total_residual)
+            / self._rms(tensor).clamp_min(torch.finfo(torch.float32).eps),
+            "router/top1_margin": (top[:, 0] - top[:, 1]).mean(),
+            "router/probability_std": probabilities.std(1, unbiased=False).mean(),
+            "router/entropy": routing.entropy.detach().float().mean(),
+            "routing_override": self.routing_override,
+        }
+        if regularizers:
+            auxiliary["expert_regularizers"] = {
+                name: torch.stack(values).mean()
+                for name, values in regularizers.items()
+            }
+        if retained is not None:
+            auxiliary["expert_residuals"] = {
+                name: value.residual for name, value in retained.items()
+            }
+        if expert_context.semantic_boundary is not None:
+            auxiliary["semantic_boundary"] = expert_context.semantic_boundary
+        diagnostics = RouterDiagnostics(
+            self.block_id,
+            routing.logits,
+            routing.probabilities,
+            routing.topk_indices,
+            routing.topk_weights,
+            routing.valid_expert_mask,
+            branch_weights=routing.branch_weights,
+            entropy=routing.entropy,
+            importance=routing.importance,
+            hard_load=routing.hard_load,
+            auxiliary=auxiliary,
+        )
+        return MoEOutput(
+            output,
+            total_residual,
+            routing,
+            None,
+            retained,
+            diagnostics,
+            {"architecture_version": "v2", "execution": self.routing_mode},
+        )
+
+    def _forward_spatial_v2(
+        self,
+        tensor: Tensor,
+        router_context: RouterContext,
+        expert_context: ExpertContext,
+        sparse_execution: bool | None,
+        return_expert_outputs: bool,
+    ) -> MoEOutput:
+        policy = self._resolve_policy(sparse_execution)
+        retained = {} if return_expert_outputs else None
+        residual_rms: dict[str, Tensor] = {}
+        contribution_rms = {
+            name: tensor.detach().float().new_zeros(())
+            for name in (ExpertType.COMMON.value, *self.expert_names)
+        }
+        regularizers: dict[str, list[Tensor]] = {}
+
+        common = self._common_expert(tensor, expert_context)
+        if not common.valid_samples.all():
+            raise RuntimeError("The v2 always-on common expert became unavailable")
+        common_residual = common.residual
+        residual_rms[ExpertType.COMMON.value] = self._rms(common_residual)
+        contribution_rms[ExpertType.COMMON.value] = residual_rms[ExpertType.COMMON.value]
+        if retained is not None:
+            retained[ExpertType.COMMON.value] = common
+        shared = tensor + self.common_scale * common_residual
+
+        routing = self._apply_routing_override(
+            self.router(replace(router_context, feature=shared))
+        )
+        weights = functional.interpolate(
+            routing.probabilities.to(shared),
+            size=shared.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        weights = weights / weights.sum(1, keepdim=True).clamp_min(
+            torch.finfo(weights.dtype).eps
+        )
+        if self.routing_override == "single:common":
+            weights = torch.zeros_like(weights)
+
+        specialist = torch.zeros_like(shared)
+        assignments = tensor.shape[0]
+        for index, expert in enumerate(self.experts):
+            selected = (weights[:, index].detach().amax((-2, -1)) != 0) & (
+                routing.valid_expert_mask[:, index, 0, 0]
+            )
+            indices = torch.nonzero(selected, as_tuple=False).flatten()
+            if indices.numel() == 0:
+                continue
+            assignments += indices.numel()
+            context = self._select_context(expert_context, indices)
+            expert_output = expert(shared.index_select(0, indices), context)
+            residual = expert_output.residual * expert_output.valid_samples[
+                :, None, None, None
+            ]
+            name = self.expert_names[index]
+            residual_rms[name] = self._rms(residual)
+            contribution = residual * weights.index_select(0, indices)[
+                :, index : index + 1
+            ]
+            contribution_rms[name] = (
+                contribution.detach().float().square().sum() / tensor.numel()
+            ).sqrt()
+            specialist = specialist.index_add(0, indices, contribution)
+            if self._regularizers_enabled(expert_output.expert, policy):
+                for key, value in self._expert_regularizers(
+                    expert_output, context
+                ).items():
+                    regularizers.setdefault(key, []).append(value)
+            if retained is not None:
+                retained[name] = self._restore_output(shared, indices, expert_output)
+
+        output = shared + self.specialist_scale * specialist
+        total_residual = output - tensor
+        probabilities = routing.probabilities.detach().float()
+        top = probabilities.topk(min(2, probabilities.shape[1]), dim=1).values
+        auxiliary = {
+            **routing.auxiliary,
+            "architecture_version": self.architecture_version,
+            "routing_mode": self.routing_mode,
+            "common_always_on": self.common_always_on,
+            "expert_names": self.expert_names,
+            "expert_sample_assignments": assignments,
+            "expert_residual_rms": residual_rms,
+            "expert_weighted_contribution_rms": contribution_rms,
+            "common_scale_rms": self._rms(self.common_scale),
+            "specialist_scale_rms": self._rms(self.specialist_scale),
+            "specialist_mixture_weights": weights.detach(),
+            "moe_residual_to_input_ratio": self._rms(total_residual)
+            / self._rms(tensor).clamp_min(torch.finfo(torch.float32).eps),
+            "router/top1_margin": (top[:, 0] - top[:, 1]).mean(),
+            "router/probability_std": probabilities.std(1, unbiased=False).mean(),
+            "router/entropy": routing.entropy.detach().float().mean(),
+            "routing_override": self.routing_override,
+        }
+        if regularizers:
+            auxiliary["expert_regularizers"] = {
+                name: torch.stack(values).mean()
+                for name, values in regularizers.items()
+            }
+        if retained is not None:
+            auxiliary["expert_residuals"] = {
+                name: value.residual.detach() for name, value in retained.items()
+            }
+        if expert_context.semantic_boundary is not None:
+            auxiliary["semantic_boundary"] = expert_context.semantic_boundary.detach()
+        diagnostics = RouterDiagnostics(
+            self.block_id,
+            routing.logits.detach(),
+            routing.probabilities.detach(),
+            None,
+            None,
+            routing.valid_expert_mask,
+            entropy=routing.entropy.detach(),
+            importance=(
+                routing.importance.detach()
+                if routing.importance is not None
+                else None
+            ),
+            hard_load=(
+                routing.hard_load.detach() if routing.hard_load is not None else None
+            ),
+            auxiliary=auxiliary,
+        )
+        return MoEOutput(
+            output,
+            total_residual,
+            routing,
+            None,
+            retained,
+            diagnostics,
+            {"architecture_version": "v2", "execution": self.routing_mode},
+        )
+
+    @staticmethod
+    def _rms(value: Tensor) -> Tensor:
+        return value.detach().float().square().mean().sqrt()
+
     def set_execution_policy(self, policy: MoEExecutionPolicy | None) -> None:
         self.execution_policy = policy
+
+    def set_routing_override(self, mode: str, seed: int = 3407) -> None:
+        normalized = self._normalize_routing_override(mode)
+        if normalized.startswith("single:"):
+            expert_name = normalized.split(":", 1)[1]
+            if not self._supports_single_expert(expert_name):
+                available_names = list(self.expert_names)
+                if self.architecture_version == "v2" and self.common_always_on:
+                    available_names.insert(0, ExpertType.COMMON.value)
+                available = ", ".join(available_names)
+                raise ValueError(
+                    f"MoE block {self.block_id!r} does not contain expert "
+                    f"{expert_name!r}; available experts: {available}"
+                )
+        self.routing_override = normalized
+        self.routing_override_seed = int(seed)
+
+    def _supports_single_expert(self, expert_name: str) -> bool:
+        return expert_name in self.expert_names or (
+            expert_name == ExpertType.COMMON.value
+            and self.architecture_version == "v2"
+            and self.common_always_on
+        )
+
+    def clear_routing_override(self) -> None:
+        self.routing_override = "learned"
+
+    @classmethod
+    def _normalize_routing_override(cls, mode: str) -> str:
+        normalized = mode.strip().lower()
+        if normalized in cls.routing_override_modes:
+            return normalized
+        if normalized.startswith("single:"):
+            expert_name = normalized.split(":", 1)[1]
+            try:
+                return f"single:{ExpertType.parse(expert_name).value}"
+            except ContractError as error:
+                raise ValueError(str(error)) from error
+        choices = ", ".join((*cls.routing_override_modes, "single:<expert>"))
+        raise ValueError(f"Unknown routing override {mode!r}; expected one of {choices}")
+
+    def _apply_routing_override(self, routing: RouterOutput) -> RouterOutput:
+        mode = self.routing_override
+        if mode == "learned":
+            return routing
+        if mode == "single:common" and self.architecture_version == "v2":
+            return routing
+        if routing.probabilities.ndim == 4:
+            return self._apply_spatial_routing_override(routing)
+
+        valid = routing.valid_expert_mask
+        auxiliary = dict(routing.auxiliary)
+        if mode == "uniform":
+            probabilities = valid.to(routing.probabilities)
+            probabilities = probabilities / probabilities.sum(1, keepdim=True)
+            logits = torch.zeros_like(routing.logits).masked_fill(~valid, -torch.inf)
+            spatial_gates = None
+        elif mode == "shuffled":
+            if not torch.equal(valid, valid[:1].expand_as(valid)):
+                raise RuntimeError(
+                    "Shuffled routing requires a consistent expert validity mask "
+                    "within each batch"
+                )
+            valid_indices = torch.nonzero(valid[0], as_tuple=False).flatten()
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(self.routing_override_seed)
+            order = torch.randperm(valid_indices.numel(), generator=generator).to(
+                valid_indices.device
+            )
+            permutation = torch.arange(
+                valid.shape[1], device=valid.device, dtype=torch.long
+            )
+            permutation[valid_indices] = valid_indices.index_select(0, order)
+            probabilities = routing.probabilities.index_select(1, permutation)
+            logits = routing.logits.index_select(1, permutation)
+            spatial_gates = (
+                routing.spatial_gates.index_select(1, permutation)
+                if routing.spatial_gates is not None
+                else None
+            )
+            auxiliary["routing_permutation"] = permutation.detach()
+        else:
+            expert_name = mode.split(":", 1)[1]
+            expert_index = self.expert_names.index(expert_name)
+            invalid_samples = torch.nonzero(
+                ~valid[:, expert_index], as_tuple=False
+            ).flatten()
+            if invalid_samples.numel():
+                sample_list = ", ".join(
+                    str(index) for index in invalid_samples.detach().cpu().tolist()
+                )
+                raise ValueError(
+                    f"Routing override {mode!r} is invalid for MoE block "
+                    f"{self.block_id!r} on sample(s) {sample_list}"
+                )
+            probabilities = torch.zeros_like(routing.probabilities)
+            probabilities[:, expert_index] = 1
+            logits = torch.full_like(routing.logits, -torch.inf)
+            logits[:, expert_index] = 0
+            spatial_gates = None
+
+        active = (probabilities > 0) & valid
+        top_k = min(routing.topk_indices.shape[1], int(active.sum(1).min().item()))
+        selected, indices = probabilities.masked_fill(~valid, -torch.inf).topk(
+            top_k, dim=1
+        )
+        topk_weights = selected / selected.sum(1, keepdim=True).clamp_min(1e-8)
+        entropy = -(probabilities * probabilities.clamp_min(1e-8).log()).sum(1)
+        importance = probabilities.mean(0)
+        hard_load = (
+            importance
+            if mode == "uniform" or mode.startswith("single:")
+            else functional.one_hot(indices, probabilities.shape[1])
+            .float()
+            .mean((0, 1))
+        )
+        return RouterOutput(
+            logits=logits,
+            probabilities=probabilities,
+            topk_indices=indices,
+            topk_weights=topk_weights,
+            valid_expert_mask=valid,
+            spatial_gates=spatial_gates,
+            branch_weights=routing.branch_weights,
+            entropy=entropy,
+            importance=importance,
+            hard_load=hard_load,
+            auxiliary=auxiliary,
+        )
+
+    def _apply_spatial_routing_override(self, routing: RouterOutput) -> RouterOutput:
+        mode, valid = self.routing_override, routing.valid_expert_mask
+        auxiliary = dict(routing.auxiliary)
+        if mode == "uniform":
+            probabilities = valid.to(routing.probabilities)
+            probabilities = probabilities / probabilities.sum(1, keepdim=True)
+            probabilities = probabilities.expand_as(routing.probabilities)
+            logits = torch.zeros_like(routing.logits).masked_fill(~valid, -torch.inf)
+        elif mode == "shuffled":
+            if not torch.equal(valid, valid[:1].expand_as(valid)):
+                raise RuntimeError(
+                    "Shuffled routing requires a consistent expert validity mask within each batch"
+                )
+            valid_indices = torch.nonzero(valid[0, :, 0, 0], as_tuple=False).flatten()
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(self.routing_override_seed)
+            permutation = torch.arange(valid.shape[1], device=valid.device)
+            permutation[valid_indices] = valid_indices.index_select(
+                0, torch.randperm(valid_indices.numel(), generator=generator).to(valid.device)
+            )
+            probabilities = routing.probabilities.index_select(1, permutation)
+            logits = routing.logits.index_select(1, permutation)
+            auxiliary["routing_permutation"] = permutation.detach()
+        else:
+            expert_name = mode.split(":", 1)[1]
+            expert_index = self.expert_names.index(expert_name)
+            invalid = torch.nonzero(~valid[:, expert_index, 0, 0], as_tuple=False).flatten()
+            if invalid.numel():
+                sample_list = ", ".join(map(str, invalid.detach().cpu().tolist()))
+                raise ValueError(
+                    f"Routing override {mode!r} is invalid for MoE block "
+                    f"{self.block_id!r} on sample(s) {sample_list}"
+                )
+            probabilities = torch.zeros_like(routing.probabilities)
+            probabilities[:, expert_index] = 1
+            logits = torch.full_like(routing.logits, -torch.inf)
+            logits[:, expert_index] = 0
+
+        entropy_map = -(probabilities * probabilities.clamp_min(1e-8).log()).sum(1)
+        top = probabilities.topk(min(2, probabilities.shape[1]), dim=1).values
+        importance = probabilities.mean((0, 2, 3))
+        hard_load = functional.one_hot(
+            probabilities.argmax(1), probabilities.shape[1]
+        ).float().mean((0, 1, 2))
+        auxiliary.update(
+            {
+                "entropy_map": entropy_map.detach(),
+                "router/top1_margin": (top[:, 0] - top[:, 1]).mean().detach(),
+                "router/spatial_variance": probabilities.var(
+                    dim=(-2, -1), unbiased=False
+                ).mean().detach(),
+            }
+        )
+        return RouterOutput(
+            logits,
+            probabilities,
+            None,
+            None,
+            valid,
+            entropy=entropy_map.mean(),
+            importance=importance,
+            hard_load=hard_load,
+            auxiliary=auxiliary,
+        )
 
     def _resolve_policy(self, sparse_execution: bool | None) -> MoEExecutionPolicy:
         if sparse_execution is not None:
@@ -1146,8 +1974,79 @@ class FunctionalMoEBlock(nn.Module):
 
     @property
     def experts(self) -> tuple[nn.Module, ...]:
+        if self.shared_pool_enabled:
+            bank = self.shared_expert_bank
+            assert bank is not None
+            return tuple(bank.specialists[name] for name in self.expert_names)
         return tuple(self.expert_pool)
+
+    @property
+    def shared_expert_bank(self) -> SharedExpertBank | None:
+        return self._shared_expert_bank
+
+    def _common_expert(
+        self, tensor: Tensor, context: ExpertContext
+    ) -> ExpertOutput:
+        bank = self.shared_expert_bank
+        if bank is not None:
+            return bank.common(tensor, context)
+        return self.common_expert(tensor, context)
+
+
+class SharedExpertMoESite(FunctionalMoEBlock):
+    """A v2 global-soft MoE site backed by a root-owned shared expert bank."""
+
+    def __init__(
+        self,
+        stage_channels: int,
+        config: MoEConfig,
+        block_id: str,
+        task_embedding: TaskEmbedding,
+        shared_expert_bank: SharedExpertBank,
+    ) -> None:
+        super().__init__(
+            stage_channels,
+            config,
+            block_id,
+            task_embedding,
+            shared_expert_bank,
+        )
 
 
 # The design document's canonical name; the older name remains supported.
 TaskFrequencyMoEBlock = FunctionalMoEBlock
+
+
+def iter_moe_blocks(model: nn.Module) -> Iterator[FunctionalMoEBlock]:
+    """Yield every unique core and feedback MoE block in a model or DDP wrapper."""
+    return (
+        module for module in model.modules() if isinstance(module, FunctionalMoEBlock)
+    )
+
+
+def set_moe_routing_override(
+    model: nn.Module, mode: str, seed: int = 3407
+) -> None:
+    """Apply one validated runtime routing override to every MoE block."""
+    normalized = FunctionalMoEBlock._normalize_routing_override(mode)
+    blocks = tuple(iter_moe_blocks(model))
+    if normalized.startswith("single:"):
+        expert_name = normalized.split(":", 1)[1]
+        missing = [
+            block.block_id
+            for block in blocks
+            if not block._supports_single_expert(expert_name)
+        ]
+        if missing:
+            raise ValueError(
+                f"Expert {expert_name!r} is missing from MoE block(s): "
+                + ", ".join(missing)
+            )
+    for block in blocks:
+        block.set_routing_override(normalized, seed)
+
+
+def clear_moe_routing_override(model: nn.Module) -> None:
+    """Restore learned routing for every MoE block."""
+    for block in iter_moe_blocks(model):
+        block.clear_routing_override()

@@ -1,4 +1,0 @@
-_base_: default.yaml
-
-experiment:
-  name: semantic_rt_vif_curriculum_2000_single_gpu
