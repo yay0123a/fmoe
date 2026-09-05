@@ -20,11 +20,11 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("configs/shared_pool_stage3_spatial_soft.yaml"))
-    parser.add_argument("--checkpoint", type=Path,default=Path("runs/shared_pool_stage3_spatial_soft/checkpoints/latest.pt"))
-    parser.add_argument("--input-a", type=Path,default=Path("data/msrs/test/vi/00918N.png")) #vi
-    parser.add_argument("--input-b", type=Path,default=Path("data/msrs/test/ir/00918N.png")) #ir
-    parser.add_argument("--output", type=Path, default=Path("runs/test_stage3"))
+    parser.add_argument("--config", type=Path, default=Path("configs/shared_pool_stage5_y_only_feedback.yaml"))
+    parser.add_argument("--checkpoint", type=Path,default=Path("runs/shared_pool_stage5_y_only_feedback/checkpoints/final_ema.pt"))
+    parser.add_argument("--input-a", type=Path,default=Path("data/semantic_rt/rgb/img_02629.jpg")) #vi
+    parser.add_argument("--input-b", type=Path,default=Path("data/semantic_rt/thermal/img_02629.jpg")) #ir
+    parser.add_argument("--output", type=Path, default=Path("runs/stage5"))
     parser.add_argument(
         "--task", required=True, choices=[item.value for item in TaskType]
     )
@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--device",
         #default=None,
-        default="cuda:6",
+        default="cuda:5",
         help="Override training.device from the config (for example cpu or cuda:1)",
     )
     parser.add_argument("--save-coarse", action="store_true")

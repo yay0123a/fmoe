@@ -196,7 +196,13 @@ def _context(ir: bool = True) -> ExpertContext:
 def test_all_five_experts_have_uniform_output_contract() -> None:
     tensor = torch.randn(2, 8, 13, 15, requires_grad=True)
     outputs = []
-    for expert_type in ExpertType:
+    for expert_type in (
+        ExpertType.COMMON,
+        ExpertType.LOW_FREQUENCY,
+        ExpertType.DETAIL,
+        ExpertType.SEMANTIC,
+        ExpertType.INFRARED_SALIENCY,
+    ):
         output = build_functional_expert(expert_type, 8)(tensor, _context())
         assert output.expert is expert_type
         assert output.residual.shape == tensor.shape
@@ -226,7 +232,13 @@ def test_infrared_expert_is_invalid_without_real_ir() -> None:
 
 
 def test_functional_expert_pool_has_fixed_order_and_validity() -> None:
-    names = [item.value for item in ExpertType]
+    names = [
+        ExpertType.COMMON.value,
+        ExpertType.LOW_FREQUENCY.value,
+        ExpertType.DETAIL.value,
+        ExpertType.SEMANTIC.value,
+        ExpertType.INFRARED_SALIENCY.value,
+    ]
     pool = FunctionalExpertPool(8, names)
     assert pool.expert_names == tuple(names)
     assert pool.num_experts == 5
@@ -346,7 +358,13 @@ from tfs_moe_fusion.moe import (
     RouterContext,
 )
 
-EXPERTS = [item.value for item in ExpertType]
+EXPERTS = [
+    ExpertType.COMMON.value,
+    ExpertType.LOW_FREQUENCY.value,
+    ExpertType.DETAIL.value,
+    ExpertType.SEMANTIC.value,
+    ExpertType.INFRARED_SALIENCY.value,
+]
 
 
 def _router_context(feature: torch.Tensor, has_ir: bool) -> RouterContext:

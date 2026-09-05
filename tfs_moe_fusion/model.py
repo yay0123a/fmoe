@@ -9,7 +9,7 @@ from torch import Tensor, nn
 from torch.nn import functional
 
 from tfs_moe_fusion.backbone import ArbitrarySizePadder, BackboneOutput, FeaturePyramid
-from tfs_moe_fusion.color import rgb_to_ycbcr
+from tfs_moe_fusion.color import compose_luminance_with_visible_chroma, rgb_to_ycbcr
 from tfs_moe_fusion.config import ProjectConfig
 from tfs_moe_fusion.frequency import spectral_statistics
 from tfs_moe_fusion.guidance import (
@@ -30,6 +30,7 @@ from tfs_moe_fusion.moe import (
 from tfs_moe_fusion.types import (
     AuxiliaryOutputs,
     FusionBatch,
+    ModalityType,
     RouterDiagnostics,
     SpectralStatistics,
     TaskType,
@@ -174,6 +175,13 @@ class TaskResidualHead(nn.Module):
         return self.scale * self.max_residual * torch.tanh(self.body(tensor))
 
 
+class YResidualHead(TaskResidualHead):
+    """A luminance-only residual head for VIF/SEG feedback."""
+
+    def __init__(self, channels: int, max_residual: float, scale_init: float) -> None:
+        super().__init__(channels, 1, max_residual, scale_init)
+
+
 class TaskConditionedRefinementDecoder(nn.Module):
     def __init__(
         self,
@@ -199,15 +207,21 @@ class TaskConditionedRefinementDecoder(nn.Module):
             channels[0], output_channels, max_residual, scale_init
         )
 
-    def forward(
+    def decode(
         self, pyramid: FeaturePyramid, guidance: tuple[Tensor, ...], task: TaskType
-    ) -> tuple[Tensor, Tensor]:
+    ) -> Tensor:
         features = tuple(pyramid)
         decoded = self.deep_film(self.deep_conditioner(features[3], guidance[3]), task)
         for stage, skip, guide in zip(
             self.stages, reversed(features[:3]), reversed(guidance[:3]), strict=True
         ):
             decoded = stage(decoded, skip, guide, task)
+        return decoded
+
+    def forward(
+        self, pyramid: FeaturePyramid, guidance: tuple[Tensor, ...], task: TaskType
+    ) -> tuple[Tensor, Tensor]:
+        decoded = self.decode(pyramid, guidance, task)
         return decoded, self.residual_head(decoded)
 
 
@@ -327,6 +341,11 @@ class ClosedLoopRefinement(nn.Module):
             task_embedding,
             feedback_cfg.task_film and not config.model.ablation.disable_task_film,
         )
+        self.y_residual_head = YResidualHead(
+            channels[0],
+            feedback_cfg.y_max_residual,
+            feedback_cfg.y_residual_scale_init,
+        )
 
     def _semantic(self, image: Tensor, task: TaskType, final: bool = False):
         if self.semantic_backend is None:
@@ -367,12 +386,10 @@ class ClosedLoopRefinement(nn.Module):
         )
 
     def forward(self, batch: FusionBatch, backbone: BackboneOutput) -> FeedbackResult:
-        if batch.task in {TaskType.VIF, TaskType.SEG}:
-            if self.config.model.feedback.vif_seg_refinement_enabled:
-                raise RuntimeError(
-                    "VIF/SEG refinement is disabled in Stage 1; Stage 2 must use a "
-                    "dedicated Y-only residual head"
-                )
+        if (
+            batch.task in {TaskType.VIF, TaskType.SEG}
+            and not self.config.model.feedback.vif_seg_refinement_enabled
+        ):
             return self._y_only_coarse_result(batch, backbone)
 
         coarse = backbone.padded_fused_image
@@ -421,8 +438,8 @@ class ClosedLoopRefinement(nn.Module):
                 stats,
                 backbone.source_a[index],
                 backbone.source_b[index],
-                focus.reliability_a if focus_feedback else None,
-                focus.reliability_b if focus_feedback else None,
+                focus.selection_a if focus_feedback else None,
+                focus.selection_b if focus_feedback else None,
                 focus.confidence if focus_feedback else None,
                 semantic_feedback.boundary if semantic_feedback else None,
                 semantic_feedback.uncertainty if semantic_feedback else None,
@@ -434,13 +451,14 @@ class ClosedLoopRefinement(nn.Module):
                 batch.source_b.modality,
                 backbone.source_a[index],
                 backbone.source_b[index],
-                focus_feedback.reliability if focus_feedback else None,
-                focus_feedback.reliability_a if focus_feedback else None,
-                focus_feedback.reliability_b if focus_feedback else None,
+                focus_feedback.selection if focus_feedback else None,
+                focus_feedback.selection_a if focus_feedback else None,
+                focus_feedback.selection_b if focus_feedback else None,
                 focus_feedback.confidence if focus_feedback else None,
                 semantic_feedback.uncertainty if semantic_feedback else None,
                 semantic_feedback.boundary if semantic_feedback else None,
                 f"feedback.{stage}.moe0",
+                stage_guidance_feature=guidance[index],
             )
             if not self.config.model.ablation.disable_feedback_moe:
                 feature, diag = self.feedback_moe[stage](
@@ -453,14 +471,49 @@ class ClosedLoopRefinement(nn.Module):
             refined[index] = feature
             statistics.append(stats)
         refined_pyramid = FeaturePyramid(*refined)
+        y_only = batch.task in {TaskType.VIF, TaskType.SEG}
+        coarse_y = backbone.padded_fused_y if y_only else None
+        if y_only and coarse_y is None:
+            raise RuntimeError("VIF/SEG backbone output is missing its padded Y prediction")
         if self.config.model.ablation.disable_refinement_decoder:
-            residual = torch.zeros_like(coarse)
+            decoded = None
         else:
-            _, residual = self.decoder(refined_pyramid, guidance, batch.task)
-        if self.config.model.ablation.disable_final_residual:
-            residual = torch.zeros_like(residual)
-        preclamp = coarse + residual
-        final_padded = preclamp.clamp(0, 1)
+            decoded = self.decoder.decode(refined_pyramid, guidance, batch.task)
+
+        final_y = refinement_y = None
+        gamut_projection_mask = None
+        if y_only:
+            assert coarse_y is not None
+            delta_y = (
+                torch.zeros_like(coarse_y)
+                if decoded is None
+                else self.y_residual_head(decoded)
+            )
+            if self.config.model.ablation.disable_final_residual:
+                delta_y = torch.zeros_like(delta_y)
+            y_preclamp = coarse_y + delta_y
+            predicted_y = y_preclamp.clamp(0, 1)
+            visible = (
+                image_a
+                if batch.source_a.modality is ModalityType.VISIBLE_RGB
+                else image_b
+            )
+            final_padded, final_y, gamut_projection_mask = (
+                compose_luminance_with_visible_chroma(predicted_y, visible)
+            )
+            refinement_y = final_y - coarse_y
+            residual = final_padded - coarse
+            preclamp = y_preclamp
+        else:
+            residual = (
+                torch.zeros_like(coarse)
+                if decoded is None
+                else self.decoder.residual_head(decoded)
+            )
+            if self.config.model.ablation.disable_final_residual:
+                residual = torch.zeros_like(residual)
+            preclamp = coarse + residual
+            final_padded = preclamp.clamp(0, 1)
         final_semantic = self._semantic(final_padded, batch.task, final=True)
         h, w = batch.spatial_size
         crop = lambda value: value[..., :h, :w]
@@ -480,6 +533,13 @@ class ClosedLoopRefinement(nn.Module):
         )
         coarse_semantic = self._crop_semantic(semantic, h, w)
         final_semantic = self._crop_semantic(final_semantic, h, w)
+        final = crop(final_padded)
+        cropped_coarse = crop(coarse)
+        cropped_y = crop(final_y) if final_y is not None else None
+        cropped_coarse_y = crop(coarse_y) if coarse_y is not None else None
+        cropped_refinement_y = (
+            crop(refinement_y) if refinement_y is not None else None
+        )
         auxiliary = AuxiliaryOutputs(
             torch.cat((focus_crop.reliability_a, focus_crop.reliability_b), 1)
             if focus_crop
@@ -493,12 +553,12 @@ class ClosedLoopRefinement(nn.Module):
             coarse_semantic.boundary if coarse_semantic else None,
         )
         return FeedbackResult(
-            final=crop(final_padded),
-            coarse=crop(coarse),
+            final=final,
+            coarse=cropped_coarse,
             refinement=crop(residual),
-            final_y=None,
-            coarse_y=None,
-            refinement_y=None,
+            final_y=cropped_y,
+            coarse_y=cropped_coarse_y,
+            refinement_y=cropped_refinement_y,
             auxiliary=auxiliary,
             coarse_semantic=coarse_semantic,
             final_semantic=final_semantic,
@@ -518,6 +578,46 @@ class ClosedLoopRefinement(nn.Module):
                 "guidance_pyramid_disabled": self.config.model.ablation.disable_guidance_pyramid,
                 "task_film_disabled": self.config.model.ablation.disable_task_film,
                 "refinement_decoder_disabled": self.config.model.ablation.disable_refinement_decoder,
+                "vif_seg_refinement_active": y_only,
+                "feedback_expert_weighted_contribution_rms": {
+                    item.block_id: item.auxiliary.get(
+                        "expert_weighted_contribution_rms", {}
+                    )
+                    for item in diagnostics
+                },
+                **(
+                    {
+                        "coarse_final_y_mae": (cropped_y - cropped_coarse_y)
+                        .detach()
+                        .abs()
+                        .mean(),
+                        "y_residual_rms": cropped_refinement_y.detach()
+                        .float()
+                        .square()
+                        .mean()
+                        .sqrt(),
+                        "y_residual_scale": self.y_residual_head.scale.detach(),
+                        "y_gamut_clip_ratio": gamut_projection_mask.detach()
+                        .float()
+                        .mean(),
+                        "chroma_cb_error": (
+                            rgb_to_ycbcr(final)[:, 1:2]
+                            - rgb_to_ycbcr(batch.visible_source.image)[:, 1:2]
+                        )
+                        .detach()
+                        .abs()
+                        .mean(),
+                        "chroma_cr_error": (
+                            rgb_to_ycbcr(final)[:, 2:3]
+                            - rgb_to_ycbcr(batch.visible_source.image)[:, 2:3]
+                        )
+                        .detach()
+                        .abs()
+                        .mean(),
+                    }
+                    if y_only
+                    else {}
+                ),
             },
         )
 
@@ -605,7 +705,10 @@ class TFSMoEFusion(nn.Module):
         self.config = config
         if config.model.moe.shared_pool_enabled:
             self.shared_expert_bank = SharedExpertBank(
-                config.model.moe.expert_dim, config.model.moe.expert_expansion
+                config.model.moe.expert_dim,
+                config.model.moe.expert_expansion,
+                tuple(name for name in config.model.moe.experts if name != "common"),
+                config.model.moe.functional_expert_version,
             )
         shared_expert_bank = getattr(self, "shared_expert_bank", None)
         self.core = CustomMultiscaleBackbone(

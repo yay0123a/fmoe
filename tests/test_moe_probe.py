@@ -16,7 +16,13 @@ from tfs_moe_fusion.moe import (
 from tfs_moe_fusion.trainer import moe_gradient_statistics
 from tfs_moe_fusion.types import ExpertType, ModalityType, TaskType
 
-EXPERT_NAMES = [expert.value for expert in ExpertType]
+EXPERT_NAMES = [
+    "common",
+    "low_frequency",
+    "detail",
+    "semantic",
+    "infrared_saliency",
+]
 
 
 def _block() -> FunctionalMoEBlock:

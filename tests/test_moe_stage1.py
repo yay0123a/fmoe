@@ -15,7 +15,13 @@ from tfs_moe_fusion.moe import (
 from tfs_moe_fusion.types import ExpertType, ModalityType, TaskType
 
 ROOT = Path(__file__).resolve().parents[1]
-ALL_EXPERTS = [expert.value for expert in ExpertType]
+ALL_EXPERTS = [
+    "common",
+    "low_frequency",
+    "detail",
+    "semantic",
+    "infrared_saliency",
+]
 SPECIALISTS = ALL_EXPERTS[1:]
 
 

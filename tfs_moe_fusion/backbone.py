@@ -529,6 +529,7 @@ class CustomMultiscaleBackbone(FusionBackbone):
                         feature_a,
                         feature_b,
                         stage_name=f"{stage}.moe{block_index}",
+                        stage_guidance_feature=fused.new_zeros(fused.shape),
                     )
                     fused, router_diagnostics = moe_block(
                         fused, router_context, expert_context

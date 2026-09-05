@@ -22,7 +22,7 @@ from tfs_moe_fusion.utils import (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("configs/default.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("configs/shared_pool_stage5_y_only_feedback.yaml"))
     parser.add_argument(
         "--device",
         default=None,

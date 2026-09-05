@@ -66,6 +66,7 @@ class ExpertType(_StringEnum):
     DETAIL = "detail"
     SEMANTIC = "semantic"
     INFRARED_SALIENCY = "infrared_saliency"
+    FOCUS = "focus"
 
 
 from dataclasses import dataclass, field
@@ -277,13 +278,10 @@ class RouterDiagnostics:
                 "Router logits/probabilities must be equal [B,E] or [B,E,H,W] tensors"
             )
         batch, experts = self.logits.shape[:2]
-        expected_mask = (
-            (batch, experts)
-            if self.logits.ndim == 2
-            else (batch, experts, 1, 1)
-        )
-        if self.valid_expert_mask.shape != expected_mask:
-            raise ContractError("Router valid_expert_mask shape does not match routing")
+        if self.valid_expert_mask.shape != (batch, experts):
+            raise ContractError(
+                "Router valid_expert_mask must be task/site-level [B,E]"
+            )
         if self.valid_expert_mask.dtype is not torch.bool:
             raise ContractError("Router valid_expert_mask must be boolean")
         if (self.topk_indices is None) != (self.topk_weights is None):

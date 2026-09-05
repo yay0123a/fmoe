@@ -1,0 +1,11 @@
+_base_: shared_pool_stage3_spatial_soft.yaml
+
+experiment:
+  name: stage4b_2
+
+model:
+  moe:
+    functional_expert_version: stage4b
+    relative_delta_clip: 5.0
+    detach_focus_evidence: true
+    experts: [common, low_frequency, detail, semantic, infrared_saliency, focus]

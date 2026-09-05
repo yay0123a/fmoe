@@ -18,7 +18,7 @@ from tfs_moe_fusion.moe import (
 from tfs_moe_fusion.types import ExpertType, ModalityType, TaskType
 
 ROOT = Path(__file__).resolve().parents[1]
-SPECIALISTS = tuple(expert.value for expert in ExpertType)[1:]
+SPECIALISTS = ("low_frequency", "detail", "semantic", "infrared_saliency")
 
 
 def _config():
@@ -81,7 +81,7 @@ def test_spatial_router_shape_probability_contract_and_interpolated_mixture() ->
     output = site(feature, *_contexts(feature))
     assert isinstance(site.router, SiteSpatialRouter)
     assert output.router.logits.shape == output.router.probabilities.shape == (2, 4, 4, 5)
-    assert output.router.valid_expert_mask.shape == (2, 4, 1, 1)
+    assert output.router.valid_expert_mask.shape == (2, 4)
     assert output.router.topk_indices is output.router.topk_weights is None
     torch.testing.assert_close(
         output.router.probabilities.sum(1), torch.ones(2, 4, 5)

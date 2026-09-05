@@ -1,0 +1,12 @@
+_base_: shared_pool_stage4b_functional_experts.yaml
+
+experiment:
+  name: shared_pool_stage5_y_only_feedback
+
+model:
+  moe:
+    semantic_guidance_source: stage_feature
+  feedback:
+    vif_seg_refinement_enabled: true
+    y_residual_scale_init: 0.001
+    y_max_residual: 0.25

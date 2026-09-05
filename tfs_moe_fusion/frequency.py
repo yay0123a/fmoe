@@ -76,35 +76,32 @@ class HaarDWT2D(nn.Module):
         )
 
 
+def local_spectral_evidence_from_bands(
+    bands: WaveletBands,
+    output_size: tuple[int, int],
+    dtype: torch.dtype,
+) -> tuple[Tensor, Tensor]:
+    """Build FP32 local energy maps from an already computed Haar transform."""
+    if min(output_size) <= 0:
+        raise ValueError("local spectral evidence requires a positive output size")
+    with torch.autocast(device_type=bands.ll.device.type, enabled=False):
+        low = bands.ll.float().square().mean(1, keepdim=True)
+        high = torch.stack((bands.lh, bands.hl, bands.hh), dim=2)
+        high = high.float().square().mean((1, 2), keepdim=True).squeeze(2)
+        low = functional.interpolate(low, output_size, mode="bilinear", align_corners=False)
+        high = functional.interpolate(high, output_size, mode="bilinear", align_corners=False)
+    return low.to(dtype), high.to(dtype)
+
+
 def local_spectral_evidence(
     feature: Tensor, output_size: tuple[int, int]
 ) -> tuple[Tensor, Tensor]:
     """Return shape-safe local Haar low/high energy maps in FP32 precision."""
     if feature.ndim != 4 or min(output_size) <= 0:
         raise ValueError("local_spectral_evidence expects [B,C,H,W] and positive size")
-    with torch.autocast(device_type=feature.device.type, enabled=False):
-        value = feature.float()
-        height, width = value.shape[-2:]
-        if height % 2 or width % 2:
-            mode = "reflect" if height > 1 and width > 1 else "replicate"
-            value = functional.pad(value, (0, width % 2, 0, height % 2), mode=mode)
-        filters = value.new_tensor(
-            (
-                [[1, 1], [1, 1]],
-                [[-1, -1], [1, 1]],
-                [[-1, 1], [-1, 1]],
-                [[1, -1], [-1, 1]],
-            )
-        ).mul_(0.5)
-        channels = value.shape[1]
-        packed = functional.conv2d(
-            value, filters[:, None].repeat(channels, 1, 1, 1), stride=2, groups=channels
-        ).view(value.shape[0], channels, 4, value.shape[-2] // 2, value.shape[-1] // 2)
-        low = packed[:, :, 0].square().mean(1, keepdim=True)
-        high = packed[:, :, 1:].square().mean((1, 2), keepdim=False).unsqueeze(1)
-        low = functional.interpolate(low, output_size, mode="bilinear", align_corners=False)
-        high = functional.interpolate(high, output_size, mode="bilinear", align_corners=False)
-    return low.to(feature.dtype), high.to(feature.dtype)
+    return local_spectral_evidence_from_bands(
+        HaarDWT2D().to(feature)(feature.float()), output_size, feature.dtype
+    )
 
 
 class HaarIDWT2D(nn.Module):

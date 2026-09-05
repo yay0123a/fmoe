@@ -69,6 +69,10 @@ class MoEConfig:
     common_always_on: bool = False
     common_scale_init: float = 0.1
     specialist_scale_init: float = 0.03
+    functional_expert_version: str = "stage3"
+    relative_delta_clip: float = 5.0
+    detach_focus_evidence: bool = True
+    semantic_guidance_source: str = "evidence_maps"
     experts: list[str] = field(
         default_factory=lambda: [
             "common",
@@ -154,6 +158,8 @@ class FeedbackConfig:
     mfif_interaction: bool = True
     residual_scale: float = 0.001
     max_residual: float = 0.25
+    y_residual_scale_init: float = 0.001
+    y_max_residual: float = 0.25
     num_iterations: int = 1
     share_with_encoder_moe: bool = False
 
@@ -619,19 +625,28 @@ class ProjectConfig:
         if frequency.residual_scale <= 0:
             raise ConfigurationError("frequency.residual_scale must be positive")
 
-        required_experts = {
+        legacy_experts = {
             "common",
             "low_frequency",
             "detail",
             "semantic",
             "infrared_saliency",
         }
-        if (
-            len(model.moe.experts) != len(required_experts)
-            or set(model.moe.experts) != required_experts
-        ):
+        stage4b_experts = {*legacy_experts, "focus"}
+        required_experts = (
+            stage4b_experts
+            if model.moe.functional_expert_version == "stage4b"
+            else legacy_experts
+        )
+        if len(model.moe.experts) != len(required_experts) or set(
+            model.moe.experts
+        ) != required_experts:
             raise ConfigurationError(
-                "model.moe.experts must contain exactly the five functional experts"
+                "model.moe.experts do not match the selected functional expert version"
+            )
+        if model.moe.functional_expert_version not in {"stage3", "stage4b"}:
+            raise ConfigurationError(
+                "model.moe.functional_expert_version must be stage3 or stage4b"
             )
         if model.moe.architecture_version not in {"legacy", "v2"}:
             raise ConfigurationError(
@@ -667,6 +682,14 @@ class ProjectConfig:
             )
         if model.moe.routing_mode == "spatial_soft" and not model.moe.shared_pool_enabled:
             raise ConfigurationError("spatial_soft routing requires the shared expert pool")
+        if model.moe.functional_expert_version == "stage4b" and not (
+            model.moe.architecture_version == "v2"
+            and model.moe.routing_mode == "spatial_soft"
+            and model.moe.shared_pool_enabled
+        ):
+            raise ConfigurationError(
+                "stage4b experts require v2 shared-pool spatial_soft routing"
+            )
         if model.moe.expert_dim <= 0:
             raise ConfigurationError("model.moe.expert_dim must be positive")
         if set(model.moe.patch_size) != {"s2", "s3", "s4"} or any(
@@ -679,6 +702,24 @@ class ProjectConfig:
             model.moe.common_scale_init, model.moe.specialist_scale_init
         ) < 0:
             raise ConfigurationError("MoE v2 scale initializers cannot be negative")
+        if model.moe.relative_delta_clip <= 0:
+            raise ConfigurationError("model.moe.relative_delta_clip must be positive")
+        if model.moe.semantic_guidance_source not in {
+            "evidence_maps",
+            "stage_feature",
+        }:
+            raise ConfigurationError(
+                "model.moe.semantic_guidance_source must be evidence_maps or stage_feature"
+            )
+        if model.moe.semantic_guidance_source == "stage_feature" and not (
+            model.moe.functional_expert_version == "stage4b"
+            and model.moe.architecture_version == "v2"
+            and model.moe.routing_mode == "spatial_soft"
+            and model.moe.shared_pool_enabled
+        ):
+            raise ConfigurationError(
+                "stage_feature semantic guidance requires Stage 4B shared spatial MoE"
+            )
         if not 1 <= model.moe.top_k <= len(model.moe.experts) - 1:
             raise ConfigurationError(
                 "model.moe.top_k must fit the four experts available without infrared"
@@ -758,10 +799,6 @@ class ProjectConfig:
                 raise ConfigurationError("semantic.model_dir cannot be empty")
         if not feedback.enabled:
             raise ConfigurationError("The final model requires feedback refinement")
-        if feedback.vif_seg_refinement_enabled:
-            raise ConfigurationError(
-                "Stage 1 requires VIF/SEG refinement to remain disabled"
-            )
         if not set(feedback.placements) <= legal_stages:
             raise ConfigurationError(
                 f"feedback.placements must be a subset of {sorted(legal_stages)}"
@@ -771,6 +808,10 @@ class ProjectConfig:
         if feedback.transformer_window_size <= 0 or feedback.residual_scale <= 0:
             raise ConfigurationError(
                 "Feedback window size/residual scale must be positive"
+            )
+        if feedback.y_residual_scale_init < 0 or feedback.y_max_residual <= 0:
+            raise ConfigurationError(
+                "Feedback Y-only residual scale/max residual are invalid"
             )
         if feedback.num_iterations != 1:
             raise ConfigurationError("feedback.num_iterations must be 1")
