@@ -13,8 +13,8 @@ from tfs_moe_fusion.utils import make_probe_batch
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _config():
-    config = load_config(ROOT / "configs/stage6_vif_mfif.yaml")
+def _config(config_name: str = "stage6_vif_mfif.yaml"):
+    config = load_config(ROOT / "configs" / config_name)
     config.model.backbone.channels = [8, 16, 32, 64]
     config.model.backbone.depths = [1, 1, 1, 1]
     config.model.frequency.fdconv_kernel_num = 4
@@ -57,3 +57,27 @@ def test_stage6_config_trains_only_vif_and_mfif_without_semantic_modules() -> No
         loss.backward()
         assert torch.isfinite(loss)
         model.zero_grad(set_to_none=True)
+
+
+def test_stage7_adaptive_ir_profile_enables_ir_and_moe_supervision() -> None:
+    config = _config("stage7_adaptive_ir.yaml")
+
+    assert config.data.dataset == "msrs"
+    assert config.training.losses.vif.intensity_mode == "adaptive_dark_ir"
+    assert config.training.losses.vif.gradient_mode == "adaptive_directional"
+    assert config.training.losses.vif.ssim_mode == "adaptive_source"
+    assert config.training.losses.vif.ir_intensity_max_weight == 0.55
+    assert config.training.losses.vif.coarse_supervision == 0.1
+    assert config.training.losses.infrared.weight == 0.2
+    assert config.training.losses.moe.enabled
+
+    model = build_model(config).train()
+    batch = make_probe_batch(config, TaskType.VIF, spatial_size=(31, 37))
+    output = model(batch)
+    result = MultiTaskLossManager(config.training.losses)(
+        LossContext(batch, output, TaskType.VIF, 0, 0, model)
+    )
+    result.total.backward()
+    assert torch.isfinite(result.total)
+    assert "cross_modal_ir_weight/s1" in result.diagnostics
+    assert "router_ir_importance" in result.diagnostics

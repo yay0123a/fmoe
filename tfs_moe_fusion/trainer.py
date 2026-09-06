@@ -591,6 +591,9 @@ class RouterLoadMonitor:
         patience = self.config.monitor.patience_steps
         result: dict[str, float] = {}
         triggered = False
+        # Reduce all blocks together, then transfer once. Validity stays local
+        # to this rank, as before; only load and top-2 mass are averaged by DDP.
+        statistics, validity = [], []
         for item in diagnostics:
             experts = item.probabilities.shape[1]
             load = (
@@ -601,25 +604,36 @@ class RouterLoadMonitor:
                 .float()
                 .mean(0)
             )
-            load = reduce_mean(load).cpu()
             valid = item.valid_expert_mask.any(
                 tuple(index for index in range(item.valid_expert_mask.ndim) if index != 1)
-            ).cpu()
+            )
             top2_mass = item.probabilities.topk(min(2, experts), dim=1).values.sum(1).mean()
-            top2_mass = float(reduce_mean(top2_mass).cpu())
+            statistics.extend((load.float(), top2_mass.float().reshape(1)))
+            validity.append(valid.float())
+        if diagnostics:
+            reduced = reduce_mean(torch.cat(statistics))
+            packed = torch.cat((reduced, *validity)).cpu().tolist()
+            offset, valid_offset = 0, reduced.numel()
+        for item in diagnostics:
+            experts = item.probabilities.shape[1]
+            load = packed[offset : offset + experts]
+            top2_mass = packed[offset + experts]
+            valid = packed[valid_offset : valid_offset + experts]
+            offset += experts + 1
+            valid_offset += experts
             name = item.block_id
-            previous = self.usage_ema.get(name, load.tolist())
+            previous = self.usage_ema.get(name, load)
             usage = [
                 (decay * old + (1 - decay) * float(current) if bool(is_valid) else old)
                 for old, current, is_valid in zip(
-                    previous, load.tolist(), valid.tolist()
+                    previous, load, valid
                 )
             ]
             self.usage_ema[name] = usage
             previous_mass = self.top2_mass_ema.get(name, top2_mass)
             self.top2_mass_ema[name] = decay * previous_mass + (1 - decay) * top2_mass
             counters = self.starvation_counters.setdefault(name, [0] * experts)
-            for index, is_valid in enumerate(valid.tolist()):
+            for index, is_valid in enumerate(valid):
                 if not is_valid:
                     continue
                 counters[index] = counters[index] + 1 if usage[index] < minimum else 0
@@ -886,7 +900,17 @@ class GradientConflictMonitor:
         self.previous = dict(state)
 
 
-def gradient_statistics(model: nn.Module) -> dict[str, float]:
+def gradient_statistics(
+    model: nn.Module, *, max_norm: float | None = None
+) -> dict[str, float]:
+    if max_norm is not None:
+        # Clipping already computes the global norm. Materialize it once and
+        # keep the per-step non-finite guard before the optimizer update.
+        norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm))
+        return {
+            "gradient_norm": norm,
+            "nonfinite_gradients": float(not math.isfinite(norm)),
+        }
     gradients = [
         parameter.grad.detach().float().norm()
         for parameter in model.parameters()
@@ -895,10 +919,10 @@ def gradient_statistics(model: nn.Module) -> dict[str, float]:
     if not gradients:
         return {"gradient_norm": 0.0, "nonfinite_gradients": 0.0}
     stacked = torch.stack(gradients)
-    return {
-        "gradient_norm": float(torch.linalg.vector_norm(stacked)),
-        "nonfinite_gradients": float((~torch.isfinite(stacked)).sum()),
-    }
+    norm, nonfinite = torch.stack(
+        (torch.linalg.vector_norm(stacked), (~torch.isfinite(stacked)).sum())
+    ).cpu().tolist()
+    return {"gradient_norm": norm, "nonfinite_gradients": nonfinite}
 
 
 def expert_gradient_statistics(
@@ -1028,6 +1052,21 @@ def loss_group_gradient_statistics(
     }
 
 
+def _scalar_metrics_to_cpu(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Materialize scalar metrics with one transfer per device, without graphs."""
+    result = dict(metrics)
+    groups: dict[torch.device, list[tuple[str, Tensor]]] = {}
+    for name, value in metrics.items():
+        if isinstance(value, Tensor):
+            groups.setdefault(value.device, []).append(
+                (name, value.detach().reshape(()))
+            )
+    for entries in groups.values():
+        scalars = torch.stack([value for _, value in entries]).cpu().tolist()
+        result.update(zip((name for name, _ in entries), scalars))
+    return result
+
+
 def router_statistics(values: tuple[RouterDiagnostics, ...]) -> dict[str, Any]:
     if not values:
         return {
@@ -1055,8 +1094,8 @@ def router_statistics(values: tuple[RouterDiagnostics, ...]) -> dict[str, Any]:
         ]
     ).mean(0)
     result = {
-        "router_entropy": float(entropy.detach()),
-        "router_max_load": float(load.max().detach()),
+        "router_entropy": entropy.detach(),
+        "router_max_load": load.max().detach(),
     }
     router_metrics = {
         name: [item.auxiliary[name] for item in values if name in item.auxiliary]
@@ -1069,7 +1108,7 @@ def router_statistics(values: tuple[RouterDiagnostics, ...]) -> dict[str, Any]:
     }
     for name, metric_values in router_metrics.items():
         if metric_values:
-            result[name] = float(
+            result[name] = (
                 torch.stack([torch.as_tensor(value).detach() for value in metric_values])
                 .float()
                 .mean()
@@ -1083,12 +1122,12 @@ def router_statistics(values: tuple[RouterDiagnostics, ...]) -> dict[str, Any]:
     for item in values:
         residuals = item.auxiliary.get("expert_residual_rms", {})
         for expert, value in residuals.items():
-            result[f"expert_residual_rms/{item.block_id}/{expert}"] = float(value)
+            result[f"expert_residual_rms/{item.block_id}/{expert}"] = torch.as_tensor(value)
         contributions = item.auxiliary.get("expert_weighted_contribution_rms", {})
         for expert, value in contributions.items():
             result[
                 f"expert_weighted_contribution_rms/{item.block_id}/{expert}"
-            ] = float(value)
+            ] = torch.as_tensor(value)
         for name in (
             "router/top1_margin",
             "router/probability_std",
@@ -1097,14 +1136,14 @@ def router_statistics(values: tuple[RouterDiagnostics, ...]) -> dict[str, Any]:
         ):
             value = item.auxiliary.get(name)
             if value is not None:
-                result[f"{name}/{item.block_id}"] = float(value)
+                result[f"{name}/{item.block_id}"] = torch.as_tensor(value)
         result[f"routing_override/{item.block_id}"] = str(
             item.auxiliary.get("routing_override", "learned")
         )
         scale = item.auxiliary.get("residual_scale_rms")
         if scale is not None:
-            result[f"moe_residual_scale/{item.block_id}"] = float(scale)
-    return result
+            result[f"moe_residual_scale/{item.block_id}"] = torch.as_tensor(scale)
+    return _scalar_metrics_to_cpu(result)
 
 
 import logging
@@ -1487,12 +1526,8 @@ class Trainer:
                 )
 
                 if self.state.global_step % self.config.training.log_every_steps == 0:
-                    values = " ".join(
-                        f"{name}={float(value.detach()):.5f}"
-                        for name, value in result.weighted_components.items()
-                    )
-                    y_only_values = " ".join(
-                        f"{name}={float(result.diagnostics[name]):.7f}"
+                    y_only_metrics = {
+                        name: result.diagnostics[name]
                         for name in (
                             "chroma_cb_error",
                             "chroma_cr_error",
@@ -1502,8 +1537,35 @@ class Trainer:
                             "ir_intensity_weight_mean",
                             "ir_intensity_weight_max",
                             "ir_intensity_weight_active_ratio",
+                            "router_ir_importance",
+                            "router_ir_hard_load",
+                            "router_ir_weighted_contribution_rms",
+                            "cross_modal_ir_weight/s1",
+                            "cross_modal_ir_weight/s2",
+                            "cross_modal_ir_weight/s3",
+                            "cross_modal_ir_weight/s4",
                         )
                         if name in result.diagnostics
+                    }
+                    log_metrics = _scalar_metrics_to_cpu(
+                        {
+                            **{
+                                f"component/{name}": value
+                                for name, value in result.weighted_components.items()
+                            },
+                            **{
+                                f"diagnostic/{name}": value
+                                for name, value in y_only_metrics.items()
+                            },
+                        }
+                    )
+                    values = " ".join(
+                        f"{name}={log_metrics['component/' + name]:.5f}"
+                        for name in result.weighted_components
+                    )
+                    y_only_values = " ".join(
+                        f"{name}={log_metrics['diagnostic/' + name]:.7f}"
+                        for name in y_only_metrics
                     )
                     values = " ".join(
                         value for value in (values, y_only_values) if value
@@ -1703,17 +1765,21 @@ class Trainer:
                 self.state.micro_step += 1
         assert aggregate is not None
         self.amp.unscale_(self.optimizer)
-        gradient_info = gradient_statistics(self.model)
         diagnostics_due = self.state.global_step % config.diagnostics.interval == 0
+        gradient_info = {}
         if diagnostics_due:
             gradient_info.update(expert_gradient_statistics(self.registry))
             gradient_info.update(moe_gradient_statistics(self.model))
+        gradient_info.update(
+            gradient_statistics(
+                self.model,
+                max_norm=config.gradient_clip.max_norm
+                if config.gradient_clip.enabled
+                else None,
+            )
+        )
         if gradient_info["nonfinite_gradients"]:
             raise FloatingPointError("Training produced non-finite gradients")
-        if config.gradient_clip.enabled:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), config.gradient_clip.max_norm
-            )
         self.amp.step(self.optimizer)
         self.scheduler.step()
         if self.ema is not None:

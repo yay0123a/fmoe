@@ -112,6 +112,18 @@ The configuration reads `data/msrs/train/{vi,ir}` for VIF and
 `data/mfif/msrs/train/{dof_stack,AiF,depth}` for MFIF. Change
 `CUDA_VISIBLE_DEVICES` to the GPU ID assigned to this job.
 
+`configs/stage7_adaptive_ir.yaml` is the follow-up MSRS profile for preserving
+IR structure in dark and IR-salient regions while keeping visible chroma. It
+uses aligned IR luminance, adaptive intensity/gradient/SSIM targets, and weak
+valid-expert MoE balancing. It uses batch size 4 with one accumulation step,
+keeping the effective batch size at 4. Deterministic mode is disabled to allow
+cuDNN autotuning; repeat runs may differ numerically even with the same seed.
+Set `experiment.deterministic: true` when strict reproducibility is required:
+
+```bash
+CUDA_VISIBLE_DEVICES=4 python train.py --config configs/stage7_adaptive_ir.yaml
+```
+
 With `--task seg`, inference also saves the final fused image's segmentation:
 
 ```bash

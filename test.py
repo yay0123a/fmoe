@@ -44,13 +44,13 @@ CITYSCAPES_COLORS = np.array(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("configs/stage6_vif_mfif.yaml"))
-    parser.add_argument("--checkpoint", type=Path,default=Path("runs/stage6_msrs_vif_mfif_single_gpu/checkpoints/final_ema.pt"))
-    parser.add_argument("--input-a", type=Path,default=Path("data/msrs/test/vi/00918N.png")) #vi
-    parser.add_argument("--input-b", type=Path,default=Path("data/msrs/test/ir/00918N.png")) #ir
+    parser.add_argument("--config", type=Path, default=Path("configs/stage7_adaptive_ir.yaml"))
+    parser.add_argument("--checkpoint", type=Path,default=Path("runs/stage7_msrs_adaptive_ir/checkpoints/epoch_0005.pt"))
+    parser.add_argument("--input-a", type=Path,default=Path("data/msrs/test/vi/00315D.png")) #vi
+    parser.add_argument("--input-b", type=Path,default=Path("data/msrs/test/ir/00315D.png")) #ir
     #parser.add_argument("--input-a", type=Path,default=Path("data/mfif/semantic_rt/dof_stack/img_00125/0.jpg")) #n
     #parser.add_argument("--input-b", type=Path,default=Path("data/mfif/semantic_rt/dof_stack/img_00125/1.jpg")) #f
-    parser.add_argument("--output", type=Path, default=Path("runs/stage6"))
+    parser.add_argument("--output", type=Path, default=Path("runs/stage7"))
     parser.add_argument(
         "--task", required=True, choices=[item.value for item in TaskType]
     )

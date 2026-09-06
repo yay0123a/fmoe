@@ -1,0 +1,38 @@
+_base_: stage6_vif_mfif.yaml
+
+experiment:
+  name: stage7_msrs_adaptive_ir
+  deterministic: false
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 1
+  losses:
+    vif:
+      intensity: 1.0
+      gradient: 1.5
+      ssim: 0.3
+      color: 0.1
+      coarse_supervision: 0.1
+      intensity_mode: adaptive_dark_ir
+      intensity_energy_normalization: per_sample_mean
+      ir_intensity_max_weight: 0.55
+      ir_darkness_threshold: 0.38
+      ir_darkness_transition: 0.12
+      ir_saliency_weight: 0.65
+      intensity_visible_support_kernel: 3
+      intensity_weight_smoothing_kernel: 3
+      gradient_mode: adaptive_directional
+      gradient_charbonnier_epsilon: 0.001
+      ssim_mode: adaptive_source
+    infrared:
+      enabled: true
+      weight: 0.2
+      detach_saliency: true
+      saliency_alignment: 0.1
+    moe:
+      enabled: true
+      weight: 0.003
+      soft_balance_weight: 1.0
+      switch_balance_weight: 0.05
+      entropy_enabled: false

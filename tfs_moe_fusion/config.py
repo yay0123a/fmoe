@@ -259,6 +259,9 @@ class VIFFusionLossConfig:
     intensity_mode: str = "pixel_max"
     intensity_energy_normalization: str = "per_sample_mean"
     ir_intensity_max_weight: float = 0.3
+    ir_darkness_threshold: float = 0.35
+    ir_darkness_transition: float = 0.1
+    ir_saliency_weight: float = 0.65
     intensity_visible_support_kernel: int = 3
     intensity_weight_smoothing_kernel: int = 3
     gradient_mode: str = "magnitude_max"
@@ -1110,22 +1113,28 @@ class ProjectConfig:
             "magnitude_max",
             "directional_visible_anchor",
             "soft_directional_visible_anchor",
+            "adaptive_directional",
         }:
             raise ConfigurationError(
                 "VIF gradient_mode must be magnitude_max, directional_visible_anchor, "
-                "or soft_directional_visible_anchor"
+                "soft_directional_visible_anchor, or adaptive_directional"
             )
-        if vif_loss.ssim_mode not in {"source_max", "visible_anchor"}:
+        if vif_loss.ssim_mode not in {
+            "source_max",
+            "visible_anchor",
+            "adaptive_source",
+        }:
             raise ConfigurationError(
-                "VIF ssim_mode must be source_max or visible_anchor"
+                "VIF ssim_mode must be source_max, visible_anchor, or adaptive_source"
             )
         if vif_loss.intensity_mode not in {
             "pixel_max",
             "gradient_weighted_visible_anchor",
+            "adaptive_dark_ir",
         }:
             raise ConfigurationError(
                 "VIF intensity_mode must be pixel_max or "
-                "gradient_weighted_visible_anchor"
+                "gradient_weighted_visible_anchor or adaptive_dark_ir"
             )
         if vif_loss.intensity_energy_normalization not in {
             "none",
@@ -1138,6 +1147,12 @@ class ProjectConfig:
             raise ConfigurationError(
                 "VIF ir_intensity_max_weight must be between 0 and 1"
             )
+        if not 0.0 <= vif_loss.ir_darkness_threshold <= 1.0:
+            raise ConfigurationError("VIF ir_darkness_threshold must be in [0, 1]")
+        if vif_loss.ir_darkness_transition <= 0:
+            raise ConfigurationError("VIF ir_darkness_transition must be positive")
+        if not 0.0 <= vif_loss.ir_saliency_weight <= 1.0:
+            raise ConfigurationError("VIF ir_saliency_weight must be in [0, 1]")
         for name, kernel in (
             (
                 "intensity_visible_support_kernel",

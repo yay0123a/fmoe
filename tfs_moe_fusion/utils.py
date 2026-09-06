@@ -144,8 +144,7 @@ def seed_everything(seed: int, deterministic: bool = True) -> None:
 
     torch.backends.cudnn.benchmark = not deterministic
     torch.backends.cudnn.deterministic = deterministic
-    if deterministic:
-        torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.use_deterministic_algorithms(deterministic, warn_only=True)
 
 
 from tfs_moe_fusion.config import ProjectConfig, load_config, save_resolved_config

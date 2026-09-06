@@ -113,6 +113,8 @@ def test_frequency_specialization_reports_both_leakages() -> None:
 
 
 from tfs_moe_fusion.losses import (
+    adaptive_ir_blend_weight,
+    align_infrared_luminance,
     directional_gradient_loss,
     directional_gradient_targets,
     luminance,
@@ -138,6 +140,59 @@ def test_vif_and_mfif_losses_are_finite_and_differentiable() -> None:
     assert values
     sum(values.values()).backward()
     assert fused.grad is not None and torch.isfinite(fused.grad).all()
+
+
+def test_adaptive_ir_target_prefers_dark_ir_salient_regions() -> None:
+    visible = torch.full((1, 1, 24, 24), 0.8)
+    visible[..., :12] = 0.15
+    infrared = torch.full_like(visible, 0.2)
+    infrared[..., 3:9, 3:9] = 0.9
+
+    aligned, weight = adaptive_ir_blend_weight(
+        visible,
+        infrared,
+        max_weight=0.55,
+        darkness_threshold=0.38,
+        darkness_transition=0.12,
+        saliency_weight=0.65,
+        visible_support_kernel=3,
+        smoothing_kernel=3,
+        energy_normalization="per_sample_mean",
+    )
+
+    assert aligned.min() >= 0 and aligned.max() <= 1
+    assert weight.max() <= 0.55
+    assert weight[..., 3:9, 3:9].mean() > weight[..., 3:9, 15:21].mean()
+
+
+def test_adaptive_vif_losses_are_finite_and_differentiable() -> None:
+    fused_y = torch.rand(2, 1, 19, 23, requires_grad=True)
+    visible = torch.rand(2, 3, 19, 23)
+    infrared = torch.rand(2, 1, 19, 23)
+    values = vif_losses(
+        fused_y.expand(-1, 3, -1, -1),
+        visible,
+        infrared,
+        fused_y,
+        intensity_mode="adaptive_dark_ir",
+        ir_intensity_max_weight=0.55,
+        ir_darkness_threshold=0.38,
+        ir_darkness_transition=0.12,
+        ir_saliency_weight=0.65,
+        gradient_mode="adaptive_directional",
+        ssim_mode="adaptive_source",
+    )
+    sum(values.values()).backward()
+    assert fused_y.grad is not None and torch.isfinite(fused_y.grad).all()
+
+
+def test_aligned_ir_matches_visible_global_luminance_statistics() -> None:
+    visible = torch.rand(2, 1, 31, 29)
+    infrared = torch.rand(2, 1, 31, 29) * 0.2 + 0.1
+    aligned = align_infrared_luminance(visible, infrared)
+    torch.testing.assert_close(
+        aligned.mean((-2, -1)), visible.mean((-2, -1)), atol=2e-3, rtol=0
+    )
 
 
 def test_ssim_stays_bounded_under_bf16_autocast() -> None:
@@ -611,6 +666,98 @@ def test_router_monitor_recovery_state_round_trips() -> None:
     assert policy.noise_std >= config.recovery.noise_std
 
 
+def test_router_monitor_batches_blocks_without_reducing_local_validity(monkeypatch) -> None:
+    import tfs_moe_fusion.trainer as trainer_module
+
+    config = _smoke_config().training.moe_execution
+    config.monitor.ema_decay = 0.5
+    config.monitor.patience_steps = 2
+    config.monitor.starvation_threshold = 0.2
+    monitor = RouterLoadMonitor(config)
+    calls = []
+
+    def fake_reduce(value):
+        calls.append(value.clone())
+        return value  # One packed collective per step, excluding validity.
+
+    monkeypatch.setattr(trainer_module, "reduce_mean", fake_reduce)
+    diagnostics = []
+    for name, probs in (("a", [0.75, 0.25]), ("b", [0.6, 0.4, 0.0])):
+        probabilities = torch.tensor([probs])
+        diagnostics.append(RouterDiagnostics(
+            name, probabilities.log(), probabilities,
+            torch.tensor([[0]]), torch.ones(1, 1), probabilities > 0,
+        ))
+    first = monitor.update(tuple(diagnostics), 10)
+    assert len(calls) == 1 and calls[0].numel() == 7
+    assert monitor.usage_ema == {"a": [1.0, 0.0], "b": [1.0, 0.0, 0.0]}
+    assert monitor.starvation_counters["b"] == [0, 1, 0]
+    assert first["router_recovery_active"] == 0
+    second = monitor.update(tuple(diagnostics), 11)
+    assert len(calls) == 2
+    assert second["router_recovery_active"] == 1
+    assert monitor.recovery_until_step == 12 + config.recovery.steps
+    assert monitor.starvation_counters["b"] == [0, 0, 0]
+
+
+@pytest.mark.parametrize("max_norm", [None, 1.0])
+def test_gradient_statistics_preserves_norm_and_clipping(max_norm) -> None:
+    from tfs_moe_fusion.trainer import gradient_statistics
+
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.weight.grad = torch.tensor([[3.0, 4.0]])
+    result = gradient_statistics(model, max_norm=max_norm)
+    assert result == {"gradient_norm": 5.0, "nonfinite_gradients": 0.0}
+    expected = torch.tensor([[3.0, 4.0]])
+    if max_norm is not None:
+        expected *= max_norm / (5.0 + 1e-6)
+    torch.testing.assert_close(model.weight.grad, expected)
+
+
+def test_router_statistics_preserves_scalar_values_and_detaches_graphs() -> None:
+    from tfs_moe_fusion.trainer import router_statistics
+
+    probabilities = torch.tensor([[0.75, 0.25]], requires_grad=True)
+    entropy = -(probabilities * probabilities.log()).sum(1)
+    diagnostic = RouterDiagnostics(
+        "block", probabilities.log(), probabilities,
+        torch.tensor([[0]]), torch.ones(1, 1), torch.ones(1, 2, dtype=torch.bool),
+        entropy=entropy,
+        auxiliary={
+            "expert_residual_rms": {"common": probabilities[0, 0]},
+            "expert_weighted_contribution_rms": {"common": 0.5},
+            "router/top1_margin": probabilities[0, 0] - probabilities[0, 1],
+            "residual_scale_rms": 0.125,
+        },
+    )
+    result = router_statistics((diagnostic,))
+    assert result["router_entropy"] == pytest.approx(entropy.item())
+    assert result["router_max_load"] == 1.0
+    assert result["expert_residual_rms/block/common"] == 0.75
+    assert result["expert_weighted_contribution_rms/block/common"] == 0.5
+    assert result["router/top1_margin/block"] == 0.5
+    assert result["moe_residual_scale/block"] == 0.125
+    assert all(isinstance(value, (float, str)) for value in result.values())
+
+
+@pytest.mark.parametrize("clip", [False, True])
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
+def test_trainer_rejects_nonfinite_gradients_before_optimizer(
+    tmp_path, semantic_rt_assets, monkeypatch, clip, bad_value
+) -> None:
+    config = _smoke_config(semantic_rt_assets)
+    config.training.gradient_clip.enabled = clip
+    trainer = Trainer(build_model(config), config, torch.device("cpu"), tmp_path)
+    parameter = next(trainer.model.parameters())
+    parameter.register_hook(lambda grad: torch.full_like(grad, bad_value))
+    stepped = []
+    monkeypatch.setattr(trainer.optimizer, "step", lambda *a, **k: stepped.append(True))
+    with pytest.raises(FloatingPointError, match="non-finite gradients"):
+        trainer.train_step(TaskType.VIF)
+    assert not stepped and trainer.state.global_step == 0
+    trainer.provider.close()
+
+
 def test_expert_only_policy_freezes_every_nonexpert_group() -> None:
     config = _smoke_config()
     registry = ParameterGroupRegistry.from_model(build_model(config))
@@ -714,6 +861,7 @@ def test_train_displays_one_progress_bar_per_epoch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     semantic_rt_assets: tuple[Path, Path, Path],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     import tfs_moe_fusion.trainer as trainer_module
 
@@ -723,8 +871,9 @@ def test_train_displays_one_progress_bar_per_epoch(
     config.training.max_steps = None
     config.training.ema.enabled = False
     config.training.task_sampling.strategy = "alternating"
-    config.training.log_every_steps = 100
+    config.training.log_every_steps = 2
     trainer = Trainer(torch.nn.Linear(2, 1), config, torch.device("cpu"), tmp_path)
+    caplog.set_level("INFO", logger=trainer.logger.name)
 
     progress_bars = []
 
@@ -766,7 +915,15 @@ def test_train_displays_one_progress_bar_per_epoch(
         }
         trainer.state.phase = "stabilization"
         trainer.state.global_step += 1
-        return LossOutput(torch.tensor(1.2), components, components, {}, {})
+        diagnostics = {
+            "chroma_cb_error": torch.tensor(0.123456749, dtype=torch.float64),
+            "chroma_cr_error": 0.25,
+            "unlogged": torch.ones(2, 3),
+        }
+        return LossOutput(
+            total=torch.tensor(1.2), components=components,
+            weighted_components=components, diagnostics=diagnostics, skipped={},
+        )
 
     monkeypatch.setattr(trainer, "train_step", fake_train_step)
     trainer.train()
@@ -778,3 +935,35 @@ def test_train_displays_one_progress_bar_per_epoch(
     assert [item.updates for item in progress_bars] == [2, 2]
     assert all(set(item.postfix) == {"task", "loss", "lr"} for item in progress_bars)
     assert all(item.closed for item in progress_bars)
+    step_logs = [
+        record.getMessage() for record in caplog.records
+        if record.getMessage().startswith("step=")
+    ]
+    assert len(step_logs) == 2
+    assert step_logs[0].startswith("step=2 ")
+    assert step_logs[1].startswith("step=4 ")
+    for message in step_logs:
+        assert "moe/importance=0.20000 chroma_cb_error=0.1234567 chroma_cr_error=0.2500000" in message
+        assert "unlogged" not in message
+
+
+def test_seed_everything_can_disable_deterministic_mode() -> None:
+    from tfs_moe_fusion.utils import seed_everything
+
+    benchmark = torch.backends.cudnn.benchmark
+    deterministic = torch.backends.cudnn.deterministic
+    algorithms = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        seed_everything(3407, True)
+        assert torch.are_deterministic_algorithms_enabled()
+        assert torch.backends.cudnn.deterministic
+        assert not torch.backends.cudnn.benchmark
+        seed_everything(3407, False)
+        assert not torch.are_deterministic_algorithms_enabled()
+        assert not torch.backends.cudnn.deterministic
+        assert torch.backends.cudnn.benchmark
+    finally:
+        torch.backends.cudnn.benchmark = benchmark
+        torch.backends.cudnn.deterministic = deterministic
+        torch.use_deterministic_algorithms(algorithms, warn_only=warn_only)
