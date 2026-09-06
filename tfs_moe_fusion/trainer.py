@@ -149,8 +149,8 @@ class StatefulTaskSampler:
     _draws: int = field(init=False, default=0, repr=False)
 
     def __post_init__(self) -> None:
-        if set(self.weights) != set(TaskType):
-            raise ValueError("weights must define every TaskType")
+        if not self.weights or not set(self.weights) <= set(TaskType):
+            raise ValueError("weights must define a non-empty subset of TaskType")
         if any(value <= 0 for value in self.weights.values()):
             raise ValueError("all task weights must be positive")
         self._random = random.Random(self.seed)
@@ -163,7 +163,7 @@ class StatefulTaskSampler:
         return cls({TaskType.parse(key): value for key, value in weights.items()}, seed)
 
     def next_task(self) -> TaskType:
-        tasks = list(TaskType)
+        tasks = list(self.weights)
         selected = self._random.choices(
             tasks, weights=[self.weights[task] for task in tasks], k=1
         )[0]
@@ -1144,10 +1144,18 @@ class _InfiniteBatchSampler:
         cursor: int,
         batch_size: int,
         random_state: object,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
+        usable = len(order) // world_size * world_size
+        if usable == 0:
+            raise ValueError("Dataset must contain at least one sample per rank")
         self.order = list(order)
         self.cursor = cursor
         self.batch_size = batch_size
+        self.rank = rank
+        self.world_size = world_size
+        self.local_length = usable // world_size
         self.random = random.Random()
         self.random.setstate(random_state)
 
@@ -1155,25 +1163,37 @@ class _InfiniteBatchSampler:
         while True:
             indices: list[int] = []
             while len(indices) < self.batch_size:
-                if self.cursor == len(self.order):
+                if self.cursor == self.local_length:
                     self.random.shuffle(self.order)
                     self.cursor = 0
-                take = min(
-                    self.batch_size - len(indices), len(self.order) - self.cursor
-                )
-                indices.extend(self.order[self.cursor : self.cursor + take])
+                take = min(self.batch_size - len(indices), self.local_length - self.cursor)
+                begin = self.rank + self.cursor * self.world_size
+                end = begin + take * self.world_size
+                indices.extend(self.order[begin:end:self.world_size])
                 self.cursor += take
             yield indices
 
 
 class SemanticRTBatchProvider:
-    """Prefetched provider with checkpointable consumed order for all three tasks."""
+    """Prefetched, checkpointable provider for the configured task subset.
 
-    def __init__(self, config: ProjectConfig) -> None:
+    The shared order is deterministically partitioned by rank.  Every rank has
+    the same number of samples per cycle, so sampler state remains resumable
+    from the primary-process checkpoint.
+    """
+
+    def __init__(self, config: ProjectConfig, *, rank: int = 0, world_size: int = 1) -> None:
         self.batch_size = config.training.batch_size
         self.num_workers = config.data.num_workers
         self.pin_memory = config.data.pin_memory
         self.seed = config.experiment.seed
+        self.rank = rank
+        self.world_size = world_size
+        self.tasks = tuple(
+            TaskType.parse(task) for task in config.training.task_sampling.weights
+        )
+        if not self.tasks:
+            raise ValueError("At least one active task is required")
         augmentation = SynchronizedImageAugmentation(
             SynchronizedAugmentationConfig(
                 crop_size=config.data.crop_size,
@@ -1188,39 +1208,49 @@ class SemanticRTBatchProvider:
         )
         root = self._project_path(config.data.root)
         mfif_root = self._project_path(config.data.mfif_root)
-        manifest = self._project_path(config.data.manifest)
-        self.datasets = {
-            task: SemanticRTFusionDataset(
-                task,
-                root,
-                mfif_root,
-                manifest,
-                augmentation=augmentation,
-            )
-            for task in TaskType
-        }
-        lengths = {len(dataset) for dataset in self.datasets.values()}
-        if len(lengths) != 1:
-            raise ValueError(
-                f"SemanticRT task datasets must have equal lengths, got {lengths}"
-            )
+        if config.data.dataset == "semantic_rt":
+            manifest = self._project_path(config.data.manifest)
+            self.datasets = {
+                task: SemanticRTFusionDataset(
+                    task, root, mfif_root, manifest, augmentation=augmentation
+                )
+                for task in self.tasks
+            }
+        elif config.data.dataset == "msrs":
+            from tfs_moe_fusion.data import MSRSFusionDataset
+
+            self.datasets = {
+                task: MSRSFusionDataset(task, root, mfif_root, augmentation=augmentation)
+                for task in self.tasks
+            }
+        else:
+            raise ValueError(f"No batch provider is configured for {config.data.dataset!r}")
+        if any(len(dataset) < self.world_size for dataset in self.datasets.values()):
+            raise ValueError("Each active task dataset must contain at least world_size samples")
+        self.provider_name = config.data.dataset
         self.manifest_digest = self._manifest_digest(
-            next(iter(self.datasets.values())).sample_ids
+            tuple(
+                f"{task.value}:{sample_id}"
+                for task, dataset in self.datasets.items()
+                for sample_id in dataset.sample_ids
+            )
         )
         self.randoms = {
             task: random.Random(config.experiment.seed + 1009 * (task.index + 1))
-            for task in TaskType
+            for task in self.tasks
         }
-        self.orders = {task: list(range(len(self.datasets[task]))) for task in TaskType}
-        for task in TaskType:
+        self.orders = {task: list(range(len(self.datasets[task]))) for task in self.tasks}
+        for task in self.tasks:
             self.randoms[task].shuffle(self.orders[task])
-        self.cursors = {task: 0 for task in TaskType}
-        self.cycles = {task: 0 for task in TaskType}
+        self.cursors = {task: 0 for task in self.tasks}
+        self.cycles = {task: 0 for task in self.tasks}
         self.loaders: dict[TaskType, DataLoader] = {}
         self.iterators: dict[TaskType, Any] = {}
         self._rebuild_loaders()
 
     def next_batch(self, task: TaskType) -> FusionBatch:
+        if task not in self.datasets:
+            raise ValueError(f"Task {task.value} is not active for this provider")
         if task not in self.iterators:
             self.iterators[task] = iter(self.loaders[task])
         batch = next(self.iterators[task])
@@ -1232,23 +1262,31 @@ class SemanticRTBatchProvider:
         while len(indices) < self.batch_size:
             cursor = self.cursors[task]
             order = self.orders[task]
-            if cursor == len(order):
+            local_length = len(order) // self.world_size
+            if cursor == local_length:
                 self.randoms[task].shuffle(order)
                 self.cursors[task] = 0
                 self.cycles[task] += 1
                 cursor = 0
-            take = min(self.batch_size - len(indices), len(order) - cursor)
-            indices.extend(order[cursor : cursor + take])
+            take = min(self.batch_size - len(indices), local_length - cursor)
+            indices.extend(
+                order[
+                    self.rank + cursor * self.world_size : self.rank
+                    + (cursor + take) * self.world_size : self.world_size
+                ]
+            )
             self.cursors[task] = cursor + take
 
     def _rebuild_loaders(self) -> None:
         self._shutdown_loaders()
-        for task in TaskType:
+        for task in self.tasks:
             sampler = _InfiniteBatchSampler(
                 self.orders[task],
                 self.cursors[task],
                 self.batch_size,
                 self.randoms[task].getstate(),
+                self.rank,
+                self.world_size,
             )
             generator = torch.Generator().manual_seed(
                 self.seed + 7919 * (task.index + 1) + self.cycles[task]
@@ -1277,8 +1315,9 @@ class SemanticRTBatchProvider:
 
     def state_dict(self) -> dict[str, Any]:
         return {
-            "provider": "semantic_rt",
+            "provider": self.provider_name,
             "batch_size": self.batch_size,
+            "world_size": self.world_size,
             "manifest_digest": self.manifest_digest,
             "orders": {task.value: list(order) for task, order in self.orders.items()},
             "cursors": {task.value: cursor for task, cursor in self.cursors.items()},
@@ -1290,12 +1329,14 @@ class SemanticRTBatchProvider:
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        if state.get("provider") != "semantic_rt":
-            raise ValueError("Checkpoint data provider is not SemanticRT")
+        if state.get("provider") != self.provider_name:
+            raise ValueError(f"Checkpoint data provider is not {self.provider_name}")
         if int(state["batch_size"]) != self.batch_size:
-            raise ValueError("SemanticRT checkpoint batch size differs from config")
+            raise ValueError("Checkpoint batch size differs from config")
+        if int(state.get("world_size", 1)) != self.world_size:
+            raise ValueError("Checkpoint world size differs from config")
         if state["manifest_digest"] != self.manifest_digest:
-            raise ValueError("SemanticRT checkpoint manifest differs from config")
+            raise ValueError("Checkpoint dataset contents differ from config")
         restored_orders = {
             TaskType.parse(key): [int(index) for index in value]
             for key, value in state["orders"].items()
@@ -1303,7 +1344,7 @@ class SemanticRTBatchProvider:
         for task, order in restored_orders.items():
             if sorted(order) != list(range(len(self.datasets[task]))):
                 raise ValueError(
-                    f"SemanticRT checkpoint has an invalid {task.value} order"
+                    f"Checkpoint has an invalid {task.value} order"
                 )
         self.orders = restored_orders
         self.cursors = {
@@ -1331,11 +1372,9 @@ class SemanticRTBatchProvider:
 
 
 def build_batch_provider(
-    config: ProjectConfig,
+    config: ProjectConfig, *, rank: int = 0, world_size: int = 1
 ) -> SemanticRTBatchProvider:
-    if config.data.dataset == "semantic_rt":
-        return SemanticRTBatchProvider(config)
-    raise ValueError(f"No batch provider is configured for {config.data.dataset!r}")
+    return SemanticRTBatchProvider(config, rank=rank, world_size=world_size)
 
 
 class Trainer:
@@ -1347,8 +1386,6 @@ class Trainer:
         run_dir: str | Path,
         logger: logging.Logger | None = None,
     ) -> None:
-        if config.data.dataset == "semantic_rt" and config.training.distributed.enabled:
-            raise ValueError("The SemanticRT training profile is single-GPU only")
         self.raw_model, self.config, self.device = model.to(device), config, device
         self.rank, self.world_size = (
             initialize_distributed(device)
@@ -1395,7 +1432,9 @@ class Trainer:
         self.task_sampler = StatefulTaskSampler.from_strings(
             config.training.task_sampling.weights, config.experiment.seed + 17
         )
-        self.provider = build_batch_provider(config)
+        self.provider = build_batch_provider(
+            config, rank=self.rank, world_size=self.world_size
+        )
         self.state = TrainerState()
         self.gradient_conflicts = GradientConflictMonitor()
         self.last_loss: LossOutput | None = None

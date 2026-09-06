@@ -98,6 +98,39 @@ the final image.
 MFIF defaults to two generic RGB sources. VIF and SEG default to visible RGB
 plus infrared grayscale; explicit modalities can be supplied when needed.
 
+`configs/stage6_vif_mfif.yaml` is a fresh 50-epoch MSRS VIF-first training
+profile. It schedules only VIF and MFIF, removes SegFormer and the semantic
+expert, and uses a soft, visible-anchored directional gradient loss. It uses
+one GPU with batch size 2 and two accumulation steps, for an effective batch
+size of 4. Start it without `--resume`:
+
+```bash
+CUDA_VISIBLE_DEVICES=4 python train.py --config configs/stage6_vif_mfif.yaml
+```
+
+The configuration reads `data/msrs/train/{vi,ir}` for VIF and
+`data/mfif/msrs/train/{dof_stack,AiF,depth}` for MFIF. Change
+`CUDA_VISIBLE_DEVICES` to the GPU ID assigned to this job.
+
+With `--task seg`, inference also saves the final fused image's segmentation:
+
+```bash
+python test.py \
+  --task seg \
+  --checkpoint runs/shared_pool_stage5_y_only_feedback/checkpoints/final_ema.pt \
+  --input-a data/semantic_rt/rgb/img_02629.jpg \
+  --input-b data/semantic_rt/thermal/img_02629.jpg \
+  --output runs/test/img_02629.png
+```
+
+This produces `img_02629.png`, `img_02629_seg.png` (8-bit grayscale Cityscapes
+train IDs 0–18), and `img_02629_seg_color.png` (RGB Cityscapes colors). The ID
+image looks almost black in an image viewer; use the color image for inspection.
+Directory inputs produce the same three files for each matched pair. Semantic
+guidance must be enabled and `model.guidance.semantic.final_pass_policy` must be
+`seg_only` or `all`. For mIoU, map SemanticRT ground-truth labels using the
+project's `SEMANTIC_RT_TO_CITYSCAPES` mapping and ignore target pixels with ID 255.
+
 ## Verify
 
 ```bash

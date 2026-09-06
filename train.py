@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import torch
@@ -15,7 +16,7 @@ from tfs_moe_fusion.utils import (
     configure_logging,
     make_probe_batch,
     prepare_run,
-    resolve_device,
+    resolve_distributed_device,
     seed_everything,
 )
 
@@ -39,10 +40,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    config, run_dir = prepare_run(args.config)
-    logger = configure_logging(log_file=run_dir / "train.log")
+    rank = int(os.environ.get("RANK", "0"))
+    config, run_dir = prepare_run(args.config, save_resolved=rank == 0)
+    logger = configure_logging(log_file=run_dir / "train.log" if rank == 0 else None)
+    if rank != 0:
+        logger.disabled = True
     seed_everything(config.experiment.seed, config.experiment.deterministic)
-    device = resolve_device(args.device or config.training.device)
+    device = resolve_distributed_device(
+        args.device or config.training.device, config.training.distributed.enabled
+    )
     if args.dry_run:
         config.model.guidance.semantic.enabled = False
         config.training.losses.strict_targets = False

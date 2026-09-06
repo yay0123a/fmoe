@@ -16,15 +16,41 @@ from tfs_moe_fusion.types import FusionBatch, ModalityType, SourceBatch, TaskTyp
 from tfs_moe_fusion.utils import configure_logging, make_probe_batch, resolve_device
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+CITYSCAPES_COLORS = np.array(
+    [
+        [128, 64, 128],  # road
+        [244, 35, 232],  # sidewalk
+        [70, 70, 70],  # building
+        [102, 102, 156],  # wall
+        [190, 153, 153],  # fence
+        [153, 153, 153],  # pole
+        [250, 170, 30],  # traffic light
+        [220, 220, 0],  # traffic sign
+        [107, 142, 35],  # vegetation
+        [152, 251, 152],  # terrain
+        [70, 130, 180],  # sky
+        [220, 20, 60],  # person
+        [255, 0, 0],  # rider
+        [0, 0, 142],  # car
+        [0, 0, 70],  # truck
+        [0, 60, 100],  # bus
+        [0, 80, 100],  # train
+        [0, 0, 230],  # motorcycle
+        [119, 11, 32],  # bicycle
+    ],
+    dtype=np.uint8,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("configs/shared_pool_stage5_y_only_feedback.yaml"))
-    parser.add_argument("--checkpoint", type=Path,default=Path("runs/shared_pool_stage5_y_only_feedback/checkpoints/final_ema.pt"))
-    parser.add_argument("--input-a", type=Path,default=Path("data/semantic_rt/rgb/img_02629.jpg")) #vi
-    parser.add_argument("--input-b", type=Path,default=Path("data/semantic_rt/thermal/img_02629.jpg")) #ir
-    parser.add_argument("--output", type=Path, default=Path("runs/stage5"))
+    parser.add_argument("--config", type=Path, default=Path("configs/stage6_vif_mfif.yaml"))
+    parser.add_argument("--checkpoint", type=Path,default=Path("runs/stage6_msrs_vif_mfif_single_gpu/checkpoints/final_ema.pt"))
+    parser.add_argument("--input-a", type=Path,default=Path("data/msrs/test/vi/00918N.png")) #vi
+    parser.add_argument("--input-b", type=Path,default=Path("data/msrs/test/ir/00918N.png")) #ir
+    #parser.add_argument("--input-a", type=Path,default=Path("data/mfif/semantic_rt/dof_stack/img_00125/0.jpg")) #n
+    #parser.add_argument("--input-b", type=Path,default=Path("data/mfif/semantic_rt/dof_stack/img_00125/1.jpg")) #f
+    parser.add_argument("--output", type=Path, default=Path("runs/stage6"))
     parser.add_argument(
         "--task", required=True, choices=[item.value for item in TaskType]
     )
@@ -92,6 +118,24 @@ def main() -> None:
             args.output if single_output else args.output / f"{path_a.stem}.png"
         )
         _save_image(output.fused, destination)
+        if task is TaskType.SEG:
+            if output.segmentation is None or not output.segmentation.available:
+                raise RuntimeError(
+                    "SEG task did not produce segmentation output; enable "
+                    "model.guidance.semantic.enabled and set final_pass_policy "
+                    "to 'seg_only' or 'all'"
+                )
+            probabilities = output.segmentation.probabilities
+            if probabilities.shape[1] != len(CITYSCAPES_COLORS):
+                raise ValueError("Segmentation export requires 19 Cityscapes classes")
+            pred = probabilities.argmax(dim=1)
+            mask = pred[0].detach().cpu().numpy().astype(np.uint8)
+            seg_path = destination.with_name(f"{destination.stem}_seg.png")
+            Image.fromarray(mask).save(seg_path)
+            color_path = destination.with_name(f"{destination.stem}_seg_color.png")
+            Image.fromarray(CITYSCAPES_COLORS[mask]).save(color_path)
+            logger.info("Saved segmentation %s", seg_path)
+            logger.info("Saved segmentation visualization %s", color_path)
         if args.save_coarse and output.coarse is not None:
             coarse = destination.with_name(f"{destination.stem}_coarse.png")
             _save_image(output.coarse, coarse)

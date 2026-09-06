@@ -354,6 +354,133 @@ class SemanticRTFusionDataset(FusionDatasetAdapter):
         return torch.from_numpy(mapped)
 
 
+class MSRSFusionDataset(FusionDatasetAdapter):
+    """MSRS VIF data plus the generated MSRS MFIF supervision set.
+
+    ``root`` is one split directory (for example ``data/msrs/train``), while
+    ``mfif_root`` is the matching generated MFIF split.
+    """
+
+    def __init__(
+        self,
+        task: TaskType | str,
+        root: str | Path,
+        mfif_root: str | Path,
+        *,
+        augmentation: SynchronizedImageAugmentation | None = None,
+        strict_files: bool = True,
+    ) -> None:
+        self.task = TaskType.parse(task)
+        if self.task is TaskType.SEG:
+            raise ValueError("MSRS training adapter supports VIF and MFIF only")
+        self.root = Path(root)
+        self.mfif_root = Path(mfif_root)
+        self.augmentation = augmentation
+        self.sample_ids = self._discover_sample_ids()
+        if not self.sample_ids:
+            raise ValueError(f"MSRS {self.task.value} contains no complete samples")
+        if strict_files:
+            missing = [
+                str(path)
+                for sample_id in self.sample_ids
+                for path in self._required_paths(sample_id)
+                if not path.is_file()
+            ]
+            if missing:
+                preview = ", ".join(missing[:5])
+                raise FileNotFoundError(
+                    f"MSRS {self.task.value} has {len(missing)} missing files: {preview}"
+                )
+
+    def __len__(self) -> int:
+        return len(self.sample_ids)
+
+    def __getitem__(self, index: int) -> FusionSample:
+        sample_id = self.sample_ids[index]
+        return (
+            self._mfif_sample(sample_id)
+            if self.task is TaskType.MFIF
+            else self._vif_sample(sample_id)
+        )
+
+    def _vif_sample(self, sample_id: str) -> FusionSample:
+        images = {
+            "source_a": Image.open(self.root / "vi" / f"{sample_id}.png").convert("RGB"),
+            "source_b": Image.open(self.root / "ir" / f"{sample_id}.png").convert("L"),
+        }
+        if self.augmentation is not None:
+            images = self.augmentation(images)
+        return FusionSample(
+            source_a=SemanticRTFusionDataset._image_tensor(images["source_a"]),
+            modality_a=ModalityType.VISIBLE_RGB,
+            source_b=SemanticRTFusionDataset._image_tensor(images["source_b"]),
+            modality_b=ModalityType.INFRARED_GRAY,
+            task=self.task,
+            sample_id=sample_id,
+            metadata={"dataset": "msrs", "split": self.root.name},
+        )
+
+    def _mfif_sample(self, sample_id: str) -> FusionSample:
+        stack = self.mfif_root / "dof_stack" / sample_id
+        images = {
+            "source_a": Image.open(stack / "0.jpg").convert("RGB"),
+            "source_b": Image.open(stack / "1.jpg").convert("RGB"),
+            "target": Image.open(self.mfif_root / "AiF" / f"{sample_id}.jpg").convert("RGB"),
+            "focus": Image.open(self.mfif_root / "depth" / f"{sample_id}.png").convert("L"),
+        }
+        if self.augmentation is not None:
+            images = self.augmentation(images, categorical=frozenset({"focus"}))
+        focus = torch.from_numpy(
+            1.0 - np.asarray(images["focus"], dtype=np.float32).copy() / 255.0
+        ).unsqueeze(0)
+        return FusionSample(
+            source_a=SemanticRTFusionDataset._image_tensor(images["source_a"]),
+            modality_a=ModalityType.GENERIC_RGB,
+            source_b=SemanticRTFusionDataset._image_tensor(images["source_b"]),
+            modality_b=ModalityType.GENERIC_RGB,
+            task=self.task,
+            sample_id=sample_id,
+            target=SemanticRTFusionDataset._image_tensor(images["target"]),
+            focus_target=focus.clamp(0.0, 1.0),
+            metadata={"dataset": "msrs_mfif", "split": self.mfif_root.name},
+        )
+
+    def _discover_sample_ids(self) -> tuple[str, ...]:
+        if self.task is TaskType.VIF:
+            directories = (self.root / "vi", self.root / "ir")
+            required_suffixes = (".png", ".png")
+        else:
+            directories = (self.mfif_root / "AiF", self.mfif_root / "depth")
+            required_suffixes = (".jpg", ".png")
+        available = []
+        for directory, suffix in zip(directories, required_suffixes, strict=True):
+            if not directory.is_dir():
+                raise FileNotFoundError(f"MSRS directory does not exist: {directory}")
+            available.append({path.stem for path in directory.glob(f"*{suffix}")})
+        sample_ids = set.intersection(*available)
+        if self.task is TaskType.MFIF:
+            sample_ids = {
+                sample_id
+                for sample_id in sample_ids
+                if (self.mfif_root / "dof_stack" / sample_id / "0.jpg").is_file()
+                and (self.mfif_root / "dof_stack" / sample_id / "1.jpg").is_file()
+            }
+        return tuple(sorted(sample_ids))
+
+    def _required_paths(self, sample_id: str) -> tuple[Path, ...]:
+        if self.task is TaskType.VIF:
+            return (
+                self.root / "vi" / f"{sample_id}.png",
+                self.root / "ir" / f"{sample_id}.png",
+            )
+        return (
+            self.mfif_root / "dof_stack" / sample_id / "0.jpg",
+            self.mfif_root / "dof_stack" / sample_id / "1.jpg",
+            self.mfif_root / "AiF" / f"{sample_id}.jpg",
+            self.mfif_root / "depth" / f"{sample_id}.png",
+        )
+
+
 from tfs_moe_fusion.types import ContractError, FusionBatch, FusionSample, SourceBatch
 
 

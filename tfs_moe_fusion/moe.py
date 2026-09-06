@@ -248,7 +248,7 @@ class ExpertAvailabilityPolicy:
         valid = torch.ones(
             batch, len(self.expert_names), dtype=torch.bool, device=device
         )
-        if self.version == "stage4b":
+        if self.version in {"stage4b", "stage6_vif_mfif"}:
             valid.zero_()
             for name in (ExpertType.LOW_FREQUENCY.value, ExpertType.DETAIL.value):
                 valid[:, self.expert_names.index(name)] = True
@@ -262,7 +262,7 @@ class ExpertAvailabilityPolicy:
                 focus = ExpertType.FOCUS.value
                 if focus in self.expert_names:
                     valid[:, self.expert_names.index(focus)] = True
-            if task is TaskType.SEG and semantic_available:
+            if self.version == "stage4b" and task is TaskType.SEG and semantic_available:
                 semantic = ExpertType.SEMANTIC.value
                 if semantic in self.expert_names:
                     valid[:, self.expert_names.index(semantic)] = True
@@ -712,7 +712,7 @@ class SiteEvidenceBuilder:
         focus_a = self._align(focus_a_raw, size) if focus_a_raw is not None else feature.new_zeros(batch, 1, *size)
         focus_b = self._align(focus_b_raw, size) if focus_b_raw is not None else feature.new_zeros(batch, 1, *size)
         focus_confidence = self._align(focus_confidence_raw, size) if focus_confidence_raw is not None else feature.new_zeros(batch, 1, *size)
-        if self.version == "stage4b" and self.detach_focus_evidence:
+        if self.version in {"stage4b", "stage6_vif_mfif"} and self.detach_focus_evidence:
             focus_a, focus_b, focus_confidence = (
                 focus_a.detach(),
                 focus_b.detach(),
@@ -729,7 +729,7 @@ class SiteEvidenceBuilder:
             low, high = local_spectral_evidence_from_bands(
                 bands, grid_size, value.dtype
             )
-            if self.version == "stage4b":
+            if self.version in {"stage4b", "stage6_vif_mfif"}:
                 focus = functional.adaptive_avg_pool2d(
                     focus_confidence.float(), grid_size
                 )
@@ -769,7 +769,7 @@ class SiteEvidenceBuilder:
             other_feature,
             infrared_valid,
         )
-        if self.version == "stage4b":
+        if self.version in {"stage4b", "stage6_vif_mfif"}:
             with torch.autocast(device_type=feature.device.type, enabled=False):
                 expert, focus_available_for_expert, stage4_diagnostics = (
                     self._stage4_expert_evidence(
@@ -1152,7 +1152,11 @@ def build_functional_expert(
     version: str = "stage3",
 ) -> FunctionalExpert:
     expert_type = ExpertType.parse(expert)
-    classes = STAGE4_EXPERT_CLASSES if version == "stage4b" else EXPERT_CLASSES
+    classes = (
+        STAGE4_EXPERT_CLASSES
+        if version in {"stage4b", "stage6_vif_mfif"}
+        else EXPERT_CLASSES
+    )
     return classes[expert_type](channels, expansion)
 
 

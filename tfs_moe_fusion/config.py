@@ -264,6 +264,9 @@ class VIFFusionLossConfig:
     gradient_mode: str = "magnitude_max"
     ir_gradient_dominance_ratio: float = 1.2
     visible_gradient_support_kernel: int = 3
+    gradient_transition: float = 0.15
+    gradient_min_magnitude: float = 0.02
+    gradient_charbonnier_epsilon: float = 1e-3
     ssim_mode: str = "source_max"
 
 
@@ -633,20 +636,31 @@ class ProjectConfig:
             "infrared_saliency",
         }
         stage4b_experts = {*legacy_experts, "focus"}
-        required_experts = (
-            stage4b_experts
-            if model.moe.functional_expert_version == "stage4b"
-            else legacy_experts
+        stage6_vif_mfif_experts = {
+            "common",
+            "low_frequency",
+            "detail",
+            "infrared_saliency",
+            "focus",
+        }
+        required_experts_by_version = {
+            "stage3": legacy_experts,
+            "stage4b": stage4b_experts,
+            "stage6_vif_mfif": stage6_vif_mfif_experts,
+        }
+        required_experts = required_experts_by_version.get(
+            model.moe.functional_expert_version
         )
+        if required_experts is None:
+            raise ConfigurationError(
+                "model.moe.functional_expert_version must be stage3, stage4b, "
+                "or stage6_vif_mfif"
+            )
         if len(model.moe.experts) != len(required_experts) or set(
             model.moe.experts
         ) != required_experts:
             raise ConfigurationError(
                 "model.moe.experts do not match the selected functional expert version"
-            )
-        if model.moe.functional_expert_version not in {"stage3", "stage4b"}:
-            raise ConfigurationError(
-                "model.moe.functional_expert_version must be stage3 or stage4b"
             )
         if model.moe.architecture_version not in {"legacy", "v2"}:
             raise ConfigurationError(
@@ -682,13 +696,14 @@ class ProjectConfig:
             )
         if model.moe.routing_mode == "spatial_soft" and not model.moe.shared_pool_enabled:
             raise ConfigurationError("spatial_soft routing requires the shared expert pool")
-        if model.moe.functional_expert_version == "stage4b" and not (
+        if model.moe.functional_expert_version in {"stage4b", "stage6_vif_mfif"} and not (
             model.moe.architecture_version == "v2"
             and model.moe.routing_mode == "spatial_soft"
             and model.moe.shared_pool_enabled
         ):
             raise ConfigurationError(
-                "stage4b experts require v2 shared-pool spatial_soft routing"
+                "stage4b and stage6_vif_mfif experts require v2 shared-pool "
+                "spatial_soft routing"
             )
         if model.moe.expert_dim <= 0:
             raise ConfigurationError("model.moe.expert_dim must be positive")
@@ -829,8 +844,8 @@ class ProjectConfig:
                 )
 
         data = self.data
-        if data.dataset != "semantic_rt":
-            raise ConfigurationError("data.dataset must be semantic_rt")
+        if data.dataset not in {"semantic_rt", "msrs"}:
+            raise ConfigurationError("data.dataset must be semantic_rt or msrs")
         if data.num_workers < 0:
             raise ConfigurationError("data.num_workers cannot be negative")
         if data.crop_size <= 0:
@@ -855,6 +870,10 @@ class ProjectConfig:
             raise ConfigurationError(
                 "SemanticRT requires data.root, data.mfif_root, and data.manifest"
             )
+        if data.dataset == "msrs" and not all(
+            value.strip() for value in (data.root, data.mfif_root)
+        ):
+            raise ConfigurationError("MSRS requires data.root and data.mfif_root")
         if self.training.epochs <= 0 or self.training.batch_size <= 0:
             raise ConfigurationError("training epochs and batch_size must be positive")
         training = self.training
@@ -911,9 +930,11 @@ class ProjectConfig:
             raise ConfigurationError(
                 "task sampling must be alternating, weighted_random, or scheduled"
             )
-        if set(self.training.task_sampling.weights) != {"vif", "mfif", "seg"}:
+        active_tasks = set(self.training.task_sampling.weights)
+        legal_tasks = {"vif", "mfif", "seg"}
+        if not active_tasks or not active_tasks <= legal_tasks:
             raise ConfigurationError(
-                "task_sampling.weights must define vif, mfif, and seg"
+                "task_sampling.weights must define a non-empty subset of vif, mfif, and seg"
             )
         if any(weight <= 0 for weight in self.training.task_sampling.weights.values()):
             raise ConfigurationError("task sampling weights must be positive")
@@ -924,7 +945,6 @@ class ProjectConfig:
                     "task_schedule is required when task sampling is scheduled"
                 )
             previous_end = 0
-            legal_tasks = {"vif", "mfif", "seg"}
             for phase in schedule:
                 if (
                     not phase.name.strip()
@@ -934,9 +954,9 @@ class ProjectConfig:
                     raise ConfigurationError(
                         "Task schedule phases must be named, contiguous, and ordered"
                     )
-                if not phase.pattern or not set(phase.pattern) <= legal_tasks:
+                if not phase.pattern or not set(phase.pattern) <= active_tasks:
                     raise ConfigurationError(
-                        "Task schedule patterns must contain only vif, mfif, and seg"
+                        "Task schedule patterns must contain only configured tasks"
                     )
                 previous_end = phase.end_epoch
             if previous_end != training.epochs:
@@ -977,9 +997,9 @@ class ProjectConfig:
             "feedback_site_adapters",
             "core_routers",
         }
-        if set(training.task_update_policy.freeze) != {"vif", "mfif", "seg"}:
+        if set(training.task_update_policy.freeze) != active_tasks:
             raise ConfigurationError(
-                "task_update_policy.freeze must define vif, mfif, and seg"
+                "task_update_policy.freeze must define every configured task"
             )
         unknown_groups = (
             set().union(*map(set, training.task_update_policy.freeze.values()))
@@ -1089,9 +1109,11 @@ class ProjectConfig:
         if vif_loss.gradient_mode not in {
             "magnitude_max",
             "directional_visible_anchor",
+            "soft_directional_visible_anchor",
         }:
             raise ConfigurationError(
-                "VIF gradient_mode must be magnitude_max or directional_visible_anchor"
+                "VIF gradient_mode must be magnitude_max, directional_visible_anchor, "
+                "or soft_directional_visible_anchor"
             )
         if vif_loss.ssim_mode not in {"source_max", "visible_anchor"}:
             raise ConfigurationError(
@@ -1131,6 +1153,14 @@ class ProjectConfig:
         if vif_loss.ir_gradient_dominance_ratio < 1.0:
             raise ConfigurationError(
                 "VIF ir_gradient_dominance_ratio must be at least 1"
+            )
+        if (
+            vif_loss.gradient_transition <= 0
+            or vif_loss.gradient_min_magnitude <= 0
+            or vif_loss.gradient_charbonnier_epsilon <= 0
+        ):
+            raise ConfigurationError(
+                "VIF soft directional gradient parameters must be positive"
             )
         if (
             vif_loss.visible_gradient_support_kernel <= 0
@@ -1328,6 +1358,8 @@ def _load_mapping(path: Path, seen: set[Path]) -> dict[str, Any]:
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    if override.get("_replace_") is True:
+        return {key: value for key, value in override.items() if key != "_replace_"}
     result = dict(base)
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(result.get(key), dict):

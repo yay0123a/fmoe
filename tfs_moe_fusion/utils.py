@@ -157,11 +157,14 @@ from tfs_moe_fusion.types import (
 )
 
 
-def prepare_run(config_path: str | Path) -> tuple[ProjectConfig, Path]:
+def prepare_run(
+    config_path: str | Path, *, save_resolved: bool = True
+) -> tuple[ProjectConfig, Path]:
     config = load_config(config_path)
     run_dir = Path(config.experiment.output_dir) / config.experiment.name
     run_dir.mkdir(parents=True, exist_ok=True)
-    save_resolved_config(config, run_dir / "resolved_config.yaml")
+    if save_resolved:
+        save_resolved_config(config, run_dir / "resolved_config.yaml")
     return config, run_dir
 
 
@@ -224,3 +227,21 @@ def resolve_device(requested: str) -> torch.device:
             f"{torch.cuda.device_count()} device(s) are visible"
         )
     return device
+
+
+def resolve_distributed_device(requested: str, distributed: bool) -> torch.device:
+    """Bind a torchrun process to its LOCAL_RANK CUDA device."""
+
+    device = resolve_device(requested)
+    world_size = int(__import__("os").environ.get("WORLD_SIZE", "1"))
+    if not distributed or world_size <= 1:
+        return device
+    if device.type != "cuda":
+        raise RuntimeError("Multi-process distributed training requires CUDA")
+    local_rank = int(__import__("os").environ["LOCAL_RANK"])
+    if local_rank >= torch.cuda.device_count():
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} exceeds {torch.cuda.device_count()} visible CUDA devices"
+        )
+    torch.cuda.set_device(local_rank)
+    return torch.device("cuda", local_rank)

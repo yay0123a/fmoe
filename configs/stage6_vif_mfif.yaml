@@ -1,0 +1,101 @@
+_base_: shared_pool_stage5_y_only_feedback.yaml
+
+experiment:
+  name: stage6_msrs_vif_mfif_single_gpu
+
+data:
+  dataset: msrs
+  root: data/msrs/train
+  mfif_root: data/mfif/msrs/train
+  manifest: ""
+
+model:
+  moe:
+    functional_expert_version: stage6_vif_mfif
+    semantic_guidance_source: evidence_maps
+    experts: [common, low_frequency, detail, infrared_saliency, focus]
+  guidance:
+    semantic:
+      enabled: false
+      backend: null
+      guidance_policy: none
+      guidance_tasks: []
+      final_pass_policy: none
+  ablation:
+    disable_semantic_feedback: true
+
+training:
+  epochs: 50
+  device: cuda
+  gradient_accumulation_steps: 2
+  distributed:
+    enabled: false
+    find_unused_parameters: true
+  optimizer:
+    learning_rate: 0.0002
+    lr_multipliers:
+      _replace_: true
+      feedback_site_adapters: 0.5
+      feedback_routers: 0.5
+  scheduler:
+    warmup_steps: 2000
+    minimum_learning_rate: 0.000001
+  task_sampling:
+    strategy: scheduled
+    weights: {_replace_: true, vif: 1.0, mfif: 1.0}
+  task_schedule:
+    - {name: vif_base, start_epoch: 0, end_epoch: 5, pattern: [vif]}
+    - {name: vif_mfif_joint, start_epoch: 5, end_epoch: 35, pattern: [vif, vif, mfif]}
+    - {name: vif_dominant, start_epoch: 35, end_epoch: 45, pattern: [vif, vif, vif, mfif]}
+    - {name: vif_convergence, start_epoch: 45, end_epoch: 50, pattern: [vif]}
+  task_update_policy:
+    freeze:
+      _replace_: true
+      vif: []
+      mfif: [shared_ir]
+  phases:
+    phases:
+      - {name: vif_base, start: 0, end: 5, loss_multipliers: {}}
+      - {name: vif_mfif_joint, start: 5, end: 35, loss_multipliers: {}}
+      - {name: vif_dominant, start: 35, end: 45, loss_multipliers: {}}
+      - {name: vif_convergence, start: 45, end: 50, loss_multipliers: {}}
+  losses:
+    vif:
+      intensity: 1.0
+      gradient: 1.5
+      ssim: 0.3
+      color: 0.1
+      coarse_supervision: 0.25
+      intensity_mode: gradient_weighted_visible_anchor
+      intensity_energy_normalization: per_sample_mean
+      ir_intensity_max_weight: 0.3
+      intensity_visible_support_kernel: 3
+      intensity_weight_smoothing_kernel: 3
+      gradient_mode: soft_directional_visible_anchor
+      ir_gradient_dominance_ratio: 1.2
+      visible_gradient_support_kernel: 3
+      gradient_transition: 0.15
+      gradient_min_magnitude: 0.02
+      gradient_charbonnier_epsilon: 0.001
+      ssim_mode: visible_anchor
+    mfif:
+      reconstruction: 1.0
+      gradient: 1.0
+      ssim: 0.5
+      coarse_supervision: 0.25
+    focus:
+      selection: 1.0
+      boundary: 1.0
+      confidence: 0.1
+    seg_fusion:
+      enabled: false
+      intensity: 0.0
+      gradient: 0.0
+    semantic:
+      cross_entropy: 0.0
+      dice: 0.0
+      coarse_supervision: 0.0
+      class_weights: null
+      boundary_alignment: 0.0
+    frequency:
+      semantic_boundary: 0.0

@@ -119,6 +119,8 @@ from tfs_moe_fusion.losses import (
     mfif_losses,
     normalized_edge_energy,
     seg_fusion_anchor_losses,
+    soft_directional_gradient_loss,
+    soft_directional_gradient_targets,
     ssim,
     vif_intensity_target,
     vif_losses,
@@ -217,6 +219,47 @@ def test_directional_gradient_loss_is_differentiable() -> None:
         torch.rand_like(fused_y),
         torch.rand_like(fused_y),
     )
+    loss.backward()
+    assert fused_y.grad is not None and torch.isfinite(fused_y.grad).all()
+
+
+def test_soft_directional_gradient_is_continuous_and_protects_visible_edges() -> None:
+    visible = torch.zeros(2, 1, 15, 15)
+    infrared = torch.zeros_like(visible)
+    visible[0, :, :, 5:] = 0.5
+    infrared[0, :, :, 6:] = 0.55
+    infrared[1, :, :, 9:] = 0.8
+
+    _, _, ir_weight = soft_directional_gradient_targets(
+        visible,
+        infrared,
+        ir_dominance_ratio=1.2,
+        visible_support_kernel=3,
+        transition=0.15,
+        min_magnitude=0.02,
+    )
+
+    assert ir_weight[0, :, :, 4:8].max() < 0.5
+    assert ir_weight[1, :, :, 8:11].max() > 0.5
+    fused_y = torch.rand(2, 1, 15, 17, requires_grad=True)
+    loss = soft_directional_gradient_loss(
+        fused_y,
+        torch.rand_like(fused_y),
+        torch.rand_like(fused_y),
+    )
+    loss.backward()
+    assert fused_y.grad is not None and torch.isfinite(fused_y.grad).all()
+
+
+def test_soft_directional_gradient_stays_fp32_under_bf16_autocast() -> None:
+    fused_y = torch.rand(1, 1, 15, 17, requires_grad=True)
+    visible_y = torch.rand_like(fused_y)
+    infrared = torch.rand_like(fused_y)
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        loss = soft_directional_gradient_loss(fused_y, visible_y, infrared)
+
+    assert loss.dtype is torch.float32
     loss.backward()
     assert fused_y.grad is not None and torch.isfinite(fused_y.grad).all()
 

@@ -279,6 +279,81 @@ def directional_gradient_loss(
     return F.l1_loss(fused_gx, target_gx) + F.l1_loss(fused_gy, target_gy)
 
 
+def soft_directional_gradient_targets(
+    visible_y: Tensor,
+    infrared: Tensor,
+    *,
+    ir_dominance_ratio: float = 1.2,
+    visible_support_kernel: int = 3,
+    transition: float = 0.15,
+    min_magnitude: float = 0.02,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Blend signed gradients only for confident IR-only structure.
+
+    Nearby visible support suppresses an IR edge, which avoids widening a
+    slightly misregistered visible edge. The continuous gate makes the target
+    stable around the admission threshold.
+    """
+    if ir_dominance_ratio < 1.0:
+        raise ValueError("ir_dominance_ratio must be at least 1")
+    if visible_support_kernel <= 0 or visible_support_kernel % 2 == 0:
+        raise ValueError("visible_support_kernel must be positive and odd")
+    if transition <= 0 or min_magnitude <= 0:
+        raise ValueError("soft directional gradient parameters must be positive")
+    with torch.autocast(device_type=visible_y.device.type, enabled=False):
+        visible_y, infrared = luminance(visible_y.float()), luminance(infrared.float())
+        gx_v, gy_v = sobel(visible_y)
+        gx_i, gy_i = sobel(infrared)
+        magnitude_v = torch.sqrt(gx_v.square() + gy_v.square() + 1e-6)
+        magnitude_i = torch.sqrt(gx_i.square() + gy_i.square() + 1e-6)
+        visible_support = F.max_pool2d(
+            magnitude_v,
+            kernel_size=visible_support_kernel,
+            stride=1,
+            padding=visible_support_kernel // 2,
+        )
+        dominance = magnitude_i / visible_support.clamp_min(min_magnitude)
+        dominance_gate = torch.sigmoid(
+            (dominance - ir_dominance_ratio) / transition
+        )
+        edge_gate = torch.sigmoid((magnitude_i - min_magnitude) / min_magnitude)
+        ir_weight = dominance_gate * edge_gate
+        return (
+            torch.lerp(gx_v, gx_i, ir_weight),
+            torch.lerp(gy_v, gy_i, ir_weight),
+            ir_weight,
+        )
+
+
+def soft_directional_gradient_loss(
+    fused_y: Tensor,
+    visible_y: Tensor,
+    infrared: Tensor,
+    *,
+    ir_dominance_ratio: float = 1.2,
+    visible_support_kernel: int = 3,
+    transition: float = 0.15,
+    min_magnitude: float = 0.02,
+    charbonnier_epsilon: float = 1e-3,
+) -> Tensor:
+    """Robustly match a softly gated, visible-anchored signed gradient target."""
+    if charbonnier_epsilon <= 0:
+        raise ValueError("charbonnier_epsilon must be positive")
+    with torch.autocast(device_type=fused_y.device.type, enabled=False):
+        target_gx, target_gy, _ = soft_directional_gradient_targets(
+            visible_y,
+            infrared,
+            ir_dominance_ratio=ir_dominance_ratio,
+            visible_support_kernel=visible_support_kernel,
+            transition=transition,
+            min_magnitude=min_magnitude,
+        )
+        fused_gx, fused_gy = sobel(fused_y.float())
+        return charbonnier(fused_gx, target_gx, charbonnier_epsilon) + charbonnier(
+            fused_gy, target_gy, charbonnier_epsilon
+        )
+
+
 def normalized_edge_energy(
     image: Tensor,
     *,
@@ -378,6 +453,9 @@ def vif_losses(
     gradient_mode: str = "magnitude_max",
     ir_gradient_dominance_ratio: float = 1.2,
     visible_gradient_support_kernel: int = 3,
+    gradient_transition: float = 0.15,
+    gradient_min_magnitude: float = 0.02,
+    gradient_charbonnier_epsilon: float = 1e-3,
     ssim_mode: str = "source_max",
 ) -> dict[str, Tensor]:
     predicted_y = fused_y if fused_y is not None else luminance(fused)
@@ -404,6 +482,17 @@ def vif_losses(
             infrared,
             ir_dominance_ratio=ir_gradient_dominance_ratio,
             visible_support_kernel=visible_gradient_support_kernel,
+        )
+    elif gradient_mode == "soft_directional_visible_anchor":
+        gradient_loss = soft_directional_gradient_loss(
+            predicted_y,
+            visible_y,
+            infrared,
+            ir_dominance_ratio=ir_gradient_dominance_ratio,
+            visible_support_kernel=visible_gradient_support_kernel,
+            transition=gradient_transition,
+            min_magnitude=gradient_min_magnitude,
+            charbonnier_epsilon=gradient_charbonnier_epsilon,
         )
     else:
         raise ValueError(f"Unknown VIF gradient mode: {gradient_mode}")
@@ -597,6 +686,11 @@ class MultiTaskLossManager(nn.Module):
                 visible_gradient_support_kernel=(
                     vif_config.visible_gradient_support_kernel
                 ),
+                gradient_transition=vif_config.gradient_transition,
+                gradient_min_magnitude=vif_config.gradient_min_magnitude,
+                gradient_charbonnier_epsilon=(
+                    vif_config.gradient_charbonnier_epsilon
+                ),
                 ssim_mode=vif_config.ssim_mode,
             )
             components.update(final_vif)
@@ -625,6 +719,11 @@ class MultiTaskLossManager(nn.Module):
                         ),
                         visible_gradient_support_kernel=(
                             vif_config.visible_gradient_support_kernel
+                        ),
+                        gradient_transition=vif_config.gradient_transition,
+                        gradient_min_magnitude=vif_config.gradient_min_magnitude,
+                        gradient_charbonnier_epsilon=(
+                            vif_config.gradient_charbonnier_epsilon
                         ),
                         ssim_mode=vif_config.ssim_mode,
                     )
