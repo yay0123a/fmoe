@@ -87,6 +87,60 @@ def test_checkpoint_round_trip_and_sampler_resume(tmp_path: Path) -> None:
     assert sampler.next_task() is restored_sampler.next_task()
 
 
+def test_checkpoint_restores_device_mapped_rng_state_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _smoke_config()
+    model = build_model(config)
+    cpu_rng_state = torch.get_rng_state()
+
+    class DeviceMappedRngState:
+        def detach(self) -> DeviceMappedRngState:
+            return self
+
+        def cpu(self) -> torch.Tensor:
+            return cpu_rng_state
+
+    mapped_rng_state = DeviceMappedRngState()
+    mapped_cuda_states = [DeviceMappedRngState() for _ in range(8)]
+    payload = {
+        "format_version": 2,
+        "model": model.state_dict(),
+        "epoch": 0,
+        "global_step": 0,
+        "rng": {
+            "torch": mapped_rng_state,
+            "cuda": mapped_cuda_states,
+            "python": None,
+            "numpy": None,
+        },
+    }
+
+    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: payload)
+
+    def assert_cpu_rng_state(state: torch.Tensor) -> None:
+        assert state is cpu_rng_state
+        assert state.device.type == "cpu"
+        assert state.dtype is torch.uint8
+
+    monkeypatch.setattr(torch, "set_rng_state", assert_cpu_rng_state)
+
+    def assert_visible_cuda_rng_states(states: list[torch.Tensor]) -> None:
+        assert states == [cpu_rng_state]
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(
+        torch.cuda, "set_rng_state_all", assert_visible_cuda_rng_states
+    )
+    load_checkpoint(
+        "device-mapped.pt",
+        build_model(config),
+        map_location="cuda:0",
+        restore_rng=True,
+    )
+
+
 from pathlib import Path
 
 from tfs_moe_fusion.trainer import Trainer

@@ -63,12 +63,14 @@ def test_stage7_adaptive_ir_profile_enables_ir_and_moe_supervision() -> None:
     config = _config("stage7_adaptive_ir.yaml")
 
     assert config.data.dataset == "msrs"
-    assert config.training.losses.vif.intensity_mode == "adaptive_dark_ir"
+    assert config.training.losses.vif.intensity_mode == "hot_object_aware"
     assert config.training.losses.vif.gradient_mode == "adaptive_directional"
     assert config.training.losses.vif.ssim_mode == "adaptive_source"
-    assert config.training.losses.vif.ir_intensity_max_weight == 0.55
+    assert config.training.losses.vif.ir_intensity_max_weight == 0.25
+    assert config.training.losses.vif.ir_hot_weight == 0.18
+    assert config.training.losses.vif.hot_underexposure_weight == 0.04
     assert config.training.losses.vif.coarse_supervision == 0.1
-    assert config.training.losses.infrared.weight == 0.2
+    assert config.training.losses.infrared.weight == 0.08
     assert config.training.losses.moe.enabled
 
     model = build_model(config).train()
@@ -79,5 +81,7 @@ def test_stage7_adaptive_ir_profile_enables_ir_and_moe_supervision() -> None:
     )
     result.total.backward()
     assert torch.isfinite(result.total)
+    assert "fusion/hot_underexposure" in result.components
+    assert "ir_hotness_mean" in result.diagnostics
     assert "cross_modal_ir_weight/s1" in result.diagnostics
     assert "router_ir_importance" in result.diagnostics

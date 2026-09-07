@@ -117,6 +117,8 @@ from tfs_moe_fusion.losses import (
     align_infrared_luminance,
     directional_gradient_loss,
     directional_gradient_targets,
+    hot_object_ir_blend_weight,
+    hot_underexposure_loss,
     luminance,
     mfif_losses,
     normalized_edge_energy,
@@ -163,6 +165,69 @@ def test_adaptive_ir_target_prefers_dark_ir_salient_regions() -> None:
     assert aligned.min() >= 0 and aligned.max() <= 1
     assert weight.max() <= 0.55
     assert weight[..., 3:9, 3:9].mean() > weight[..., 3:9, 15:21].mean()
+
+
+def test_hot_object_ir_admits_thermal_targets_in_bright_and_dark_regions() -> None:
+    visible = torch.full((1, 1, 32, 32), 0.72)
+    visible[..., :16] = 0.20
+    infrared = torch.full_like(visible, 0.08)
+    infrared[..., 4:12, 4:12] = 0.95
+    infrared[..., 20:28, 20:28] = 0.95
+
+    aligned, weight, hotness = hot_object_ir_blend_weight(
+        visible,
+        infrared,
+        max_weight=0.85,
+        darkness_threshold=0.38,
+        darkness_transition=0.12,
+        saliency_weight=0.65,
+        hot_contrast_low=0.08,
+        hot_contrast_high=0.30,
+        hot_weight=0.80,
+        dark_context_weight=0.45,
+        edge_weight=0.08,
+        visible_support_kernel=3,
+        smoothing_kernel=3,
+        energy_normalization="per_sample_mean",
+    )
+
+    bright_hot = weight[..., 20:28, 20:28].mean()
+    bright_background = weight[..., 20:28, 16:20].mean()
+    assert aligned[..., 20:28, 20:28].mean() > visible[..., 20:28, 20:28].mean()
+    assert hotness[..., 4:12, 4:12].mean() > 0.9
+    assert hotness[..., 20:28, 20:28].mean() > 0.9
+    assert bright_hot > 0.7
+    assert bright_hot > bright_background + 0.6
+
+
+def test_hot_underexposure_loss_is_region_normalized_and_differentiable() -> None:
+    visible = torch.full((1, 1, 24, 24), 0.2)
+    infrared = visible.clone()
+    infrared[..., 8:16, 8:16] = 0.9
+    hotness = torch.zeros_like(visible)
+    hotness[..., 8:16, 8:16] = 1
+
+    fused = visible.clone().requires_grad_()
+    loss = hot_underexposure_loss(
+        fused,
+        visible,
+        infrared,
+        hotness,
+        minimum_contrast_retention=0.65,
+    )
+    assert loss > 0.4
+    loss.backward()
+    assert fused.grad is not None and torch.isfinite(fused.grad).all()
+
+    sufficient = visible + 0.65 * (infrared - visible)
+    satisfied_loss = hot_underexposure_loss(
+        sufficient,
+        visible,
+        infrared,
+        hotness,
+        minimum_contrast_retention=0.65,
+    )
+    torch.testing.assert_close(satisfied_loss, torch.zeros_like(satisfied_loss))
 
 
 def test_adaptive_vif_losses_are_finite_and_differentiable() -> None:

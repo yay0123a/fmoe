@@ -484,6 +484,122 @@ def adaptive_ir_blend_weight(
     return infrared_aligned, weight.clamp(0, max_weight)
 
 
+def _smoothstep(value: Tensor, low: float, high: float) -> Tensor:
+    """Return a cubic transition from zero at ``low`` to one at ``high``."""
+    if low < 0 or high <= low:
+        raise ValueError("smoothstep requires 0 <= low < high")
+    position = ((value - low) / (high - low)).clamp(0, 1)
+    return position.square() * (3 - 2 * position)
+
+
+def hot_object_ir_blend_weight(
+    visible: Tensor,
+    infrared: Tensor,
+    *,
+    max_weight: float,
+    darkness_threshold: float,
+    darkness_transition: float,
+    saliency_weight: float,
+    hot_contrast_low: float,
+    hot_contrast_high: float,
+    hot_weight: float,
+    dark_context_weight: float,
+    edge_weight: float,
+    visible_support_kernel: int,
+    smoothing_kernel: int,
+    energy_normalization: str,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Return aligned IR, its admission map, and a positive thermal-hot map.
+
+    Bright thermal targets are useful in both day and night images.  Unlike the
+    dark-region profile, their admission is therefore driven by *positive* IR
+    contrast and is not multiplied by the visible-darkness gate.  The existing
+    darkness/reliability route remains as a conservative contextual fallback.
+    """
+    if not 0.0 <= max_weight <= 1.0:
+        raise ValueError("max_weight must be between 0 and 1")
+    if darkness_transition <= 0:
+        raise ValueError("darkness_transition must be positive")
+    if not 0.0 <= saliency_weight <= 1.0:
+        raise ValueError("saliency_weight must be between 0 and 1")
+    if hot_contrast_low < 0 or hot_contrast_high <= hot_contrast_low:
+        raise ValueError("hot contrast thresholds must satisfy 0 <= low < high")
+    for name, value in (
+        ("hot_weight", hot_weight),
+        ("dark_context_weight", dark_context_weight),
+        ("edge_weight", edge_weight),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be between 0 and 1")
+
+    visible_y = luminance(visible.float())
+    infrared_aligned = align_infrared_luminance(visible_y, infrared)
+    visible_edges = normalized_edge_energy(
+        visible_y, normalization=energy_normalization
+    )
+    infrared_edges = normalized_edge_energy(
+        infrared_aligned, normalization=energy_normalization
+    )
+    visible_support = F.max_pool2d(
+        visible_edges,
+        kernel_size=visible_support_kernel,
+        stride=1,
+        padding=visible_support_kernel // 2,
+    )
+    edge_advantage = infrared_edges / (infrared_edges + visible_support + 1e-6)
+    difference = (infrared_aligned - visible_y).abs()
+    difference_scale = difference.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-3)
+    saliency = 1 - torch.exp(-difference / difference_scale)
+    darkness = torch.sigmoid(
+        (darkness_threshold - visible_y) / darkness_transition
+    )
+    reliability = saliency_weight * saliency + (1 - saliency_weight) * edge_advantage
+
+    positive_contrast = (infrared_aligned - visible_y).clamp_min(0)
+    hotness = _smoothstep(positive_contrast, hot_contrast_low, hot_contrast_high)
+    contextual_weight = (
+        dark_context_weight * darkness * reliability + edge_weight * edge_advantage
+    )
+    padding = smoothing_kernel // 2
+    if padding:
+        contextual_weight = F.avg_pool2d(
+            F.pad(
+                contextual_weight,
+                (padding, padding, padding, padding),
+                mode="replicate",
+            ),
+            kernel_size=smoothing_kernel,
+            stride=1,
+        )
+    weight = torch.maximum(hot_weight * hotness, contextual_weight)
+    return infrared_aligned, weight.clamp(0, max_weight), hotness
+
+
+def hot_underexposure_loss(
+    fused_y: Tensor,
+    visible: Tensor,
+    infrared_aligned: Tensor,
+    hotness: Tensor,
+    *,
+    minimum_contrast_retention: float,
+) -> Tensor:
+    """Penalize thermal-hot regions that retain too little positive contrast.
+
+    Normalizing within each image prevents small people and vehicles from being
+    diluted by a full-frame mean while leaving non-hot background untouched.
+    """
+    if not 0.0 <= minimum_contrast_retention <= 1.0:
+        raise ValueError("minimum_contrast_retention must be between 0 and 1")
+    visible_y = luminance(visible).to(fused_y)
+    positive_contrast = (infrared_aligned.to(fused_y) - visible_y).clamp_min(0)
+    required = minimum_contrast_retention * positive_contrast
+    retained = fused_y - visible_y
+    penalty = torch.relu(required - retained) * hotness.to(fused_y)
+    numerator = penalty.sum(dim=(-2, -1))
+    denominator = hotness.to(fused_y).sum(dim=(-2, -1)).clamp_min(1e-6)
+    return (numerator / denominator).mean()
+
+
 def vif_intensity_target(
     visible: Tensor,
     infrared: Tensor,
@@ -494,6 +610,11 @@ def vif_intensity_target(
     ir_darkness_threshold: float = 0.35,
     ir_darkness_transition: float = 0.1,
     ir_saliency_weight: float = 0.65,
+    ir_hot_contrast_low: float = 0.08,
+    ir_hot_contrast_high: float = 0.3,
+    ir_hot_weight: float = 0.3,
+    ir_dark_context_weight: float = 0.45,
+    ir_edge_weight: float = 0.08,
     visible_support_kernel: int = 3,
     weight_smoothing_kernel: int = 3,
 ) -> tuple[Tensor, Tensor | None]:
@@ -514,6 +635,24 @@ def vif_intensity_target(
             energy_normalization=energy_normalization,
         )
         return visible_y + weight * (infrared_aligned - visible_y), weight
+    if mode == "hot_object_aware":
+        infrared_aligned, weight, _ = hot_object_ir_blend_weight(
+            visible_y,
+            infrared_y,
+            max_weight=ir_max_weight,
+            darkness_threshold=ir_darkness_threshold,
+            darkness_transition=ir_darkness_transition,
+            saliency_weight=ir_saliency_weight,
+            hot_contrast_low=ir_hot_contrast_low,
+            hot_contrast_high=ir_hot_contrast_high,
+            hot_weight=ir_hot_weight,
+            dark_context_weight=ir_dark_context_weight,
+            edge_weight=ir_edge_weight,
+            visible_support_kernel=visible_support_kernel,
+            smoothing_kernel=weight_smoothing_kernel,
+            energy_normalization=energy_normalization,
+        )
+        return visible_y + weight * (infrared_aligned - visible_y).clamp_min(0), weight
     if mode != "gradient_weighted_visible_anchor":
         raise ValueError(f"Unknown VIF intensity mode: {mode}")
     if not 0.0 <= ir_max_weight <= 1.0:
@@ -573,6 +712,11 @@ def vif_losses(
     ir_darkness_threshold: float = 0.35,
     ir_darkness_transition: float = 0.1,
     ir_saliency_weight: float = 0.65,
+    ir_hot_contrast_low: float = 0.08,
+    ir_hot_contrast_high: float = 0.3,
+    ir_hot_weight: float = 0.3,
+    ir_dark_context_weight: float = 0.45,
+    ir_edge_weight: float = 0.08,
     intensity_visible_support_kernel: int = 3,
     intensity_weight_smoothing_kernel: int = 3,
     intensity_weight: Tensor | None = None,
@@ -601,6 +745,25 @@ def vif_losses(
                 smoothing_kernel=intensity_weight_smoothing_kernel,
                 energy_normalization=intensity_energy_normalization,
             )
+    elif intensity_mode == "hot_object_aware":
+        infrared_reference, computed_weight, _ = hot_object_ir_blend_weight(
+            visible_y,
+            infrared,
+            max_weight=ir_intensity_max_weight,
+            darkness_threshold=ir_darkness_threshold,
+            darkness_transition=ir_darkness_transition,
+            saliency_weight=ir_saliency_weight,
+            hot_contrast_low=ir_hot_contrast_low,
+            hot_contrast_high=ir_hot_contrast_high,
+            hot_weight=ir_hot_weight,
+            dark_context_weight=ir_dark_context_weight,
+            edge_weight=ir_edge_weight,
+            visible_support_kernel=intensity_visible_support_kernel,
+            smoothing_kernel=intensity_weight_smoothing_kernel,
+            energy_normalization=intensity_energy_normalization,
+        )
+        if intensity_weight is None:
+            intensity_weight = computed_weight
     if target_intensity is None:
         target_intensity, _ = vif_intensity_target(
             visible_y,
@@ -611,6 +774,11 @@ def vif_losses(
             ir_darkness_threshold=ir_darkness_threshold,
             ir_darkness_transition=ir_darkness_transition,
             ir_saliency_weight=ir_saliency_weight,
+            ir_hot_contrast_low=ir_hot_contrast_low,
+            ir_hot_contrast_high=ir_hot_contrast_high,
+            ir_hot_weight=ir_hot_weight,
+            ir_dark_context_weight=ir_dark_context_weight,
+            ir_edge_weight=ir_edge_weight,
             visible_support_kernel=intensity_visible_support_kernel,
             weight_smoothing_kernel=intensity_weight_smoothing_kernel,
         )
@@ -641,7 +809,7 @@ def vif_losses(
     elif gradient_mode == "adaptive_directional":
         if intensity_weight is None:
             raise ValueError(
-                "adaptive_directional gradient requires intensity_mode=adaptive_dark_ir"
+                "adaptive_directional gradient requires an adaptive IR intensity mode"
             )
         gradient_loss = adaptive_directional_gradient_loss(
             predicted_y,
@@ -665,7 +833,7 @@ def vif_losses(
     elif ssim_mode == "adaptive_source":
         if intensity_weight is None:
             raise ValueError(
-                "adaptive_source SSIM requires intensity_mode=adaptive_dark_ir"
+                "adaptive_source SSIM requires an adaptive IR intensity mode"
             )
         visible_map = ssim_map(predicted_y, visible_y)
         infrared_map = ssim_map(predicted_y, infrared_reference)
@@ -831,6 +999,9 @@ class MultiTaskLossManager(nn.Module):
         weights: dict[str, float] = {}
         skipped: dict[str, str] = {}
         intensity_weight: Tensor | None = None
+        hotness: Tensor | None = None
+        hot_infrared_reference: Tensor | None = None
+        hot_target_reference: Tensor | None = None
         output, batch = context.output, context.batch
         if context.task is TaskType.VIF:
             visible, infrared = self._visible_ir(batch)
@@ -844,9 +1015,40 @@ class MultiTaskLossManager(nn.Module):
                 ir_darkness_threshold=vif_config.ir_darkness_threshold,
                 ir_darkness_transition=vif_config.ir_darkness_transition,
                 ir_saliency_weight=vif_config.ir_saliency_weight,
+                ir_hot_contrast_low=vif_config.ir_hot_contrast_low,
+                ir_hot_contrast_high=vif_config.ir_hot_contrast_high,
+                ir_hot_weight=vif_config.ir_hot_weight,
+                ir_dark_context_weight=vif_config.ir_dark_context_weight,
+                ir_edge_weight=vif_config.ir_edge_weight,
                 visible_support_kernel=vif_config.intensity_visible_support_kernel,
                 weight_smoothing_kernel=(vif_config.intensity_weight_smoothing_kernel),
             )
+            if vif_config.intensity_mode == "hot_object_aware":
+                hot_infrared_reference, intensity_weight, hotness = (
+                    hot_object_ir_blend_weight(
+                        visible,
+                        infrared,
+                        max_weight=vif_config.ir_intensity_max_weight,
+                        darkness_threshold=vif_config.ir_darkness_threshold,
+                        darkness_transition=vif_config.ir_darkness_transition,
+                        saliency_weight=vif_config.ir_saliency_weight,
+                        hot_contrast_low=vif_config.ir_hot_contrast_low,
+                        hot_contrast_high=vif_config.ir_hot_contrast_high,
+                        hot_weight=vif_config.ir_hot_weight,
+                        dark_context_weight=vif_config.ir_dark_context_weight,
+                        edge_weight=vif_config.ir_edge_weight,
+                        visible_support_kernel=(
+                            vif_config.intensity_visible_support_kernel
+                        ),
+                        smoothing_kernel=(
+                            vif_config.intensity_weight_smoothing_kernel
+                        ),
+                        energy_normalization=(
+                            vif_config.intensity_energy_normalization
+                        ),
+                    )
+                )
+                hot_target_reference = target_intensity
             final_vif = vif_losses(
                 output.fused,
                 visible,
@@ -859,6 +1061,11 @@ class MultiTaskLossManager(nn.Module):
                 ir_darkness_threshold=vif_config.ir_darkness_threshold,
                 ir_darkness_transition=vif_config.ir_darkness_transition,
                 ir_saliency_weight=vif_config.ir_saliency_weight,
+                ir_hot_contrast_low=vif_config.ir_hot_contrast_low,
+                ir_hot_contrast_high=vif_config.ir_hot_contrast_high,
+                ir_hot_weight=vif_config.ir_hot_weight,
+                ir_dark_context_weight=vif_config.ir_dark_context_weight,
+                ir_edge_weight=vif_config.ir_edge_weight,
                 intensity_visible_support_kernel=(
                     vif_config.intensity_visible_support_kernel
                 ),
@@ -887,6 +1094,28 @@ class MultiTaskLossManager(nn.Module):
                     "fusion/color": vif_config.color,
                 }
             )
+            if (
+                hotness is not None
+                and hot_infrared_reference is not None
+                and vif_config.hot_underexposure_weight > 0
+            ):
+                predicted_y = (
+                    output.fused_y
+                    if output.fused_y is not None
+                    else luminance(output.fused)
+                )
+                components["fusion/hot_underexposure"] = hot_underexposure_loss(
+                    predicted_y,
+                    visible,
+                    hot_infrared_reference,
+                    hotness,
+                    minimum_contrast_retention=(
+                        vif_config.hot_minimum_contrast_retention
+                    ),
+                )
+                weights["fusion/hot_underexposure"] = (
+                    vif_config.hot_underexposure_weight
+                )
             if output.coarse is not None:
                 coarse = (
                     final_vif
@@ -906,6 +1135,11 @@ class MultiTaskLossManager(nn.Module):
                         ir_darkness_threshold=vif_config.ir_darkness_threshold,
                         ir_darkness_transition=vif_config.ir_darkness_transition,
                         ir_saliency_weight=vif_config.ir_saliency_weight,
+                        ir_hot_contrast_low=vif_config.ir_hot_contrast_low,
+                        ir_hot_contrast_high=vif_config.ir_hot_contrast_high,
+                        ir_hot_weight=vif_config.ir_hot_weight,
+                        ir_dark_context_weight=vif_config.ir_dark_context_weight,
+                        ir_edge_weight=vif_config.ir_edge_weight,
                         intensity_visible_support_kernel=(
                             vif_config.intensity_visible_support_kernel
                         ),
@@ -956,7 +1190,14 @@ class MultiTaskLossManager(nn.Module):
             self._focus(context, components, weights, skipped)
         else:
             self._semantic(context, components, weights, skipped)
-        self._shared(context, components, weights, skipped)
+        self._shared(
+            context,
+            components,
+            weights,
+            skipped,
+            hotness=hotness,
+            hot_target_reference=hot_target_reference,
+        )
         weighted = {
             name: value * weight * self._phase_multiplier(name, context)
             for name, value in components.items()
@@ -1008,6 +1249,15 @@ class MultiTaskLossManager(nn.Module):
                         "ir_intensity_weight_max": intensity_weight.amax().detach(),
                         "ir_intensity_weight_active_ratio": (
                             (intensity_weight > 0).float().mean().detach()
+                        ),
+                    }
+                )
+            if hotness is not None:
+                diagnostics.update(
+                    {
+                        "ir_hotness_mean": hotness.mean().detach(),
+                        "ir_hotness_active_ratio": (
+                            (hotness > 0).float().mean().detach()
                         ),
                     }
                 )
@@ -1137,7 +1387,16 @@ class MultiTaskLossManager(nn.Module):
             )
             weights["semantic/improvement"] = self.config.semantic.improvement_weight
 
-    def _shared(self, context, components, weights, skipped) -> None:
+    def _shared(
+        self,
+        context,
+        components,
+        weights,
+        skipped,
+        *,
+        hotness: Tensor | None = None,
+        hot_target_reference: Tensor | None = None,
+    ) -> None:
         output = context.output
         if output.router_diagnostics and (
             self.config.frequency.enabled
@@ -1197,30 +1456,41 @@ class MultiTaskLossManager(nn.Module):
                     self.config.moe.weight * self.config.moe.entropy_weight
                 )
         if self.config.infrared.enabled and context.task is TaskType.VIF:
-            _, infrared = self._visible_ir(context.batch)
-            saliency = next(
-                (
-                    item.auxiliary.get("ir_saliency")
-                    for item in output.router_diagnostics
-                    if item.auxiliary.get("ir_saliency") is not None
-                ),
-                None,
-            )
-            if saliency is None:
-                saliency = luminance(infrared)
-            if self.config.infrared.detach_saliency:
-                saliency = saliency.detach()
-            saliency = torch.nn.functional.interpolate(
-                saliency, output.fused.shape[-2:], mode="bilinear", align_corners=False
-            )
             predicted_y = (
                 output.fused_y
                 if output.fused_y is not None
                 else luminance(output.fused)
             )
-            components["infrared/preservation"] = (
-                (predicted_y - luminance(infrared)).abs() * saliency
-            ).mean()
+            if hotness is not None and hot_target_reference is not None:
+                pixel_error = (
+                    predicted_y - hot_target_reference.to(predicted_y)
+                ).abs()
+                numerator = (pixel_error * hotness.to(predicted_y)).sum(dim=(-2, -1))
+                denominator = hotness.to(predicted_y).sum(dim=(-2, -1)).clamp_min(1e-6)
+                components["infrared/preservation"] = (numerator / denominator).mean()
+            else:
+                _, infrared = self._visible_ir(context.batch)
+                saliency = next(
+                    (
+                        item.auxiliary.get("ir_saliency")
+                        for item in output.router_diagnostics
+                        if item.auxiliary.get("ir_saliency") is not None
+                    ),
+                    None,
+                )
+                if saliency is None:
+                    saliency = luminance(infrared)
+                if self.config.infrared.detach_saliency:
+                    saliency = saliency.detach()
+                saliency = torch.nn.functional.interpolate(
+                    saliency,
+                    output.fused.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                components["infrared/preservation"] = (
+                    (predicted_y - luminance(infrared)).abs() * saliency
+                ).mean()
             weights["infrared/preservation"] = self.config.infrared.weight
         paired = context.aux.get("paired_output")
         if self.config.consistency.enabled and paired is not None:

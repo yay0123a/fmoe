@@ -112,9 +112,10 @@ The configuration reads `data/msrs/train/{vi,ir}` for VIF and
 `data/mfif/msrs/train/{dof_stack,AiF,depth}` for MFIF. Change
 `CUDA_VISIBLE_DEVICES` to the GPU ID assigned to this job.
 
-`configs/stage7_adaptive_ir.yaml` is the follow-up MSRS profile for preserving
-IR structure in dark and IR-salient regions while keeping visible chroma. It
-uses aligned IR luminance, adaptive intensity/gradient/SSIM targets, and weak
+`configs/stage7_adaptive_ir.yaml` preserves positive, thermally hot targets
+(such as people and vehicles) in both day and night images while keeping the
+non-hot background anchored to visible luminance and chroma. It uses aligned
+IR luminance, hot-target-aware intensity/gradient/SSIM supervision, and weak
 valid-expert MoE balancing. It uses batch size 4 with one accumulation step,
 keeping the effective batch size at 4. Deterministic mode is disabled to allow
 cuDNN autotuning; repeat runs may differ numerically even with the same seed.

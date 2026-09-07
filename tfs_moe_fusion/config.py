@@ -262,6 +262,13 @@ class VIFFusionLossConfig:
     ir_darkness_threshold: float = 0.35
     ir_darkness_transition: float = 0.1
     ir_saliency_weight: float = 0.65
+    ir_hot_contrast_low: float = 0.08
+    ir_hot_contrast_high: float = 0.3
+    ir_hot_weight: float = 0.3
+    ir_dark_context_weight: float = 0.45
+    ir_edge_weight: float = 0.08
+    hot_underexposure_weight: float = 0.0
+    hot_minimum_contrast_retention: float = 0.65
     intensity_visible_support_kernel: int = 3
     intensity_weight_smoothing_kernel: int = 3
     gradient_mode: str = "magnitude_max"
@@ -1131,10 +1138,12 @@ class ProjectConfig:
             "pixel_max",
             "gradient_weighted_visible_anchor",
             "adaptive_dark_ir",
+            "hot_object_aware",
         }:
             raise ConfigurationError(
                 "VIF intensity_mode must be pixel_max or "
-                "gradient_weighted_visible_anchor or adaptive_dark_ir"
+                "gradient_weighted_visible_anchor, adaptive_dark_ir, or "
+                "hot_object_aware"
             )
         if vif_loss.intensity_energy_normalization not in {
             "none",
@@ -1153,6 +1162,32 @@ class ProjectConfig:
             raise ConfigurationError("VIF ir_darkness_transition must be positive")
         if not 0.0 <= vif_loss.ir_saliency_weight <= 1.0:
             raise ConfigurationError("VIF ir_saliency_weight must be in [0, 1]")
+        if not (
+            0.0 <= vif_loss.ir_hot_contrast_low < vif_loss.ir_hot_contrast_high
+        ):
+            raise ConfigurationError(
+                "VIF ir_hot_contrast_low must be non-negative and below "
+                "ir_hot_contrast_high"
+            )
+        for name in (
+            "ir_hot_weight",
+            "ir_dark_context_weight",
+            "ir_edge_weight",
+            "hot_minimum_contrast_retention",
+        ):
+            if not 0.0 <= getattr(vif_loss, name) <= 1.0:
+                raise ConfigurationError(f"VIF {name} must be in [0, 1]")
+        if (
+            vif_loss.intensity_mode == "hot_object_aware"
+            and vif_loss.ir_hot_weight > vif_loss.ir_intensity_max_weight
+        ):
+            raise ConfigurationError(
+                "VIF ir_hot_weight cannot exceed ir_intensity_max_weight"
+            )
+        if vif_loss.hot_underexposure_weight < 0:
+            raise ConfigurationError(
+                "VIF hot_underexposure_weight cannot be negative"
+            )
         for name, kernel in (
             (
                 "intensity_visible_support_kernel",

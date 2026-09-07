@@ -112,14 +112,26 @@ def load_checkpoint(
     if optimizer is not None and payload.get("optimizer") is not None:
         optimizer.load_state_dict(payload["optimizer"])
     if restore_rng:
-        torch.set_rng_state(payload["rng"]["torch"])
+        # ``map_location`` applies to every tensor in the checkpoint, including
+        # RNG states.  CPU RNG state restoration only accepts a CPU ByteTensor,
+        # so move device-mapped states back before handing them to PyTorch.
+        torch.set_rng_state(payload["rng"]["torch"].detach().cpu())
         if payload["rng"].get("python") is not None:
             random.setstate(payload["rng"]["python"])
         if payload["rng"].get("numpy") is not None:
             np.random.set_state(payload["rng"]["numpy"])
         cuda_state = payload["rng"].get("cuda")
         if cuda_state is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(cuda_state)
+            # A checkpoint may have been saved while more GPUs were visible.
+            # ``set_rng_state_all`` indexes the current CUDA generators, so
+            # passing surplus states raises once it reaches a hidden device.
+            visible_cuda_count = torch.cuda.device_count()
+            torch.cuda.set_rng_state_all(
+                [
+                    state.detach().cpu()
+                    for state in cuda_state[:visible_cuda_count]
+                ]
+            )
 
     return CheckpointLoadReport(
         path=source,
@@ -1537,6 +1549,8 @@ class Trainer:
                             "ir_intensity_weight_mean",
                             "ir_intensity_weight_max",
                             "ir_intensity_weight_active_ratio",
+                            "ir_hotness_mean",
+                            "ir_hotness_active_ratio",
                             "router_ir_importance",
                             "router_ir_hard_load",
                             "router_ir_weighted_contribution_rms",
