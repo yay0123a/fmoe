@@ -44,17 +44,17 @@ CITYSCAPES_COLORS = np.array(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("configs/stage7_adaptive_ir.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("configs/stage9_specialist_feedback_space.yaml"))
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("runs/stage7_msrs_adaptive_ir/checkpoints/latest.pt"),
+        default=Path("runs/stage9_msrs_specialist_feedback_space/checkpoints/latest.pt"),
     )
     parser.add_argument("--input-a", type=Path,default=Path("data/msrs/test/vi/00918N.png")) #vi
     parser.add_argument("--input-b", type=Path,default=Path("data/msrs/test/ir/00918N.png")) #ir
     #parser.add_argument("--input-a", type=Path,default=Path("data/mfif/semantic_rt/dof_stack/img_00125/0.jpg")) #n
     #parser.add_argument("--input-b", type=Path,default=Path("data/mfif/semantic_rt/dof_stack/img_00125/1.jpg")) #f
-    parser.add_argument("--output", type=Path, default=Path("runs/stage7"))
+    parser.add_argument("--output", type=Path, default=Path("runs/stage9"))
     parser.add_argument(
         "--task", required=True, choices=[item.value for item in TaskType]
     )
@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--device",
         #default=None,
-        default="cuda:5",
+        default="cuda:6",
         help="Override training.device from the config (for example cpu or cuda:1)",
     )
     parser.add_argument("--save-coarse", action="store_true")

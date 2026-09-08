@@ -1,0 +1,41 @@
+_base_: stage7_adaptive_ir.yaml
+
+experiment:
+  name: stage8_msrs_router_ir_evidence
+
+model:
+  moe:
+    router_ir_evidence_enabled: true
+    source_aware_expert_evidence_enabled: true
+
+training:
+  task_update_policy:
+    freeze:
+      _replace_: true
+      vif: []
+      mfif:
+        - rgb_stem
+        - ir_stem
+        - gray_stem
+        - source_backbone
+        - fused_backbone
+        - cross_modal_fusion
+        - shared_backbone
+        - shared_common
+        - shared_ir
+        - core_common_scale
+        - feedback_common_scale
+        - core_specialist_scale
+        - feedback_specialist_scale
+        - coarse_decoder_trunk
+        - vif_coarse_head
+        - guidance_pyramid
+        - refinement_decoder_trunk
+        - vif_residual_head
+    gradient_scales:
+      mfif:
+        shared_low: 0.20
+        core_site_adapters: 0.20
+        feedback_site_adapters: 0.20
+        core_routers: 0.25
+        feedback_routers: 0.25

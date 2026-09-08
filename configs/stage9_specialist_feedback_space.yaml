@@ -1,0 +1,23 @@
+_base_: stage8_router_ir_evidence.yaml
+
+experiment:
+  name: stage9_msrs_specialist_feedback_space
+
+model:
+  moe:
+    specialist_scale_init: 0.05
+
+training:
+  losses:
+    vif:
+      coarse_supervision: 0.05
+  phases:
+    phases:
+      - {name: vif_base, start: 0, end: 5, loss_multipliers: {}}
+      - {name: vif_mfif_joint, start: 5, end: 35, loss_multipliers: {}}
+      - {name: vif_dominant, start: 35, end: 45, loss_multipliers: {}}
+      - name: vif_convergence
+        start: 45
+        end: 50
+        loss_multipliers:
+          fusion/coarse: 0.0

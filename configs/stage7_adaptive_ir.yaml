@@ -16,30 +16,54 @@ training:
       coarse_supervision: 0.1
       intensity_mode: hot_object_aware
       intensity_energy_normalization: per_sample_mean
-      ir_intensity_max_weight: 0.25
+      ir_intensity_max_weight: 0.40
       ir_darkness_threshold: 0.32
       ir_darkness_transition: 0.10
       ir_saliency_weight: 0.65
       ir_hot_contrast_low: 0.20
       ir_hot_contrast_high: 0.50
-      ir_hot_weight: 0.18
-      ir_dark_context_weight: 0.10
-      ir_edge_weight: 0.015
-      hot_underexposure_weight: 0.04
-      hot_minimum_contrast_retention: 0.18
+      ir_hot_weight: 0.40
+      ir_dark_context_weight: 0.20
+      ir_edge_weight: 0.0
+      hot_underexposure_weight: 0.08
+      hot_minimum_contrast_retention: 0.25
+      ir_structure_decoupled: true
+      highlight_saturation_threshold: 0.90
+      highlight_saturation_transition: 0.04
+      highlight_rgb_clip_threshold: 0.98
+      highlight_local_std_threshold: 0.025
+      highlight_tone_knee: 0.75
+      highlight_tone_strength: 6.0
+      highlight_ir_detail_scale: 0.06
+      highlight_reconstruction_weight: 0.04
+      highlight_gradient_weight: 0.02
+      ir_structure_max_weight: 0.80
+      structure_ssim_scale: 0.40
       intensity_visible_support_kernel: 3
       intensity_weight_smoothing_kernel: 3
-      gradient_mode: adaptive_directional
+      gradient_mode: independent_directional
       gradient_charbonnier_epsilon: 0.001
-      ssim_mode: adaptive_source
+      ssim_mode: structure_adaptive
     infrared:
       enabled: true
-      weight: 0.08
+      weight: 0.12
       detach_saliency: true
       saliency_alignment: 0.1
     moe:
-      enabled: true
+      enabled: false
       weight: 0.003
       soft_balance_weight: 1.0
       switch_balance_weight: 0.05
       entropy_enabled: false
+    moe_starvation:
+      enabled: true
+      threshold: 0.02
+      patience_steps: 500
+      release_threshold: 0.03
+      release_patience_steps: 100
+      ema_decay: 0.99
+      weight: 0.0001
+      max_total_weight: 0.0005
+      ramp_steps: 100
+      evidence_threshold: 0.05
+      per_task: true

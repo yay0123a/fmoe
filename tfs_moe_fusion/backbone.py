@@ -56,7 +56,12 @@ from itertools import pairwise
 
 from torch import nn
 
-from tfs_moe_fusion.types import FusionBatch, RouterDiagnostics, SpectralStatistics
+from tfs_moe_fusion.types import (
+    FusionBatch,
+    RouterBalanceState,
+    RouterDiagnostics,
+    SpectralStatistics,
+)
 
 
 @dataclass(slots=True)
@@ -105,6 +110,8 @@ class BackboneOutput:
     gamut_projection_mask: Tensor | None
     spectral_statistics: tuple[SpectralStatistics, ...]
     router_diagnostics: tuple[RouterDiagnostics, ...]
+    router_balance_states: tuple[RouterBalanceState, ...]
+    ir_router_evidence: Tensor | None
     padding: object
     debug: dict[str, object] = field(default_factory=dict)
 
@@ -136,6 +143,7 @@ from tfs_moe_fusion.frequency import (
     FrequencyFoundationBlock,
     SpectralStatsExtractor,
 )
+from tfs_moe_fusion.ir_evidence import build_router_ir_evidence
 from tfs_moe_fusion.moe import (
     ExpertContext,
     FunctionalMoEBlock,
@@ -429,6 +437,16 @@ class CustomMultiscaleBackbone(FusionBackbone):
         self.task_embedding = (
             TaskEmbedding(moe.task_embedding_dim) if moe is not None else None
         )
+        self.router_ir_evidence_config = (
+            (
+                moe.router_ir_local_contrast_kernel,
+                moe.router_ir_edge_dominance_ratio,
+                moe.router_ir_edge_transition,
+                moe.router_ir_edge_min_magnitude,
+            )
+            if moe is not None and moe.router_ir_evidence_enabled
+            else None
+        )
         self.moe_blocks = nn.ModuleDict()
         if moe is not None and moe.enabled:
             if moe.shared_pool_enabled != (shared_expert_bank is not None):
@@ -474,10 +492,24 @@ class CustomMultiscaleBackbone(FusionBackbone):
         image_b, padding_b = self.padder.pad(batch.source_b.image)
         if padding != padding_b:
             raise RuntimeError("Source padding unexpectedly differs")
+        ir_router_evidence = None
+        if self.router_ir_evidence_config is not None:
+            kernel, ratio, transition, minimum = self.router_ir_evidence_config
+            ir_router_evidence = build_router_ir_evidence(
+                image_a,
+                image_b,
+                batch.source_a.modality,
+                batch.source_b.modality,
+                batch.task,
+                local_contrast_kernel=kernel,
+                edge_dominance_ratio=ratio,
+                edge_transition=transition,
+                edge_min_magnitude=minimum,
+            )
         feature_a = self.stems(image_a, batch.source_a.modality)
         feature_b = self.stems(image_b, batch.source_b.modality)
         source_a, source_b, fused_values = [], [], []
-        diagnostics, cross_modal = [], []
+        diagnostics, balance_states, cross_modal = [], [], []
         spectral = [
             self.stats_extractor(image_a, "input_a"),
             self.stats_extractor(image_b, "input_b"),
@@ -521,6 +553,7 @@ class CustomMultiscaleBackbone(FusionBackbone):
                         feature_a,
                         feature_b,
                         stage_name=f"{stage}.moe{block_index}",
+                        ir_evidence=ir_router_evidence,
                     )
                     expert_context = ExpertContext(
                         batch.task,
@@ -531,10 +564,12 @@ class CustomMultiscaleBackbone(FusionBackbone):
                         stage_name=f"{stage}.moe{block_index}",
                         stage_guidance_feature=fused.new_zeros(fused.shape),
                     )
-                    fused, router_diagnostics = moe_block(
+                    moe_output = moe_block(
                         fused, router_context, expert_context
                     )
-                    diagnostics.append(router_diagnostics)
+                    fused = moe_output.feature
+                    diagnostics.append(moe_output.diagnostics)
+                    balance_states.append(moe_output.balance_state)
             elif stage in self.frequency_blocks:
                 fused, _ = self.frequency_blocks[stage](fused, f"fused_{stage}")
                 stats = self.stats_extractor(fused, f"fused_{stage}")
@@ -600,6 +635,8 @@ class CustomMultiscaleBackbone(FusionBackbone):
             ),
             spectral_statistics=tuple(spectral),
             router_diagnostics=tuple(diagnostics),
+            router_balance_states=tuple(balance_states),
+            ir_router_evidence=ir_router_evidence,
             padding=padding,
             debug=debug,
         )

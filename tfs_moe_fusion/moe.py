@@ -31,6 +31,7 @@ class RouterContext:
     low_energy: Tensor | None = None
     high_energy: Tensor | None = None
     focus_reliability: Tensor | None = None
+    ir_evidence: Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.frequency_stats is None:
@@ -65,7 +66,7 @@ class RouterOutput:
 
 import torch
 
-from tfs_moe_fusion.types import RouterDiagnostics
+from tfs_moe_fusion.types import RouterBalanceState, RouterDiagnostics
 
 
 def summarize_expert_usage(values: tuple[RouterDiagnostics, ...]) -> torch.Tensor:
@@ -386,10 +387,15 @@ class DetailEvidence:
 class InfraredEvidence:
     delta: RelativeDelta
     advantage: RelativeDelta
+    saliency: Tensor
+    edge: Tensor
 
     def index_select(self, indices: Tensor) -> InfraredEvidence:
         return InfraredEvidence(
-            self.delta.index_select(indices), self.advantage.index_select(indices)
+            self.delta.index_select(indices),
+            self.advantage.index_select(indices),
+            self.saliency.index_select(0, indices),
+            self.edge.index_select(0, indices),
         )
 
 
@@ -460,6 +466,9 @@ class SiteEvidence:
     router_boundary: Tensor
     router_boundary_available: Tensor
     router_uncertainty: Tensor
+    router_ir_advantage: Tensor
+    router_ir_saliency: Tensor
+    router_ir_edge: Tensor
     task: TaskType
     modality_a: ModalityType
     modality_b: ModalityType
@@ -478,18 +487,14 @@ class SiteEvidenceBuilder:
         version: str = "stage3",
         relative_delta_clip: float = 5.0,
         detach_focus_evidence: bool = True,
+        source_aware_evidence: bool = False,
     ) -> None:
         object.__setattr__(self, "_dwt", dwt)
         self.availability = availability
         self.version = version
         self.relative_delta_clip = relative_delta_clip
         self.detach_focus_evidence = detach_focus_evidence
-
-    @staticmethod
-    def project_optional_source(
-        projection: nn.Module, source: Tensor | None
-    ) -> Tensor | None:
-        return projection(source) if source is not None else None
+        self.source_aware_evidence = source_aware_evidence
 
     @staticmethod
     def _align(value: Tensor, size: tuple[int, int]) -> Tensor:
@@ -574,6 +579,8 @@ class SiteEvidenceBuilder:
         focus_b: Tensor,
         focus_confidence: Tensor,
         focus_available: bool,
+        ir_saliency: Tensor,
+        ir_edge: Tensor,
         task: TaskType,
         modality_a: ModalityType,
         modality_b: ModalityType,
@@ -614,7 +621,16 @@ class SiteEvidenceBuilder:
         )
         infrared = InfraredEvidence(
             relative(infrared_feature - feature, feature),
-            relative((infrared_feature - other_feature).abs(), feature),
+            relative(
+                (
+                    infrared_feature - other_feature
+                    if self.source_aware_evidence
+                    else (infrared_feature - other_feature).abs()
+                ),
+                feature,
+            ),
+            ir_saliency,
+            ir_edge,
         )
         if focus_available:
             confidence = focus_confidence
@@ -718,6 +734,17 @@ class SiteEvidenceBuilder:
                 focus_b.detach(),
                 focus_confidence.detach(),
             )
+        if router_context.ir_evidence is None:
+            expert_ir_evidence = feature.new_zeros(batch, 3, *size)
+        else:
+            if router_context.ir_evidence.shape[1] != 3:
+                raise ValueError("Router IR evidence must have three channels")
+            expert_ir_evidence = functional.interpolate(
+                router_context.ir_evidence.detach().float(),
+                size=size,
+                mode="bilinear",
+                align_corners=False,
+            ).to(feature.dtype)
 
         with torch.autocast(device_type=feature.device.type, enabled=False):
             value = feature.float()
@@ -755,6 +782,9 @@ class SiteEvidenceBuilder:
                 router_uncertainty, _ = self._router_map(
                     router_context.semantic_uncertainty, value, grid_size
                 )
+            router_ir_evidence = functional.adaptive_avg_pool2d(
+                expert_ir_evidence.float(), grid_size
+            )
         diagnostics = (
             {"semantic_boundary": boundary.detach()}
             if boundary is not None
@@ -786,6 +816,8 @@ class SiteEvidenceBuilder:
                         focus_b,
                         focus_confidence,
                         focus_available_for_expert,
+                        expert_ir_evidence[:, 1:2],
+                        expert_ir_evidence[:, 2:3],
                         router_context.task,
                         router_context.modality_a,
                         router_context.modality_b,
@@ -802,6 +834,9 @@ class SiteEvidenceBuilder:
             router_boundary,
             boundary_available,
             router_uncertainty,
+            router_ir_evidence[:, :1],
+            router_ir_evidence[:, 1:2],
+            router_ir_evidence[:, 2:3],
             router_context.task,
             router_context.modality_a,
             router_context.modality_b,
@@ -1049,9 +1084,9 @@ class Stage4InfraredSaliencyExpert(FunctionalExpert):
 
     def __init__(self, channels: int, expansion: int = 2) -> None:
         super().__init__()
-        self.condition = nn.Conv2d(channels * 2, channels, 1)
+        self.condition = nn.Conv2d(channels * 2 + 2, channels, 1)
         self.saliency = nn.Sequential(
-            nn.Conv2d(channels * 3, channels, 3, padding=1),
+            nn.Conv2d(channels * 3 + 2, channels, 3, padding=1),
             nn.Conv2d(channels, 1, 1),
             nn.Sigmoid(),
         )
@@ -1063,14 +1098,21 @@ class Stage4InfraredSaliencyExpert(FunctionalExpert):
             evidence.delta.value,
             evidence.advantage.value,
         )
-        condition = self.condition(torch.cat((delta, advantage), dim=1))
-        saliency = self.saliency(torch.cat((tensor, delta, advantage), dim=1))
+        physical = torch.cat((evidence.saliency, evidence.edge), dim=1).to(tensor)
+        condition = self.condition(torch.cat((delta, advantage, physical), dim=1))
+        saliency = self.saliency(
+            torch.cat((tensor, delta, advantage, physical), dim=1)
+        )
         residual = self.refine(saliency * condition) + self.delta_gain * delta
         return ExpertOutput(
             residual,
             self.expert_type,
             _valid(tensor),
-            diagnostics={"saliency": saliency},
+            diagnostics={
+                "saliency": saliency,
+                "thermal_saliency": evidence.saliency.detach(),
+                "ir_only_edge": evidence.edge.detach(),
+            },
         )
 
 
@@ -1265,10 +1307,16 @@ class MoESiteAdapter(nn.Module):
         expert_dim: int,
         expert_version: str = "stage3",
         semantic_guidance_source: str = "evidence_maps",
+        source_aware_evidence: bool = False,
     ) -> None:
         super().__init__()
         self.feature_in = nn.Conv2d(stage_channels, expert_dim, 1)
-        self.source_in = nn.Conv2d(stage_channels, expert_dim, 1)
+        self.source_in = (
+            None
+            if source_aware_evidence
+            else nn.Conv2d(stage_channels, expert_dim, 1)
+        )
+        self.source_aware_evidence = source_aware_evidence
         self.guidance_in = (
             nn.Conv2d(
                 stage_channels if semantic_guidance_source == "stage_feature" else 2,
@@ -1281,7 +1329,11 @@ class MoESiteAdapter(nn.Module):
         self.delta_out = nn.Conv2d(expert_dim, stage_channels, 1, bias=False)
 
     def project_source(self, source: Tensor) -> Tensor:
-        return self.source_in(source)
+        projection = self.feature_in if self.source_in is None else self.source_in
+        return projection(source)
+
+    def project_feature(self, feature: Tensor) -> Tensor:
+        return self.feature_in(feature)
 
     def project_guidance(self, guidance: Tensor) -> Tensor:
         return self.guidance_in(guidance)
@@ -1676,11 +1728,13 @@ class SiteSpatialRouter(nn.Module):
         temperature: float,
         task_embedding: TaskEmbedding | None,
         modality_embedding_dim: int,
+        ir_evidence_enabled: bool = False,
     ) -> None:
         super().__init__()
         self.expert_types = tuple(ExpertType.parse(item) for item in experts)
         self.expert_count = len(experts)
         self.patch_size, self.temperature = patch_size, temperature
+        self.ir_evidence_enabled = ir_evidence_enabled
         if task_embedding is None:
             self.owned_task_embedding = TaskEmbedding(hidden_channels)
             object.__setattr__(self, "_shared_task_embedding", None)
@@ -1725,6 +1779,19 @@ class SiteSpatialRouter(nn.Module):
             modality = self.modality_projection(
                 self.modality_embedding.weight[pair].float()[None].expand(batch, -1)
             )[:, :, None, None].expand(-1, -1, *grid_size)
+            task_specific = (
+                (
+                    evidence.router_ir_advantage,
+                    evidence.router_ir_saliency,
+                    evidence.router_ir_edge,
+                )
+                if self.ir_evidence_enabled
+                else (
+                    evidence.router_boundary,
+                    evidence.router_boundary_available,
+                    evidence.router_uncertainty,
+                )
+            )
             logits = self.body(
                 torch.cat(
                     (
@@ -1736,9 +1803,7 @@ class SiteSpatialRouter(nn.Module):
                         evidence.router_high_energy,
                         evidence.router_focus,
                         evidence.router_focus_available,
-                        evidence.router_boundary,
-                        evidence.router_boundary_available,
-                        evidence.router_uncertainty,
+                        *task_specific,
                     ),
                     dim=1,
                 )
@@ -1768,6 +1833,10 @@ class SiteSpatialRouter(nn.Module):
                     dim=(-2, -1), unbiased=False
                 ).mean().detach(),
                 "router_grid_size": grid_size,
+                "router/ir_evidence_enabled": self.ir_evidence_enabled,
+                "router/ir_advantage_mean": evidence.router_ir_advantage.mean().detach(),
+                "router/ir_saliency_mean": evidence.router_ir_saliency.mean().detach(),
+                "router/ir_edge_mean": evidence.router_ir_edge.mean().detach(),
             },
         )
 
@@ -1787,14 +1856,51 @@ class MoEOutput:
     residual: Tensor
     router: RouterOutput
     spatial_gates: Tensor | None
-    expert_outputs: dict[str, ExpertOutput] | None = None
-    diagnostics: RouterDiagnostics | None = None
+    expert_outputs: dict[str, ExpertOutput] | None
+    diagnostics: RouterDiagnostics
     aux: dict[str, Any] = field(default_factory=dict)
 
-    def __iter__(self):
-        """Preserve the established ``feature, diagnostics = block(...)`` API."""
-        yield self.feature
-        yield self.diagnostics
+    @property
+    def balance_state(self) -> RouterBalanceState:
+        names = self.diagnostics.auxiliary.get("expert_names", ())
+        return RouterBalanceState(
+            probabilities=self.router.probabilities,
+            valid_expert_mask=self.router.valid_expert_mask,
+            hard_load=(
+                self.router.hard_load.detach()
+                if self.router.hard_load is not None
+                else None
+            ),
+            block_id=self.diagnostics.block_id,
+            expert_names=tuple(str(name) for name in names),
+            opportunity_weights=self.router.auxiliary.get(
+                "starvation_opportunity"
+            ),
+        )
+
+
+def _router_diagnostics(
+    block_id: str,
+    routing: RouterOutput,
+    auxiliary: dict[str, Any],
+) -> RouterDiagnostics:
+    """Build a logging-only view without retaining the router graph."""
+
+    detach = lambda value: value.detach() if value is not None else None
+    return RouterDiagnostics(
+        block_id=block_id,
+        logits=routing.logits.detach(),
+        probabilities=routing.probabilities.detach(),
+        topk_indices=detach(routing.topk_indices),
+        topk_weights=detach(routing.topk_weights),
+        valid_expert_mask=routing.valid_expert_mask.detach(),
+        spatial_gates=detach(routing.spatial_gates),
+        branch_weights=detach(routing.branch_weights),
+        entropy=detach(routing.entropy),
+        importance=detach(routing.importance),
+        hard_load=detach(routing.hard_load),
+        auxiliary=auxiliary,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1866,6 +1972,7 @@ class FunctionalMoEBlock(nn.Module):
                     shared_expert_bank.channels,
                     config.functional_expert_version,
                     config.semantic_guidance_source,
+                    config.source_aware_expert_evidence_enabled,
                 )
                 router_channels = shared_expert_bank.channels
             else:
@@ -1901,6 +2008,7 @@ class FunctionalMoEBlock(nn.Module):
                 config.router_temperature,
                 task_embedding,
                 config.modality_embedding_dim,
+                config.router_ir_evidence_enabled,
             )
         else:
             self.router = JointTopKRouter(
@@ -1925,6 +2033,7 @@ class FunctionalMoEBlock(nn.Module):
             config.functional_expert_version,
             config.relative_delta_clip,
             config.detach_focus_evidence,
+            config.source_aware_expert_evidence_enabled,
         )
         self.sparse_execution = config.sparse_execution
         self.train_execution = config.train_execution
@@ -2090,20 +2199,7 @@ class FunctionalMoEBlock(nn.Module):
             auxiliary["expert_residuals"] = {
                 name: value.residual for name, value in retained_outputs.items()
             }
-        diagnostics = RouterDiagnostics(
-            block_id=self.block_id,
-            logits=routing.logits,
-            probabilities=routing.probabilities,
-            topk_indices=routing.topk_indices,
-            topk_weights=routing.topk_weights,
-            valid_expert_mask=routing.valid_expert_mask,
-            spatial_gates=routing.spatial_gates,
-            branch_weights=routing.branch_weights,
-            entropy=routing.entropy,
-            importance=routing.importance,
-            hard_load=routing.hard_load,
-            auxiliary=auxiliary,
-        )
+        diagnostics = _router_diagnostics(self.block_id, routing, auxiliary)
         return MoEOutput(
             output,
             scaled_residual,
@@ -2127,12 +2223,16 @@ class FunctionalMoEBlock(nn.Module):
         return_expert_outputs: bool,
     ) -> MoEOutput:
         adapter = self.adapter
-        canonical_feature = adapter.feature_in(tensor)
-        source_a = self.site_evidence_builder.project_optional_source(
-            adapter.source_in, expert_context.source_a_feature
+        canonical_feature = adapter.project_feature(tensor)
+        source_a = (
+            adapter.project_source(expert_context.source_a_feature)
+            if expert_context.source_a_feature is not None
+            else None
         )
-        source_b = self.site_evidence_builder.project_optional_source(
-            adapter.source_in, expert_context.source_b_feature
+        source_b = (
+            adapter.project_source(expert_context.source_b_feature)
+            if expert_context.source_b_feature is not None
+            else None
         )
         stage_guidance = None
         if self.semantic_guidance_source == "stage_feature":
@@ -2167,11 +2267,11 @@ class FunctionalMoEBlock(nn.Module):
         )
         stage_residual = adapter.delta_out(canonical.residual)
         diagnostics = canonical.diagnostics
-        assert diagnostics is not None
         diagnostics.auxiliary.update(
             {
                 "shared_pool_enabled": True,
                 "expert_dim": canonical_feature.shape[1],
+                "contribution_ratio_space": "canonical",
                 "moe_residual_to_input_ratio": self._rms(stage_residual)
                 / self._rms(tensor).clamp_min(torch.finfo(torch.float32).eps),
             }
@@ -2209,7 +2309,12 @@ class FunctionalMoEBlock(nn.Module):
             name: tensor.detach().float().new_zeros(())
             for name in (ExpertType.COMMON.value, *self.expert_names)
         }
+        effective_contribution_ratio = {
+            name: tensor.detach().float().new_zeros(())
+            for name in (ExpertType.COMMON.value, *self.expert_names)
+        }
         regularizers: dict[str, list[Tensor]] = {}
+        input_rms = self._rms(tensor).clamp_min(torch.finfo(torch.float32).eps)
 
         common_residual = torch.zeros_like(tensor)
         assignments = 0
@@ -2225,7 +2330,11 @@ class FunctionalMoEBlock(nn.Module):
             ]
             if retained is not None:
                 retained[ExpertType.COMMON.value] = common
-        shared = tensor + self.common_scale * common_residual
+        common_effective_residual = self.common_scale * common_residual
+        effective_contribution_ratio[ExpertType.COMMON.value] = (
+            self._rms(common_effective_residual) / input_rms
+        )
+        shared = tensor + common_effective_residual
 
         learned_routing = self.router(replace(router_context, feature=shared))
         routing = self._apply_routing_override(learned_routing)
@@ -2268,6 +2377,13 @@ class FunctionalMoEBlock(nn.Module):
             contribution_rms[name] = (
                 contribution.detach().float().square().sum() / tensor.numel()
             ).sqrt()
+            effective_contribution = (
+                self.specialist_scale.detach().float()
+                * contribution.detach().float()
+            )
+            effective_contribution_ratio[name] = (
+                effective_contribution.square().sum() / tensor.numel()
+            ).sqrt() / input_rms
             specialist = specialist.index_add(0, indices, contribution)
             if self._regularizers_enabled(expert_output.expert, policy):
                 for key, value in self._expert_regularizers(
@@ -2277,7 +2393,8 @@ class FunctionalMoEBlock(nn.Module):
             if retained is not None:
                 retained[name] = self._restore_output(shared, indices, expert_output)
 
-        output = shared + self.specialist_scale * specialist
+        specialist_effective_residual = self.specialist_scale * specialist
+        output = shared + specialist_effective_residual
         total_residual = output - tensor
         probabilities = routing.probabilities.detach().float()
         top = probabilities.topk(min(2, probabilities.shape[1]), dim=1).values
@@ -2291,6 +2408,16 @@ class FunctionalMoEBlock(nn.Module):
             "expert_sample_assignments": assignments,
             "expert_residual_rms": residual_rms,
             "expert_weighted_contribution_rms": contribution_rms,
+            "expert_effective_contribution_ratio": effective_contribution_ratio,
+            "common_effective_contribution_ratio": self._rms(
+                common_effective_residual
+            )
+            / input_rms,
+            "specialist_effective_contribution_ratio": self._rms(
+                specialist_effective_residual
+            )
+            / input_rms,
+            "contribution_ratio_space": "native",
             "common_scale_rms": self._rms(self.common_scale),
             "specialist_scale_rms": self._rms(self.specialist_scale),
             "specialist_mixture_weights": weights.detach(),
@@ -2310,19 +2437,7 @@ class FunctionalMoEBlock(nn.Module):
             auxiliary["expert_residuals"] = {
                 name: value.residual for name, value in retained.items()
             }
-        diagnostics = RouterDiagnostics(
-            self.block_id,
-            routing.logits,
-            routing.probabilities,
-            routing.topk_indices,
-            routing.topk_weights,
-            routing.valid_expert_mask,
-            branch_weights=routing.branch_weights,
-            entropy=routing.entropy,
-            importance=routing.importance,
-            hard_load=routing.hard_load,
-            auxiliary=auxiliary,
-        )
+        diagnostics = _router_diagnostics(self.block_id, routing, auxiliary)
         return MoEOutput(
             output,
             total_residual,
@@ -2348,7 +2463,12 @@ class FunctionalMoEBlock(nn.Module):
             name: tensor.detach().float().new_zeros(())
             for name in (ExpertType.COMMON.value, *self.expert_names)
         }
+        effective_contribution_ratio = {
+            name: tensor.detach().float().new_zeros(())
+            for name in (ExpertType.COMMON.value, *self.expert_names)
+        }
         regularizers: dict[str, list[Tensor]] = {}
+        input_rms = self._rms(tensor).clamp_min(torch.finfo(torch.float32).eps)
 
         common = self._common_expert(tensor)
         if not common.valid_samples.all():
@@ -2358,7 +2478,11 @@ class FunctionalMoEBlock(nn.Module):
         contribution_rms[ExpertType.COMMON.value] = residual_rms[ExpertType.COMMON.value]
         if retained is not None:
             retained[ExpertType.COMMON.value] = common
-        shared = tensor + self.common_scale * common_residual
+        common_effective_residual = self.common_scale * common_residual
+        effective_contribution_ratio[ExpertType.COMMON.value] = (
+            self._rms(common_effective_residual) / input_rms
+        )
+        shared = tensor + common_effective_residual
 
         evidence = self._build_site_evidence(
             shared,
@@ -2387,6 +2511,9 @@ class FunctionalMoEBlock(nn.Module):
                 ),
             )
         routing = self._apply_routing_override(self.router(evidence))
+        routing.auxiliary["starvation_opportunity"] = (
+            self._starvation_opportunity(evidence, routing)
+        )
         weights = functional.interpolate(
             routing.probabilities.to(shared),
             size=shared.shape[-2:],
@@ -2429,6 +2556,13 @@ class FunctionalMoEBlock(nn.Module):
             contribution_rms[name] = (
                 contribution.detach().float().square().sum() / tensor.numel()
             ).sqrt()
+            effective_contribution = (
+                self.specialist_scale.detach().float()
+                * contribution.detach().float()
+            )
+            effective_contribution_ratio[name] = (
+                effective_contribution.square().sum() / tensor.numel()
+            ).sqrt() / input_rms
             specialist = specialist.index_add(0, indices, contribution)
             if self._regularizers_enabled(expert_output.expert, policy):
                 for key, value in self._expert_regularizers(
@@ -2438,7 +2572,8 @@ class FunctionalMoEBlock(nn.Module):
             if retained is not None:
                 retained[name] = self._restore_output(shared, indices, expert_output)
 
-        output = shared + self.specialist_scale * specialist
+        specialist_effective_residual = self.specialist_scale * specialist
+        output = shared + specialist_effective_residual
         total_residual = output - tensor
         probabilities = routing.probabilities.detach().float()
         top = probabilities.topk(min(2, probabilities.shape[1]), dim=1).values
@@ -2452,6 +2587,16 @@ class FunctionalMoEBlock(nn.Module):
             "expert_sample_assignments": assignments,
             "expert_residual_rms": residual_rms,
             "expert_weighted_contribution_rms": contribution_rms,
+            "expert_effective_contribution_ratio": effective_contribution_ratio,
+            "common_effective_contribution_ratio": self._rms(
+                common_effective_residual
+            )
+            / input_rms,
+            "specialist_effective_contribution_ratio": self._rms(
+                specialist_effective_residual
+            )
+            / input_rms,
+            "contribution_ratio_space": "native",
             "common_scale_rms": self._rms(self.common_scale),
             "specialist_scale_rms": self._rms(self.specialist_scale),
             "specialist_mixture_weights": weights.detach(),
@@ -2471,24 +2616,7 @@ class FunctionalMoEBlock(nn.Module):
             auxiliary["expert_residuals"] = {
                 name: value.residual.detach() for name, value in retained.items()
             }
-        diagnostics = RouterDiagnostics(
-            self.block_id,
-            routing.logits.detach(),
-            routing.probabilities.detach(),
-            None,
-            None,
-            routing.valid_expert_mask,
-            entropy=routing.entropy.detach(),
-            importance=(
-                routing.importance.detach()
-                if routing.importance is not None
-                else None
-            ),
-            hard_load=(
-                routing.hard_load.detach() if routing.hard_load is not None else None
-            ),
-            auxiliary=auxiliary,
-        )
+        diagnostics = _router_diagnostics(self.block_id, routing, auxiliary)
         return MoEOutput(
             output,
             total_residual,
@@ -2498,6 +2626,46 @@ class FunctionalMoEBlock(nn.Module):
             diagnostics,
             {"architecture_version": "v2", "execution": self.routing_mode},
         )
+
+    def _starvation_opportunity(
+        self, evidence: SiteEvidence, routing: RouterOutput
+    ) -> Tensor:
+        """Return detached physical-evidence weights aligned with router logits."""
+
+        size = routing.probabilities.shape[-2:]
+
+        def normalized(value: Tensor) -> Tensor:
+            value = value.detach().float().abs()
+            if value.shape[1] != 1:
+                value = value.mean(1, keepdim=True)
+            if value.shape[-2:] != size:
+                value = functional.adaptive_avg_pool2d(value, size)
+            maximum = value.flatten(2).amax(2, keepdim=True).clamp_min(1e-8)
+            return (value / maximum[:, :, None]).clamp(0, 1)
+
+        maps: list[Tensor] = []
+        for name in self.expert_names:
+            expert = ExpertType.parse(name)
+            if expert is ExpertType.LOW_FREQUENCY:
+                value = evidence.router_low_energy
+            elif expert is ExpertType.DETAIL:
+                value = evidence.router_high_energy
+            elif expert is ExpertType.INFRARED_SALIENCY:
+                if self.router.ir_evidence_enabled:
+                    value = evidence.router_ir_saliency
+                elif isinstance(evidence.expert, Stage4ExpertEvidence):
+                    value = evidence.expert.infrared.advantage.value
+                else:
+                    value = evidence.router_difference
+            elif expert is ExpertType.FOCUS:
+                value = evidence.router_focus
+            elif expert is ExpertType.SEMANTIC:
+                value = evidence.router_boundary * (1 - evidence.router_uncertainty)
+            else:
+                value = torch.ones_like(evidence.router_low_energy)
+            maps.append(normalized(value))
+        opportunity = torch.cat(maps, dim=1)
+        return opportunity * routing.valid_expert_mask[:, :, None, None]
 
     @staticmethod
     def _rms(value: Tensor) -> Tensor:

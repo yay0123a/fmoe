@@ -60,6 +60,9 @@ def test_stage5_y_only_outputs_and_mfif_rgb_contract() -> None:
         )
         assert output.debug["vif_seg_refinement_active"] is True
         assert output.debug["feedback_expert_weighted_contribution_rms"]
+        assert torch.isfinite(output.debug["y_residual_rms"])
+        assert torch.isfinite(output.debug["y_residual_to_coarse_ratio"])
+        assert output.debug["y_residual_to_coarse_ratio"] >= 0
 
     mfif = model(make_probe_batch(config, TaskType.MFIF, spatial_size=(31, 37)))
     assert mfif.fused_y is mfif.coarse_y is mfif.refinement_y is None

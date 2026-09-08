@@ -327,7 +327,6 @@ from tfs_moe_fusion.config import OptimizerConfig
 
 GROUP_NAMES = (
     "shared_backbone",
-    "coarse_decoder",
     "common_experts",
     "low_frequency_experts",
     "detail_experts",
@@ -338,20 +337,46 @@ GROUP_NAMES = (
     "guidance_pyramid",
     "feedback_experts",
     "feedback_routers",
-    "refinement_decoder",
-    "residual_head",
     "shared_common",
     "shared_low",
     "shared_detail",
     "shared_semantic",
     "shared_ir",
+    "shared_focus",
     "core_site_adapters",
     "feedback_site_adapters",
     "core_routers",
+    "rgb_stem",
+    "ir_stem",
+    "gray_stem",
+    "source_backbone",
+    "fused_backbone",
+    "cross_modal_fusion",
+    "coarse_decoder_trunk",
+    "vif_coarse_head",
+    "mfif_coarse_head",
+    "mfif_interactions",
+    "refinement_decoder_trunk",
+    "mfif_residual_head",
+    "vif_residual_head",
+    "core_common_scale",
+    "feedback_common_scale",
+    "core_specialist_scale",
+    "feedback_specialist_scale",
 )
 
 
 def parameter_group_name(name: str, shared_pool_enabled: bool = False) -> str:
+    if name.startswith("core.moe_blocks") and name.endswith(".common_scale"):
+        return "core_common_scale"
+    if name.startswith("core.moe_blocks") and name.endswith(".specialist_scale"):
+        return "core_specialist_scale"
+    if name.startswith("feedback.feedback_moe") and name.endswith(".common_scale"):
+        return "feedback_common_scale"
+    if name.startswith("feedback.feedback_moe") and name.endswith(
+        ".specialist_scale"
+    ):
+        return "feedback_specialist_scale"
     if shared_pool_enabled:
         shared_experts = {
             "shared_expert_bank.common.": "shared_common",
@@ -359,6 +384,7 @@ def parameter_group_name(name: str, shared_pool_enabled: bool = False) -> str:
             "shared_expert_bank.specialists.detail.": "shared_detail",
             "shared_expert_bank.specialists.semantic.": "shared_semantic",
             "shared_expert_bank.specialists.infrared_saliency.": "shared_ir",
+            "shared_expert_bank.specialists.focus.": "shared_focus",
         }
         for prefix, group in shared_experts.items():
             if name.startswith(prefix):
@@ -375,10 +401,26 @@ def parameter_group_name(name: str, shared_pool_enabled: bool = False) -> str:
                 if ".router." in name
                 else "feedback_site_adapters"
             )
-    if name.startswith(
-        ("core.decoder_stages", "core.fusion_y_head", "core.mfif_rgb_head")
-    ):
-        return "coarse_decoder"
+    structural_groups = (
+        ("core.stems.rgb.", "rgb_stem"),
+        ("core.stems.infrared.", "ir_stem"),
+        ("core.stems.gray.", "gray_stem"),
+        ("core.source_stages.", "source_backbone"),
+        ("core.source_downsamples.", "source_backbone"),
+        ("core.fused_stages.", "fused_backbone"),
+        ("core.fused_downsamples.", "fused_backbone"),
+        ("core.cross_modal_fusions.", "cross_modal_fusion"),
+        ("core.decoder_stages.", "coarse_decoder_trunk"),
+        ("core.fusion_y_head.", "vif_coarse_head"),
+        ("core.mfif_rgb_head.", "mfif_coarse_head"),
+        ("feedback.mfif_interactions.", "mfif_interactions"),
+        ("feedback.decoder.residual_head.", "mfif_residual_head"),
+        ("feedback.decoder.", "refinement_decoder_trunk"),
+        ("feedback.y_residual_head.", "vif_residual_head"),
+    )
+    for prefix, group in structural_groups:
+        if name.startswith(prefix):
+            return group
     if ".expert_pool.modules_by_name.common" in name:
         return "common_experts" if name.startswith("core.") else "feedback_experts"
     if ".common_expert." in name:
@@ -397,13 +439,7 @@ def parameter_group_name(name: str, shared_pool_enabled: bool = False) -> str:
         return "coarse_routers"
     if name.startswith("feedback.focus_head"):
         return "focus_head"
-    if name.startswith(
-        (
-            "feedback.guidance_builder",
-            "feedback.feedback_conditioners",
-            "feedback.mfif_interactions",
-        )
-    ):
+    if name.startswith(("feedback.guidance_builder", "feedback.feedback_conditioners")):
         return "guidance_pyramid"
     if name.startswith("feedback.feedback_moe"):
         return (
@@ -411,10 +447,6 @@ def parameter_group_name(name: str, shared_pool_enabled: bool = False) -> str:
             if ".router." in name or name.endswith("residual_scale")
             else "feedback_experts"
         )
-    if name.startswith("feedback.decoder.residual_head"):
-        return "residual_head"
-    if name.startswith("feedback.decoder"):
-        return "refinement_decoder"
     return "shared_backbone"
 
 
@@ -559,7 +591,11 @@ def router_temperature(
 
 from contextlib import ExitStack, contextmanager
 
-from tfs_moe_fusion.config import MoEExecutionScheduleConfig, TaskUpdatePolicyConfig
+from tfs_moe_fusion.config import (
+    MoEExecutionScheduleConfig,
+    MoEStarvationLossConfig,
+    TaskUpdatePolicyConfig,
+)
 from tfs_moe_fusion.moe import (
     FunctionalMoEBlock,
     MoEExecutionPolicy,
@@ -578,25 +614,43 @@ def _cosine_progress(step: int, start: int, end: int) -> float:
 class RouterLoadMonitor:
     """Checkpointable block-level EMA load monitor and recovery controller."""
 
-    def __init__(self, config: MoEExecutionScheduleConfig) -> None:
+    def __init__(
+        self,
+        config: MoEExecutionScheduleConfig,
+        starvation: MoEStarvationLossConfig | None = None,
+    ) -> None:
         self.config = config
+        self.starvation = starvation or MoEStarvationLossConfig()
         self.usage_ema: dict[str, list[float]] = {}
         self.top2_mass_ema: dict[str, float] = {}
         self.starvation_counters: dict[str, list[int]] = {}
         self.overload_counters: dict[str, int] = {}
         self.recovery_until_step = 0
+        self.floor_usage_ema: dict[str, list[float]] = {}
+        self.floor_low_counters: dict[str, list[int]] = {}
+        self.floor_release_counters: dict[str, list[int]] = {}
+        self.floor_active: dict[str, list[bool]] = {}
+        self.floor_active_steps: dict[str, list[int]] = {}
+        self.floor_expert_names: dict[str, list[str]] = {}
 
     @property
     def recovery_active(self) -> bool:
-        return self.recovery_until_step > 0
+        return not self.starvation.enabled and self.recovery_until_step > 0
 
     def in_recovery(self, step: int) -> bool:
-        return step < self.recovery_until_step
+        return not self.starvation.enabled and step < self.recovery_until_step
 
     @torch.no_grad()
     def update(
-        self, diagnostics: tuple[RouterDiagnostics, ...], step: int
+        self,
+        diagnostics: tuple[RouterDiagnostics, ...],
+        step: int,
+        task: TaskType | None = None,
     ) -> dict[str, float]:
+        if self.starvation.enabled:
+            return self._update_starvation_floor(
+                diagnostics, task or TaskType.VIF
+            )
         decay = self.config.monitor.ema_decay
         minimum = self.config.monitor.starvation_threshold
         maximum = self.config.monitor.overload_threshold
@@ -673,6 +727,147 @@ class RouterLoadMonitor:
             )
         return result
 
+    @torch.no_grad()
+    def _update_starvation_floor(
+        self, diagnostics: tuple[RouterDiagnostics, ...], task: TaskType
+    ) -> dict[str, float]:
+        config = self.starvation
+        packed_parts: list[torch.Tensor] = []
+        layouts: list[tuple[RouterDiagnostics, int]] = []
+        for item in diagnostics:
+            probabilities = item.probabilities.detach().float()
+            experts = probabilities.shape[1]
+            spatial_dims = probabilities.ndim - 2
+            valid = item.valid_expert_mask.reshape(
+                *item.valid_expert_mask.shape, *((1,) * spatial_dims)
+            ).to(probabilities)
+            valid = valid.expand_as(probabilities)
+            opportunity = item.auxiliary.get("starvation_opportunity")
+            if isinstance(opportunity, torch.Tensor):
+                if opportunity.shape != probabilities.shape:
+                    raise ValueError(
+                        "Router starvation opportunity weights must match probabilities"
+                    )
+                opportunity = opportunity.detach().float().to(probabilities) * valid
+            else:
+                opportunity = valid
+            reduce_dims = tuple(
+                index for index in range(probabilities.ndim) if index != 1
+            )
+            numerator = (probabilities * opportunity).sum(reduce_dims)
+            denominator = opportunity.sum(reduce_dims)
+            possible = valid.sum(reduce_dims)
+            top2_mass = probabilities.topk(min(2, experts), dim=1).values.sum(1).mean()
+            packed_parts.extend(
+                (numerator, denominator, possible, top2_mass.reshape(1))
+            )
+            layouts.append((item, experts))
+        if not packed_parts:
+            return {
+                "router_recovery_active": 0.0,
+                "router_starvation_active": 0.0,
+            }
+        packed = reduce_mean(torch.cat(packed_parts)).cpu().tolist()
+        offset = 0
+        result: dict[str, float] = {}
+        active_count = 0
+        for item, experts in layouts:
+            numerator = packed[offset : offset + experts]
+            offset += experts
+            denominator = packed[offset : offset + experts]
+            offset += experts
+            possible = packed[offset : offset + experts]
+            offset += experts
+            top2_mass = float(packed[offset])
+            offset += 1
+            usage = [
+                float(value) / max(float(weight), 1e-8)
+                for value, weight in zip(numerator, denominator)
+            ]
+            support = [
+                float(weight) / max(float(count), 1.0)
+                for weight, count in zip(denominator, possible)
+            ]
+            task_key = task.value if config.per_task else "all"
+            key = f"{task_key}|{item.block_id}"
+            names = [
+                str(name)
+                for name in item.auxiliary.get(
+                    "expert_names", tuple(str(index) for index in range(experts))
+                )
+            ]
+            if len(names) != experts:
+                names = [str(index) for index in range(experts)]
+            self.floor_expert_names[key] = names
+            previous = self.floor_usage_ema.get(key, usage)
+            ema = list(previous)
+            low = self.floor_low_counters.setdefault(key, [0] * experts)
+            release = self.floor_release_counters.setdefault(key, [0] * experts)
+            active = self.floor_active.setdefault(key, [False] * experts)
+            ages = self.floor_active_steps.setdefault(key, [0] * experts)
+            for index in range(experts):
+                eligible = support[index] >= config.evidence_threshold
+                if not eligible:
+                    continue
+                ema[index] = (
+                    config.ema_decay * previous[index]
+                    + (1 - config.ema_decay) * usage[index]
+                )
+                if active[index]:
+                    ages[index] += 1
+                    release[index] = (
+                        release[index] + 1
+                        if ema[index] >= config.release_threshold
+                        else 0
+                    )
+                    if release[index] >= config.release_patience_steps:
+                        active[index] = False
+                        ages[index] = 0
+                        release[index] = 0
+                else:
+                    low[index] = (
+                        low[index] + 1 if ema[index] < config.threshold else 0
+                    )
+                    if low[index] >= config.patience_steps:
+                        active[index] = True
+                        ages[index] = 1
+                        low[index] = 0
+                active_count += int(active[index])
+                result[
+                    f"router_usage_ema/{task_key}/{item.block_id}/{names[index]}"
+                ] = ema[index]
+                result[
+                    f"router_evidence_support/{task_key}/{item.block_id}/{names[index]}"
+                ] = support[index]
+                result[
+                    f"router_starvation_counter/{task_key}/{item.block_id}/{names[index]}"
+                ] = float(low[index])
+                result[
+                    f"router_starvation_active/{task_key}/{item.block_id}/{names[index]}"
+                ] = float(active[index])
+            self.floor_usage_ema[key] = ema
+            result[f"router_top2_mass/{item.block_id}"] = top2_mass
+            result[f"router_max_load/{item.block_id}"] = max(usage)
+        result["router_recovery_active"] = 0.0
+        result["router_starvation_active"] = float(active_count)
+        return result
+
+    def starvation_strengths(self, task: TaskType) -> dict[str, list[float]]:
+        if not self.starvation.enabled:
+            return {}
+        task_key = task.value if self.starvation.per_task else "all"
+        prefix = f"{task_key}|"
+        strengths: dict[str, list[float]] = {}
+        for key, active in self.floor_active.items():
+            if not key.startswith(prefix):
+                continue
+            ages = self.floor_active_steps[key]
+            strengths[key[len(prefix) :]] = [
+                min(1.0, age / self.starvation.ramp_steps) if enabled else 0.0
+                for enabled, age in zip(active, ages)
+            ]
+        return strengths
+
     def state_dict(self) -> dict[str, Any]:
         return {
             "usage_ema": self.usage_ema,
@@ -680,9 +875,47 @@ class RouterLoadMonitor:
             "starvation_counters": self.starvation_counters,
             "overload_counters": self.overload_counters,
             "recovery_until_step": self.recovery_until_step,
+            "starvation_floor": {
+                "usage_ema": self.floor_usage_ema,
+                "low_counters": self.floor_low_counters,
+                "release_counters": self.floor_release_counters,
+                "active": self.floor_active,
+                "active_steps": self.floor_active_steps,
+                "expert_names": self.floor_expert_names,
+            },
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
+        if self.starvation.enabled:
+            floor = state.get("starvation_floor", {})
+            self.floor_usage_ema = {
+                str(name): [float(value) for value in values]
+                for name, values in floor.get("usage_ema", {}).items()
+            }
+            self.floor_low_counters = {
+                str(name): [int(value) for value in values]
+                for name, values in floor.get("low_counters", {}).items()
+            }
+            self.floor_release_counters = {
+                str(name): [int(value) for value in values]
+                for name, values in floor.get("release_counters", {}).items()
+            }
+            self.floor_active = {
+                str(name): [bool(value) for value in values]
+                for name, values in floor.get("active", {}).items()
+            }
+            self.floor_active_steps = {
+                str(name): [int(value) for value in values]
+                for name, values in floor.get("active_steps", {}).items()
+            }
+            self.floor_expert_names = {
+                str(name): [str(value) for value in values]
+                for name, values in floor.get("expert_names", {}).items()
+            }
+            # Legacy recovery was global and included overload triggers.  It is
+            # intentionally not restored when the one-sided floor is enabled.
+            self.recovery_until_step = 0
+            return
         self.usage_ema = {
             str(name): [float(value) for value in values]
             for name, values in state.get("usage_ema", {}).items()
@@ -829,6 +1062,17 @@ class TaskParameterPolicy:
             for parameter in changed:
                 parameter.requires_grad_(True)
 
+    @torch.no_grad()
+    def scale_gradients(self, task: TaskType) -> None:
+        """Scale selected parameter-group gradients for one task update."""
+
+        for group, scale in self.config.gradient_scales.get(
+            task.value, {}
+        ).items():
+            for parameter in self.registry.parameters(group):
+                if parameter.grad is not None:
+                    parameter.grad.mul_(scale)
+
 
 class ExpertOnlyParameterPolicy:
     expert_groups = frozenset(
@@ -844,6 +1088,7 @@ class ExpertOnlyParameterPolicy:
             "shared_detail",
             "shared_semantic",
             "shared_ir",
+            "shared_focus",
         }
     )
 
@@ -1140,6 +1385,22 @@ def router_statistics(values: tuple[RouterDiagnostics, ...]) -> dict[str, Any]:
             result[
                 f"expert_weighted_contribution_rms/{item.block_id}/{expert}"
             ] = torch.as_tensor(value)
+        effective_ratios = item.auxiliary.get(
+            "expert_effective_contribution_ratio", {}
+        )
+        for expert, value in effective_ratios.items():
+            result[
+                f"expert_effective_contribution_ratio/{item.block_id}/{expert}"
+            ] = torch.as_tensor(value)
+        for name in (
+            "common_effective_contribution_ratio",
+            "specialist_effective_contribution_ratio",
+            "common_scale_rms",
+            "specialist_scale_rms",
+        ):
+            value = item.auxiliary.get(name)
+            if value is not None:
+                result[f"{name}/{item.block_id}"] = torch.as_tensor(value)
         for name in (
             "router/top1_margin",
             "router/probability_std",
@@ -1171,7 +1432,12 @@ from tfs_moe_fusion.data import (
     SynchronizedImageAugmentation,
     collate_fusion_samples,
 )
-from tfs_moe_fusion.losses import LossContext, LossOutput, MultiTaskLossManager
+from tfs_moe_fusion.losses import (
+    LossContext,
+    LossOutput,
+    MultiTaskLossManager,
+    moe_starvation_floor_loss,
+)
 from tfs_moe_fusion.types import FusionBatch
 
 
@@ -1476,7 +1742,10 @@ class Trainer:
             self.registry, config.training.task_update_policy
         )
         self.expert_only_policy = ExpertOnlyParameterPolicy(self.registry)
-        self.router_monitor = RouterLoadMonitor(config.training.moe_execution)
+        self.router_monitor = RouterLoadMonitor(
+            config.training.moe_execution,
+            config.training.losses.moe_starvation,
+        )
         self.moe_scheduler = MoEExecutionScheduler(
             config.training.moe_execution, self.router_monitor
         )
@@ -1545,6 +1814,9 @@ class Trainer:
                             "chroma_cr_error",
                             "y_gamut_clip_ratio",
                             "coarse_final_y_mae",
+                            "y_residual_rms",
+                            "y_residual_to_coarse_ratio",
+                            "y_residual_scale",
                             "y_gradient_loss",
                             "ir_intensity_weight_mean",
                             "ir_intensity_weight_max",
@@ -1554,6 +1826,8 @@ class Trainer:
                             "router_ir_importance",
                             "router_ir_hard_load",
                             "router_ir_weighted_contribution_rms",
+                            "router_starvation_active",
+                            "router_recovery_active",
                             "cross_modal_ir_weight/s1",
                             "cross_modal_ir_weight/s2",
                             "cross_modal_ir_weight/s3",
@@ -1599,6 +1873,57 @@ class Trainer:
                         values,
                         extra={"terminal": False},
                     )
+                if (
+                    self.state.global_step
+                    % self.config.training.diagnostics.interval
+                    == 0
+                ):
+                    starvation_metrics = _scalar_metrics_to_cpu(
+                        {
+                            name: value
+                            for name, value in result.diagnostics.items()
+                            if name.startswith(
+                                (
+                                    "router_usage_ema/",
+                                    "router_evidence_support/",
+                                    "router_starvation_active/",
+                                )
+                            )
+                        }
+                    )
+                    if starvation_metrics:
+                        self.logger.info(
+                            "step=%d task=%s router_starvation %s",
+                            self.state.global_step,
+                            task.value,
+                            " ".join(
+                                f"{name}={value:.5f}"
+                                for name, value in starvation_metrics.items()
+                            ),
+                            extra={"terminal": False},
+                        )
+                    contribution_metrics = {
+                        name: value
+                        for name, value in result.diagnostics.items()
+                        if name.startswith(
+                            (
+                                "expert_effective_contribution_ratio/",
+                                "common_effective_contribution_ratio/",
+                                "specialist_effective_contribution_ratio/",
+                            )
+                        )
+                    }
+                    if contribution_metrics:
+                        self.logger.info(
+                            "step=%d task=%s effective_contribution %s",
+                            self.state.global_step,
+                            task.value,
+                            " ".join(
+                                f"{name}={value:.7f}"
+                                for name, value in contribution_metrics.items()
+                            ),
+                            extra={"terminal": False},
+                        )
                 loss_gradient_values = " ".join(
                     f"{name}={value:.5f}"
                     for name, value in result.diagnostics.items()
@@ -1761,6 +2086,25 @@ class Trainer:
                             loss_multipliers,
                         )
                     )
+                    starvation = config.losses.moe_starvation
+                    if starvation.enabled and not (
+                        execution_policy is not None
+                        and execution_policy.expert_only
+                    ):
+                        floor_loss = moe_starvation_floor_loss(
+                            output.router_balance_states,
+                            self.router_monitor.starvation_strengths(task),
+                            threshold=starvation.threshold,
+                            evidence_threshold=starvation.evidence_threshold,
+                        )
+                        weighted_floor = (starvation.weight * floor_loss).clamp_max(
+                            starvation.max_total_weight
+                        )
+                        result.components["moe_starvation/floor"] = floor_loss
+                        result.weighted_components[
+                            "moe_starvation/floor"
+                        ] = weighted_floor
+                        result.total = result.total + weighted_floor
                     if (
                         micro_index == 0
                         and task is TaskType.SEG
@@ -1779,6 +2123,7 @@ class Trainer:
                 self.state.micro_step += 1
         assert aggregate is not None
         self.amp.unscale_(self.optimizer)
+        self.policy.scale_gradients(task)
         diagnostics_due = self.state.global_step % config.diagnostics.interval == 0
         gradient_info = {}
         if diagnostics_due:
@@ -1824,7 +2169,9 @@ class Trainer:
             )
         aggregate.diagnostics.update(
             self.router_monitor.update(
-                tuple(output.router_diagnostics), self.state.global_step
+                tuple(output.router_diagnostics),
+                self.state.global_step,
+                task,
             )
         )
         if execution_policy is not None:
@@ -1956,7 +2303,7 @@ class Trainer:
 
     def _loss_gradient_parameters(self) -> tuple[nn.Parameter, ...]:
         selected: list[nn.Parameter] = []
-        for group in ("refinement_decoder", "shared_backbone"):
+        for group in ("refinement_decoder_trunk", "shared_backbone"):
             selected.extend(
                 parameter
                 for parameter in self.registry.parameters(group)

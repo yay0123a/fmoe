@@ -337,6 +337,18 @@ class RouterDiagnostics:
 
 
 @dataclass(slots=True)
+class RouterBalanceState:
+    """Minimal live router state used by the existing MoE balance loss."""
+
+    probabilities: Tensor
+    valid_expert_mask: Tensor
+    hard_load: Tensor | None = None
+    block_id: str = ""
+    expert_names: tuple[str, ...] = ()
+    opportunity_weights: Tensor | None = None
+
+
+@dataclass(slots=True)
 class AuxiliaryOutputs:
     focus_reliability: Tensor | None = None
     focus_selection: Tensor | None = None
@@ -397,6 +409,7 @@ class FusionOutput:
     refinement_y: Tensor | None = None
     spectral_statistics: tuple[SpectralStatistics, ...] = field(default_factory=tuple)
     router_diagnostics: tuple[RouterDiagnostics, ...] = field(default_factory=tuple)
+    router_balance_states: tuple[RouterBalanceState, ...] = field(default_factory=tuple)
     auxiliary: AuxiliaryOutputs | None = None
     focus: Any | None = None
     coarse_segmentation: Any | None = None

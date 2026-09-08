@@ -115,14 +115,45 @@ The configuration reads `data/msrs/train/{vi,ir}` for VIF and
 `configs/stage7_adaptive_ir.yaml` preserves positive, thermally hot targets
 (such as people and vehicles) in both day and night images while keeping the
 non-hot background anchored to visible luminance and chroma. It uses aligned
-IR luminance, hot-target-aware intensity/gradient/SSIM supervision, and weak
-valid-expert MoE balancing. It uses batch size 4 with one accumulation step,
-keeping the effective batch size at 4. Deterministic mode is disabled to allow
-cuDNN autotuning; repeat runs may differ numerically even with the same seed.
-Set `experiment.deterministic: true` when strict reproducibility is required:
+IR luminance with separate intensity and structure gates: visible highlights
+that are both clipped and locally textureless use soft-knee tone compression,
+a weak bloom-ring correction, and bounded zero-mean IR detail. Confident IR-only
+edges can still enter the signed-gradient and local-SSIM targets. Weak
+valid-expert MoE balancing is disabled so functional experts can specialize
+without a uniform-usage objective. The Router and MoE forward path remain
+enabled. A task-local, physical-evidence-aware starvation floor activates only
+after an eligible expert remains below 2% EMA usage for 500 eligible steps; it
+turns off again after recovery above 3% and never targets uniform usage. It uses
+batch size 4 with one
+accumulation step, keeping the effective batch size at 4. Deterministic mode is
+disabled to allow cuDNN autotuning; repeat runs may differ numerically even with
+the same seed. Set
+`experiment.deterministic: true` when strict reproducibility is required:
 
 ```bash
 CUDA_VISIBLE_DEVICES=4 python train.py --config configs/stage7_adaptive_ir.yaml
+```
+
+`configs/stage8_router_ir_evidence.yaml` adds three image-space signals to the
+spatial Router for VIF: signed IR advantage, thermal saliency (local contrast
+times cross-modal novelty), and IR-only edge confidence. They replace the three
+inactive semantic-guide slots in the Stage 7 profile, so the Router remains at
+four projected feature groups plus seven scalar maps instead of gaining extra
+channels. MFIF receives zero values in these VIF-only slots and continues to use
+its focus evidence. At each MoE site, fused, visible, and IR features use the
+same canonical projection before comparison. The IR specialist receives signed
+`IR - fused` and `IR - visible` feature residuals together with the thermal
+saliency and IR-only edge maps. VIF is the primary optimization task. On MFIF
+steps, the modality stems, shared backbone, cross-modal fusion, common and IR
+experts, shared decoder trunks, site mixture scales, and VIF heads are frozen.
+MFIF updates the focus/detail specialists and its output heads; low-frequency,
+Router, and site-adapter gradients are reduced to 20%, 25%, and 20%,
+respectively. This makes MFIF auxiliary expert-level supervision rather than a
+second full-network objective. This is a structural experiment and should be
+trained from scratch in its separate run directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=4 python train.py --config configs/stage8_router_ir_evidence.yaml
 ```
 
 With `--task seg`, inference also saves the final fused image's segmentation:

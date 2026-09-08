@@ -72,6 +72,12 @@ class MoEConfig:
     functional_expert_version: str = "stage3"
     relative_delta_clip: float = 5.0
     detach_focus_evidence: bool = True
+    router_ir_evidence_enabled: bool = False
+    router_ir_local_contrast_kernel: int = 9
+    router_ir_edge_dominance_ratio: float = 1.2
+    router_ir_edge_transition: float = 0.15
+    router_ir_edge_min_magnitude: float = 0.02
+    source_aware_expert_evidence_enabled: bool = False
     semantic_guidance_source: str = "evidence_maps"
     experts: list[str] = field(
         default_factory=lambda: [
@@ -269,6 +275,18 @@ class VIFFusionLossConfig:
     ir_edge_weight: float = 0.08
     hot_underexposure_weight: float = 0.0
     hot_minimum_contrast_retention: float = 0.65
+    ir_structure_decoupled: bool = False
+    highlight_saturation_threshold: float = 0.9
+    highlight_saturation_transition: float = 0.04
+    highlight_rgb_clip_threshold: float = 0.98
+    highlight_local_std_threshold: float = 0.025
+    highlight_tone_knee: float = 0.75
+    highlight_tone_strength: float = 6.0
+    highlight_ir_detail_scale: float = 0.06
+    highlight_reconstruction_weight: float = 0.0
+    highlight_gradient_weight: float = 0.0
+    ir_structure_max_weight: float = 1.0
+    structure_ssim_scale: float = 0.4
     intensity_visible_support_kernel: int = 3
     intensity_weight_smoothing_kernel: int = 3
     gradient_mode: str = "magnitude_max"
@@ -338,6 +356,21 @@ class MoEBalanceLossConfig:
 
 
 @dataclass(slots=True)
+class MoEStarvationLossConfig:
+    enabled: bool = False
+    threshold: float = 0.02
+    patience_steps: int = 500
+    release_threshold: float = 0.03
+    release_patience_steps: int = 100
+    ema_decay: float = 0.99
+    weight: float = 0.0001
+    max_total_weight: float = 0.0005
+    ramp_steps: int = 100
+    evidence_threshold: float = 0.05
+    per_task: bool = True
+
+
+@dataclass(slots=True)
 class TaskConsistencyLossConfig:
     enabled: bool = False
     weight: float = 0.01
@@ -372,6 +405,9 @@ class LossConfig:
     semantic: SemanticLossConfig = field(default_factory=SemanticLossConfig)
     frequency: FrequencyLossConfig = field(default_factory=FrequencyLossConfig)
     moe: MoEBalanceLossConfig = field(default_factory=MoEBalanceLossConfig)
+    moe_starvation: MoEStarvationLossConfig = field(
+        default_factory=MoEStarvationLossConfig
+    )
     consistency: TaskConsistencyLossConfig = field(
         default_factory=TaskConsistencyLossConfig
     )
@@ -398,6 +434,7 @@ class TaskUpdatePolicyConfig:
             "seg": ["focus_head"],
         }
     )
+    gradient_scales: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -715,6 +752,23 @@ class ProjectConfig:
                 "stage4b and stage6_vif_mfif experts require v2 shared-pool "
                 "spatial_soft routing"
             )
+        if model.moe.router_ir_evidence_enabled and (
+            model.moe.functional_expert_version != "stage6_vif_mfif"
+            or model.moe.routing_mode != "spatial_soft"
+        ):
+            raise ConfigurationError(
+                "Router IR evidence requires stage6_vif_mfif spatial_soft routing"
+            )
+        if model.moe.source_aware_expert_evidence_enabled and (
+            model.moe.functional_expert_version != "stage6_vif_mfif"
+            or model.moe.routing_mode != "spatial_soft"
+            or not model.moe.shared_pool_enabled
+            or not model.moe.router_ir_evidence_enabled
+        ):
+            raise ConfigurationError(
+                "Source-aware expert evidence requires Stage 6 shared-pool "
+                "spatial routing with Router IR evidence"
+            )
         if model.moe.expert_dim <= 0:
             raise ConfigurationError("model.moe.expert_dim must be positive")
         if set(model.moe.patch_size) != {"s2", "s3", "s4"} or any(
@@ -729,6 +783,19 @@ class ProjectConfig:
             raise ConfigurationError("MoE v2 scale initializers cannot be negative")
         if model.moe.relative_delta_clip <= 0:
             raise ConfigurationError("model.moe.relative_delta_clip must be positive")
+        if (
+            model.moe.router_ir_local_contrast_kernel <= 0
+            or model.moe.router_ir_local_contrast_kernel % 2 == 0
+        ):
+            raise ConfigurationError(
+                "model.moe.router_ir_local_contrast_kernel must be positive and odd"
+            )
+        if (
+            model.moe.router_ir_edge_dominance_ratio < 1.0
+            or model.moe.router_ir_edge_transition <= 0
+            or model.moe.router_ir_edge_min_magnitude <= 0
+        ):
+            raise ConfigurationError("model.moe Router IR edge settings are invalid")
         if model.moe.semantic_guidance_source not in {
             "evidence_maps",
             "stage_feature",
@@ -985,7 +1052,6 @@ class ProjectConfig:
             raise ConfigurationError("gradient_clip.max_norm must be positive")
         legal_groups = {
             "shared_backbone",
-            "coarse_decoder",
             "common_experts",
             "low_frequency_experts",
             "detail_experts",
@@ -996,16 +1062,32 @@ class ProjectConfig:
             "guidance_pyramid",
             "feedback_experts",
             "feedback_routers",
-            "refinement_decoder",
-            "residual_head",
             "shared_common",
             "shared_low",
             "shared_detail",
             "shared_semantic",
             "shared_ir",
+            "shared_focus",
             "core_site_adapters",
             "feedback_site_adapters",
             "core_routers",
+            "rgb_stem",
+            "ir_stem",
+            "gray_stem",
+            "source_backbone",
+            "fused_backbone",
+            "cross_modal_fusion",
+            "coarse_decoder_trunk",
+            "vif_coarse_head",
+            "mfif_coarse_head",
+            "mfif_interactions",
+            "refinement_decoder_trunk",
+            "mfif_residual_head",
+            "vif_residual_head",
+            "core_common_scale",
+            "feedback_common_scale",
+            "core_specialist_scale",
+            "feedback_specialist_scale",
         }
         if set(training.task_update_policy.freeze) != active_tasks:
             raise ConfigurationError(
@@ -1018,6 +1100,35 @@ class ProjectConfig:
         if unknown_groups:
             raise ConfigurationError(
                 f"Unknown task update groups: {sorted(unknown_groups)}"
+            )
+        gradient_scales = training.task_update_policy.gradient_scales
+        unknown_scale_tasks = set(gradient_scales) - active_tasks
+        if unknown_scale_tasks:
+            raise ConfigurationError(
+                "task_update_policy.gradient_scales contains inactive tasks: "
+                f"{sorted(unknown_scale_tasks)}"
+            )
+        unknown_scaled_groups = {
+            group
+            for scales in gradient_scales.values()
+            for group in scales
+            if group not in legal_groups
+        }
+        if unknown_scaled_groups:
+            raise ConfigurationError(
+                "Unknown task gradient-scale groups: "
+                f"{sorted(unknown_scaled_groups)}"
+            )
+        invalid_scales = {
+            f"{task}/{group}": scale
+            for task, scales in gradient_scales.items()
+            for group, scale in scales.items()
+            if not 0.0 < scale <= 1.0
+        }
+        if invalid_scales:
+            raise ConfigurationError(
+                "Task gradient scales must be in (0, 1]: "
+                f"{invalid_scales}"
             )
         phases = training.phases.phases
         if not phases:
@@ -1121,18 +1232,22 @@ class ProjectConfig:
             "directional_visible_anchor",
             "soft_directional_visible_anchor",
             "adaptive_directional",
+            "independent_directional",
         }:
             raise ConfigurationError(
                 "VIF gradient_mode must be magnitude_max, directional_visible_anchor, "
-                "soft_directional_visible_anchor, or adaptive_directional"
+                "soft_directional_visible_anchor, adaptive_directional, or "
+                "independent_directional"
             )
         if vif_loss.ssim_mode not in {
             "source_max",
             "visible_anchor",
             "adaptive_source",
+            "structure_adaptive",
         }:
             raise ConfigurationError(
-                "VIF ssim_mode must be source_max, visible_anchor, or adaptive_source"
+                "VIF ssim_mode must be source_max, visible_anchor, adaptive_source, "
+                "or structure_adaptive"
             )
         if vif_loss.intensity_mode not in {
             "pixel_max",
@@ -1188,6 +1303,33 @@ class ProjectConfig:
             raise ConfigurationError(
                 "VIF hot_underexposure_weight cannot be negative"
             )
+        for name in (
+            "highlight_saturation_threshold",
+            "highlight_rgb_clip_threshold",
+            "highlight_tone_knee",
+        ):
+            if not 0.0 <= getattr(vif_loss, name) < 1.0:
+                raise ConfigurationError(f"VIF {name} must be in [0, 1)")
+        for name in (
+            "highlight_saturation_transition",
+            "highlight_local_std_threshold",
+            "highlight_tone_strength",
+        ):
+            if getattr(vif_loss, name) <= 0:
+                raise ConfigurationError(f"VIF {name} must be positive")
+        for name in (
+            "highlight_ir_detail_scale",
+            "highlight_reconstruction_weight",
+            "highlight_gradient_weight",
+        ):
+            if getattr(vif_loss, name) < 0:
+                raise ConfigurationError(f"VIF {name} cannot be negative")
+        if not 0.0 <= vif_loss.ir_structure_max_weight <= 1.0:
+            raise ConfigurationError(
+                "VIF ir_structure_max_weight must be in [0, 1]"
+            )
+        if not 0.0 <= vif_loss.structure_ssim_scale <= 1.0:
+            raise ConfigurationError("VIF structure_ssim_scale must be in [0, 1]")
         for name, kernel in (
             (
                 "intensity_visible_support_kernel",
@@ -1244,6 +1386,26 @@ class ProjectConfig:
             < 0
         ):
             raise ConfigurationError("MoE balance loss weights cannot be negative")
+        starvation = training.losses.moe_starvation
+        if not 0.0 < starvation.threshold < starvation.release_threshold <= 1.0:
+            raise ConfigurationError(
+                "MoE starvation thresholds must satisfy 0 < threshold "
+                "< release_threshold <= 1"
+            )
+        if not 0.0 < starvation.ema_decay < 1.0:
+            raise ConfigurationError("MoE starvation ema_decay must be in (0, 1)")
+        if min(
+            starvation.patience_steps,
+            starvation.release_patience_steps,
+            starvation.ramp_steps,
+        ) <= 0:
+            raise ConfigurationError("MoE starvation step counts must be positive")
+        if (
+            starvation.weight < 0
+            or starvation.max_total_weight < starvation.weight
+            or not 0.0 <= starvation.evidence_threshold <= 1.0
+        ):
+            raise ConfigurationError("MoE starvation loss settings are invalid")
         if training.losses.infrared.saliency_alignment < 0:
             raise ConfigurationError("infrared.saliency_alignment cannot be negative")
         semantic_loss = training.losses.semantic

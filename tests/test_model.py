@@ -453,8 +453,8 @@ def test_dense_and_sparse_execution_are_numerically_equivalent() -> None:
             sparse_execution=False,
             return_expert_outputs=True,
         )
-        sparse, sparse_diagnostics = sparse_output
-        dense, dense_diagnostics = dense_output
+        sparse, sparse_diagnostics = sparse_output.feature, sparse_output.diagnostics
+        dense, dense_diagnostics = dense_output.feature, dense_output.diagnostics
     assert isinstance(sparse_output, MoEOutput)
     assert sparse_output.residual.shape == feature.shape
     assert dense_output.expert_outputs is not None

@@ -133,6 +133,36 @@ def test_zero_common_and_specialist_scales_make_identity() -> None:
     output = block(feature, *_contexts(feature))
     assert torch.equal(output.feature, feature)
     assert torch.count_nonzero(output.residual) == 0
+    auxiliary = output.diagnostics.auxiliary
+    assert auxiliary["common_effective_contribution_ratio"] == 0
+    assert auxiliary["specialist_effective_contribution_ratio"] == 0
+    assert all(
+        value == 0
+        for value in auxiliary["expert_effective_contribution_ratio"].values()
+    )
+
+
+def test_single_specialist_effective_ratio_includes_scale_and_input_rms() -> None:
+    block = _block()
+    block.set_routing_override("single:detail")
+    with torch.no_grad():
+        block.common_scale.zero_()
+        block.specialist_scale.fill_(0.05)
+    feature = torch.randn(2, 8, 5, 7)
+    output = block(feature, *_contexts(feature))
+    expected = (
+        output.residual.detach().float().square().mean().sqrt()
+        / feature.detach().float().square().mean().sqrt()
+    )
+    auxiliary = output.diagnostics.auxiliary
+    torch.testing.assert_close(
+        auxiliary["expert_effective_contribution_ratio"]["detail"], expected
+    )
+    torch.testing.assert_close(
+        auxiliary["specialist_effective_contribution_ratio"], expected
+    )
+    assert auxiliary["common_effective_contribution_ratio"] == 0
+    assert auxiliary["contribution_ratio_space"] == "native"
 
 
 def test_all_valid_specialists_receive_dense_soft_gradients() -> None:

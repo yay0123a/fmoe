@@ -89,6 +89,13 @@ def test_spatial_router_shape_probability_contract_and_interpolated_mixture() ->
     weights = output.diagnostics.auxiliary["specialist_mixture_weights"]
     assert weights.shape == (2, 4, 13, 17)
     torch.testing.assert_close(weights.sum(1), torch.ones(2, 13, 17))
+    auxiliary = output.diagnostics.auxiliary
+    assert set(auxiliary["expert_effective_contribution_ratio"]) == {
+        "common",
+        *SPECIALISTS,
+    }
+    assert torch.isfinite(auxiliary["common_effective_contribution_ratio"])
+    assert torch.isfinite(auxiliary["specialist_effective_contribution_ratio"])
 
 
 @pytest.mark.parametrize("height,width", [(5, 7), (13, 17), (14, 9)])

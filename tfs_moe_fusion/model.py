@@ -31,6 +31,7 @@ from tfs_moe_fusion.types import (
     AuxiliaryOutputs,
     FusionBatch,
     ModalityType,
+    RouterBalanceState,
     RouterDiagnostics,
     SpectralStatistics,
     TaskType,
@@ -237,6 +238,7 @@ class FeedbackResult:
     coarse_semantic: SemanticGuideOutput | None
     final_semantic: SemanticGuideOutput | None
     router_diagnostics: tuple[RouterDiagnostics, ...]
+    router_balance_states: tuple[RouterBalanceState, ...]
     spectral_statistics: tuple[SpectralStatistics, ...]
     debug: dict[str, object]
 
@@ -418,7 +420,7 @@ class ClosedLoopRefinement(nn.Module):
                 focus_feedback, semantic_feedback, backbone.fused
             )
         refined = list(backbone.fused)
-        diagnostics, statistics = [], []
+        diagnostics, balance_states, statistics = [], [], []
         for stage in self.config.model.feedback.placements:
             index = int(stage[1:]) - 1
             feature = self.feedback_conditioners[stage](refined[index], guidance[index])
@@ -444,6 +446,7 @@ class ClosedLoopRefinement(nn.Module):
                 semantic_feedback.boundary if semantic_feedback else None,
                 semantic_feedback.uncertainty if semantic_feedback else None,
                 f"feedback.{stage}.moe0",
+                ir_evidence=backbone.ir_router_evidence,
             )
             expert_context = ExpertContext(
                 batch.task,
@@ -461,13 +464,15 @@ class ClosedLoopRefinement(nn.Module):
                 stage_guidance_feature=guidance[index],
             )
             if not self.config.model.ablation.disable_feedback_moe:
-                feature, diag = self.feedback_moe[stage](
+                moe_output = self.feedback_moe[stage](
                     feature, context, expert_context
                 )
+                feature = moe_output.feature
                 # A shared block retains its coarse-pass module identity, while the
                 # diagnostic belongs to this second, guidance-conditioned pass.
-                diag.block_id = f"feedback.{stage}.moe0"
-                diagnostics.append(diag)
+                moe_output.diagnostics.block_id = f"feedback.{stage}.moe0"
+                diagnostics.append(moe_output.diagnostics)
+                balance_states.append(moe_output.balance_state)
             refined[index] = feature
             statistics.append(stats)
         refined_pyramid = FeaturePyramid(*refined)
@@ -540,6 +545,22 @@ class ClosedLoopRefinement(nn.Module):
         cropped_refinement_y = (
             crop(refinement_y) if refinement_y is not None else None
         )
+        y_residual_rms = (
+            cropped_refinement_y.detach().float().square().mean().sqrt()
+            if cropped_refinement_y is not None
+            else None
+        )
+        y_residual_to_coarse_ratio = (
+            y_residual_rms
+            / cropped_coarse_y.detach()
+            .float()
+            .square()
+            .mean()
+            .sqrt()
+            .clamp_min(torch.finfo(torch.float32).eps)
+            if y_residual_rms is not None and cropped_coarse_y is not None
+            else None
+        )
         auxiliary = AuxiliaryOutputs(
             torch.cat((focus_crop.reliability_a, focus_crop.reliability_b), 1)
             if focus_crop
@@ -563,6 +584,7 @@ class ClosedLoopRefinement(nn.Module):
             coarse_semantic=coarse_semantic,
             final_semantic=final_semantic,
             router_diagnostics=tuple(diagnostics),
+            router_balance_states=tuple(balance_states),
             spectral_statistics=tuple(statistics),
             debug={
                 "focus": focus_crop,
@@ -591,11 +613,8 @@ class ClosedLoopRefinement(nn.Module):
                         .detach()
                         .abs()
                         .mean(),
-                        "y_residual_rms": cropped_refinement_y.detach()
-                        .float()
-                        .square()
-                        .mean()
-                        .sqrt(),
+                        "y_residual_rms": y_residual_rms,
+                        "y_residual_to_coarse_ratio": y_residual_to_coarse_ratio,
                         "y_residual_scale": self.y_residual_head.scale.detach(),
                         "y_gamut_clip_ratio": gamut_projection_mask.detach()
                         .float()
@@ -661,6 +680,7 @@ class ClosedLoopRefinement(nn.Module):
             coarse_semantic=coarse_semantic,
             final_semantic=final_semantic,
             router_diagnostics=(),
+            router_balance_states=(),
             spectral_statistics=(),
             debug={
                 "focus": None,
@@ -747,6 +767,10 @@ class TFSMoEFusion(nn.Module):
             router_diagnostics=(
                 *backbone.router_diagnostics,
                 *feedback.router_diagnostics,
+            ),
+            router_balance_states=(
+                *backbone.router_balance_states,
+                *feedback.router_balance_states,
             ),
             auxiliary=feedback.auxiliary,
             focus=feedback.debug.get("focus"),

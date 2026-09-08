@@ -34,8 +34,10 @@ def _config():
     return config.model.moe
 
 
-def _site() -> SharedExpertMoESite:
+def _site(source_aware_evidence: bool = False) -> SharedExpertMoESite:
     config = _config()
+    config.router_ir_evidence_enabled = source_aware_evidence
+    config.source_aware_expert_evidence_enabled = source_aware_evidence
     bank = SharedExpertBank(
         config.expert_dim,
         config.expert_expansion,
@@ -55,6 +57,7 @@ def _contexts(
     confidence: torch.Tensor | None = None,
     boundary: torch.Tensor | None = None,
     uncertainty: torch.Tensor | None = None,
+    ir_evidence: torch.Tensor | None = None,
     swapped_ir: bool = False,
 ) -> tuple[RouterContext, ExpertContext]:
     source_a = torch.randn_like(feature) if source_a is None else source_a
@@ -80,6 +83,7 @@ def _contexts(
             focus_confidence=confidence,
             semantic_boundary=boundary,
             semantic_uncertainty=uncertainty,
+            ir_evidence=ir_evidence,
         ),
         ExpertContext(
             task,
@@ -283,6 +287,38 @@ def test_ir_focus_and_semantic_experts_follow_typed_evidence() -> None:
     ).with_semantic_guidance(torch.zeros_like(feature))
     gate = semantic(feature, semantic_evidence.semantic).diagnostics["gate"]
     assert gate[..., :, :8].mean() > gate[..., :, 8:].mean()
+
+
+def test_source_aware_ir_evidence_is_signed_and_reuses_physical_maps() -> None:
+    site = _site(source_aware_evidence=True)
+    assert site.adapter.source_in is None
+    feature = torch.ones(1, 8, 16, 16)
+    visible = torch.full_like(feature, 0.75)
+    infrared = torch.full_like(feature, 0.25)
+    infrared[..., 5:11, 5:11] = 1.5
+    physical = torch.zeros(1, 3, 16, 16)
+    physical[:, 1:2, 5:11, 5:11] = 0.8
+    physical[:, 2:3, 4:12, 4:12] = 0.6
+
+    evidence = _evidence(
+        site,
+        feature,
+        *_contexts(
+            feature,
+            TaskType.VIF,
+            visible,
+            infrared,
+            ir_evidence=physical,
+        ),
+    ).infrared
+
+    assert evidence.advantage.value[..., 6:10, 6:10].mean() > 0
+    assert evidence.advantage.value[..., :4, :4].mean() < 0
+    torch.testing.assert_close(evidence.saliency, physical[:, 1:2])
+    torch.testing.assert_close(evidence.edge, physical[:, 2:3])
+    expert = site.shared_expert_bank.specialists["infrared_saliency"]
+    assert expert.condition.in_channels == feature.shape[1] * 2 + 2
+    assert expert.saliency[0].in_channels == feature.shape[1] * 3 + 2
 
 
 def test_mfif_source_swap_preserves_low_detail_and_focus_outputs() -> None:

@@ -85,7 +85,7 @@ def test_focus_loss_supervises_selection_boundary_and_confidence() -> None:
 
 
 from tfs_moe_fusion.losses import frequency_specialization
-from tfs_moe_fusion.types import RouterDiagnostics
+from tfs_moe_fusion.types import RouterBalanceState, RouterDiagnostics
 
 
 def _diagnostic() -> RouterDiagnostics:
@@ -106,6 +106,15 @@ def _diagnostic() -> RouterDiagnostics:
     )
 
 
+def _balance_state() -> RouterBalanceState:
+    probabilities = torch.tensor([[0.6, 0.4]], requires_grad=True)
+    return RouterBalanceState(
+        probabilities,
+        torch.ones(1, 2, dtype=torch.bool),
+        torch.tensor([1.0, 0.0]),
+    )
+
+
 def test_frequency_specialization_reports_both_leakages() -> None:
     values = frequency_specialization((_diagnostic(),))
     assert values["frequency/low_leakage"] > 0
@@ -117,6 +126,8 @@ from tfs_moe_fusion.losses import (
     align_infrared_luminance,
     directional_gradient_loss,
     directional_gradient_targets,
+    highlight_reconstruction_losses,
+    highlight_reconstruction_target,
     hot_object_ir_blend_weight,
     hot_underexposure_loss,
     luminance,
@@ -200,6 +211,55 @@ def test_hot_object_ir_admits_thermal_targets_in_bright_and_dark_regions() -> No
     assert bright_hot > bright_background + 0.6
 
 
+def test_highlight_reconstruction_compresses_only_clipped_flat_regions() -> None:
+    visible = torch.full((1, 3, 40, 56), 0.2)
+    visible[..., 8:24, 5:19] = 0.95
+    visible[..., 8:32, 32:52] = 1.0
+    infrared = torch.full((1, 1, 40, 56), 0.5)
+    infrared[..., 8:32, 32:42] = 0.25
+    infrared[..., 8:32, 42:52] = 0.75
+    normal = luminance(visible)
+    structure = torch.ones_like(normal)
+    kwargs = {
+        "saturation_threshold": 0.9,
+        "saturation_transition": 0.04,
+        "rgb_clip_threshold": 0.98,
+        "local_std_threshold": 0.025,
+        "tone_knee": 0.75,
+        "tone_strength": 6.0,
+    }
+
+    target, saturation, bloom = highlight_reconstruction_target(
+        normal, visible, infrared, structure, ir_detail_scale=0.06, **kwargs
+    )
+    base_target, _, _ = highlight_reconstruction_target(
+        normal, visible, infrared, structure, ir_detail_scale=0.0, **kwargs
+    )
+
+    assert saturation[..., 12:20, 9:15].max() == 0
+    assert saturation[..., 12:28, 36:48].mean() > 0.7
+    torch.testing.assert_close(target[..., 12:20, 9:15], normal[..., 12:20, 9:15])
+    assert target[..., 12:28, 36:48].mean() < 0.93
+    detail_delta = target[..., 12:28, 36:48] - base_target[..., 12:28, 36:48]
+    assert detail_delta.abs().mean() > 1e-3
+    assert detail_delta.mean().abs() < 0.02
+    assert bloom.mean() > saturation.mean()
+
+
+def test_highlight_reconstruction_loss_prefers_compressed_target() -> None:
+    visible = torch.ones(1, 1, 16, 16, requires_grad=True)
+    target = torch.full_like(visible, 0.85)
+    bloom = torch.ones_like(visible)
+    bad = highlight_reconstruction_losses(visible, target, bloom)
+    good = highlight_reconstruction_losses(target, target, bloom)
+
+    assert bad[0] > 0.1
+    assert good[0] == 0
+    assert good[1] < bad[1]
+    sum(bad).backward()
+    assert visible.grad is not None and torch.isfinite(visible.grad).all()
+
+
 def test_hot_underexposure_loss_is_region_normalized_and_differentiable() -> None:
     visible = torch.full((1, 1, 24, 24), 0.2)
     infrared = visible.clone()
@@ -249,6 +309,28 @@ def test_adaptive_vif_losses_are_finite_and_differentiable() -> None:
     )
     sum(values.values()).backward()
     assert fused_y.grad is not None and torch.isfinite(fused_y.grad).all()
+
+
+def test_structure_adaptive_ssim_cannot_escape_with_visible_only_output() -> None:
+    visible = torch.linspace(0, 1, 19 * 23).reshape(1, 1, 19, 23)
+    infrared = torch.flip(visible, dims=(-1,))
+    fused = visible.clone().requires_grad_()
+    values = vif_losses(
+        fused,
+        visible,
+        infrared,
+        fused,
+        target_intensity=visible,
+        intensity_weight=torch.zeros_like(visible),
+        structure_weight=torch.ones_like(visible),
+        structure_ssim_scale=0.4,
+        gradient_mode="independent_directional",
+        ssim_mode="structure_adaptive",
+    )
+
+    assert values["fusion/ssim"] > 0
+    sum(values.values()).backward()
+    assert fused.grad is not None and torch.isfinite(fused.grad).all()
 
 
 def test_aligned_ir_matches_visible_global_luminance_statistics() -> None:
@@ -493,6 +575,9 @@ def test_loss_manager_returns_structured_vif_output() -> None:
         "chroma_cr_error",
         "y_gamut_clip_ratio",
         "coarse_final_y_mae",
+        "y_residual_rms",
+        "y_residual_to_coarse_ratio",
+        "y_residual_scale",
         "y_gradient_loss",
     ):
         assert name in value.diagnostics
@@ -592,16 +677,16 @@ from tfs_moe_fusion.losses import moe_balance_loss
 
 
 def test_moe_balance_is_availability_aware_and_finite() -> None:
-    importance, load, entropy = moe_balance_loss((_diagnostic(),))
+    importance, load, entropy = moe_balance_loss((_balance_state(),))
     assert importance.isfinite() and load.isfinite() and entropy.isfinite()
 
 
 def test_switch_balance_routes_gradient_through_probabilities() -> None:
-    diagnostic = _diagnostic()
-    soft, switch, _ = moe_balance_loss((diagnostic,))
+    state = _balance_state()
+    soft, switch, _ = moe_balance_loss((state,))
     (soft + switch).backward()
-    assert diagnostic.probabilities.grad is not None
-    assert torch.isfinite(diagnostic.probabilities.grad).all()
+    assert state.probabilities.grad is not None
+    assert torch.isfinite(state.probabilities.grad).all()
 
 
 from tfs_moe_fusion.trainer import (
@@ -731,6 +816,89 @@ def test_router_monitor_recovery_state_round_trips() -> None:
     assert policy.noise_std >= config.recovery.noise_std
 
 
+def test_availability_starvation_floor_is_task_local_and_one_sided() -> None:
+    from tfs_moe_fusion.losses import moe_starvation_floor_loss
+    from tfs_moe_fusion.trainer import RouterLoadMonitor
+    from tfs_moe_fusion.types import RouterBalanceState, RouterDiagnostics, TaskType
+
+    project = _smoke_config()
+    config = project.training.losses.moe_starvation
+    config.enabled = True
+    config.ema_decay = 0.5
+    config.patience_steps = 2
+    config.release_patience_steps = 2
+    config.ramp_steps = 1
+    monitor = RouterLoadMonitor(project.training.moe_execution, config)
+    probabilities = torch.tensor([[0.99, 0.01]])
+    opportunity = torch.ones_like(probabilities)
+    diagnostic = RouterDiagnostics(
+        "s2.moe0",
+        probabilities.log(),
+        probabilities,
+        torch.tensor([[0]]),
+        torch.ones(1, 1),
+        torch.ones(1, 2, dtype=torch.bool),
+        auxiliary={
+            "expert_names": ("detail", "infrared_saliency"),
+            "starvation_opportunity": opportunity,
+        },
+    )
+    monitor.update((diagnostic,), 10, TaskType.VIF)
+    assert monitor.starvation_strengths(TaskType.VIF) == {
+        "s2.moe0": [0.0, 0.0]
+    }
+    metrics = monitor.update((diagnostic,), 11, TaskType.VIF)
+    assert monitor.starvation_strengths(TaskType.VIF) == {
+        "s2.moe0": [0.0, 1.0]
+    }
+    assert monitor.starvation_strengths(TaskType.MFIF) == {}
+    assert metrics["router_recovery_active"] == 0.0
+
+    live = probabilities.clone().requires_grad_()
+    state = RouterBalanceState(
+        live,
+        torch.ones(1, 2, dtype=torch.bool),
+        block_id="s2.moe0",
+        expert_names=("detail", "infrared_saliency"),
+        opportunity_weights=opportunity,
+    )
+    loss = moe_starvation_floor_loss(
+        (state,),
+        monitor.starvation_strengths(TaskType.VIF),
+        threshold=config.threshold,
+        evidence_threshold=config.evidence_threshold,
+    )
+    assert loss.detach().item() == pytest.approx(0.25)
+    loss.backward()
+    assert live.grad is not None and live.grad[0, 1] < 0
+
+    restored = RouterLoadMonitor(project.training.moe_execution, config)
+    restored.load_state_dict(monitor.state_dict())
+    assert restored.starvation_strengths(TaskType.VIF) == {
+        "s2.moe0": [0.0, 1.0]
+    }
+
+
+def test_starvation_floor_ignores_insufficient_physical_evidence() -> None:
+    from tfs_moe_fusion.losses import moe_starvation_floor_loss
+    from tfs_moe_fusion.types import RouterBalanceState
+
+    probabilities = torch.tensor([[0.99, 0.01]], requires_grad=True)
+    state = RouterBalanceState(
+        probabilities,
+        torch.ones(1, 2, dtype=torch.bool),
+        block_id="s2.moe0",
+        opportunity_weights=torch.tensor([[1.0, 0.01]]),
+    )
+    loss = moe_starvation_floor_loss(
+        (state,),
+        {"s2.moe0": [0.0, 1.0]},
+        threshold=0.02,
+        evidence_threshold=0.05,
+    )
+    assert loss == 0
+
+
 def test_router_monitor_batches_blocks_without_reducing_local_validity(monkeypatch) -> None:
     import tfs_moe_fusion.trainer as trainer_module
 
@@ -791,6 +959,11 @@ def test_router_statistics_preserves_scalar_values_and_detaches_graphs() -> None
         auxiliary={
             "expert_residual_rms": {"common": probabilities[0, 0]},
             "expert_weighted_contribution_rms": {"common": 0.5},
+            "expert_effective_contribution_ratio": {"common": 0.05},
+            "common_effective_contribution_ratio": 0.05,
+            "specialist_effective_contribution_ratio": 0.025,
+            "common_scale_rms": 0.1,
+            "specialist_scale_rms": 0.03,
             "router/top1_margin": probabilities[0, 0] - probabilities[0, 1],
             "residual_scale_rms": 0.125,
         },
@@ -800,6 +973,11 @@ def test_router_statistics_preserves_scalar_values_and_detaches_graphs() -> None
     assert result["router_max_load"] == 1.0
     assert result["expert_residual_rms/block/common"] == 0.75
     assert result["expert_weighted_contribution_rms/block/common"] == 0.5
+    assert result["expert_effective_contribution_ratio/block/common"] == 0.05
+    assert result["common_effective_contribution_ratio/block"] == 0.05
+    assert result["specialist_effective_contribution_ratio/block"] == 0.025
+    assert result["common_scale_rms/block"] == 0.1
+    assert result["specialist_scale_rms/block"] == 0.03
     assert result["router/top1_margin/block"] == 0.5
     assert result["moe_residual_scale/block"] == 0.125
     assert all(isinstance(value, (float, str)) for value in result.values())
@@ -859,8 +1037,8 @@ def test_optimizer_groups_cover_trainable_parameters_exactly_once() -> None:
     assert {id(parameter) for parameter in optimized} == {
         id(parameter) for parameter in model.parameters() if parameter.requires_grad
     }
-    assert registry.names["core.fusion_y_head.0.weight"] == "coarse_decoder"
-    assert registry.names["core.mfif_rgb_head.0.weight"] == "coarse_decoder"
+    assert registry.names["core.fusion_y_head.0.weight"] == "vif_coarse_head"
+    assert registry.names["core.mfif_rgb_head.0.weight"] == "mfif_coarse_head"
 
 
 from pathlib import Path
@@ -879,6 +1057,25 @@ def test_mfif_policy_temporarily_freezes_ir_experts() -> None:
     with policy.apply(TaskType.MFIF):
         assert all(not parameter.requires_grad for parameter in parameters)
     assert all(parameter.requires_grad for parameter in parameters)
+
+
+def test_task_policy_scales_only_configured_group_gradients() -> None:
+    config = _smoke_config()
+    registry = ParameterGroupRegistry.from_model(build_model(config))
+    config.training.task_update_policy.gradient_scales = {
+        "mfif": {"ir_experts": 0.25}
+    }
+    policy = TaskParameterPolicy(registry, config.training.task_update_policy)
+    infrared = registry.parameters("ir_experts")
+    detail = registry.parameters("detail_experts")
+    assert infrared and detail
+    for parameter in (*infrared, *detail):
+        parameter.grad = torch.ones_like(parameter)
+
+    policy.scale_gradients(TaskType.MFIF)
+
+    assert all(torch.all(parameter.grad == 0.25) for parameter in infrared)
+    assert all(torch.all(parameter.grad == 1.0) for parameter in detail)
 
 
 from tfs_moe_fusion.losses import low_frequency_consistency

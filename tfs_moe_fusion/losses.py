@@ -9,6 +9,7 @@ from torch import Tensor
 from torch.nn import functional as F
 
 from tfs_moe_fusion.color import luminance, rgb_to_ycbcr
+from tfs_moe_fusion.ir_evidence import align_infrared_luminance
 
 
 def _depthwise(image: Tensor, kernel: Tensor) -> Tensor:
@@ -181,7 +182,7 @@ def focus_losses(
     }
 
 
-from tfs_moe_fusion.types import RouterDiagnostics
+from tfs_moe_fusion.types import RouterBalanceState, RouterDiagnostics
 
 
 def frequency_specialization(
@@ -284,7 +285,7 @@ def directional_gradient_loss(
     return F.l1_loss(fused_gx, target_gx) + F.l1_loss(fused_gy, target_gy)
 
 
-def soft_directional_gradient_targets(
+def independent_ir_structure_weight(
     visible_y: Tensor,
     infrared: Tensor,
     *,
@@ -292,12 +293,13 @@ def soft_directional_gradient_targets(
     visible_support_kernel: int = 3,
     transition: float = 0.15,
     min_magnitude: float = 0.02,
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Blend signed gradients only for confident IR-only structure.
+    max_weight: float = 1.0,
+) -> Tensor:
+    """Return an intensity-independent gate for confident IR-only structure.
 
     Nearby visible support suppresses an IR edge, which avoids widening a
-    slightly misregistered visible edge. The continuous gate makes the target
-    stable around the admission threshold.
+    slightly misregistered visible edge. A minimum-magnitude gate rejects flat
+    thermal noise, and the continuous gates remain stable around thresholds.
     """
     if ir_dominance_ratio < 1.0:
         raise ValueError("ir_dominance_ratio must be at least 1")
@@ -305,6 +307,8 @@ def soft_directional_gradient_targets(
         raise ValueError("visible_support_kernel must be positive and odd")
     if transition <= 0 or min_magnitude <= 0:
         raise ValueError("soft directional gradient parameters must be positive")
+    if not 0.0 <= max_weight <= 1.0:
+        raise ValueError("structure max_weight must be between 0 and 1")
     with torch.autocast(device_type=visible_y.device.type, enabled=False):
         visible_y, infrared = luminance(visible_y.float()), luminance(infrared.float())
         gx_v, gy_v = sobel(visible_y)
@@ -322,11 +326,64 @@ def soft_directional_gradient_targets(
             (dominance - ir_dominance_ratio) / transition
         )
         edge_gate = torch.sigmoid((magnitude_i - min_magnitude) / min_magnitude)
-        ir_weight = dominance_gate * edge_gate
+        return (dominance_gate * edge_gate).clamp(0, max_weight)
+
+
+def soft_directional_gradient_targets(
+    visible_y: Tensor,
+    infrared: Tensor,
+    *,
+    ir_dominance_ratio: float = 1.2,
+    visible_support_kernel: int = 3,
+    transition: float = 0.15,
+    min_magnitude: float = 0.02,
+    max_weight: float = 1.0,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Blend signed gradients only for confident IR-only structure."""
+    with torch.autocast(device_type=visible_y.device.type, enabled=False):
+        visible_y = luminance(visible_y.float())
+        infrared = luminance(infrared.float())
+        ir_weight = independent_ir_structure_weight(
+            visible_y,
+            infrared,
+            ir_dominance_ratio=ir_dominance_ratio,
+            visible_support_kernel=visible_support_kernel,
+            transition=transition,
+            min_magnitude=min_magnitude,
+            max_weight=max_weight,
+        )
+        gx_v, gy_v = sobel(visible_y)
+        gx_i, gy_i = sobel(infrared)
         return (
             torch.lerp(gx_v, gx_i, ir_weight),
             torch.lerp(gy_v, gy_i, ir_weight),
             ir_weight,
+        )
+
+
+def independent_directional_gradient_loss(
+    fused_y: Tensor,
+    visible_y: Tensor,
+    infrared_aligned: Tensor,
+    structure_weight: Tensor,
+    *,
+    charbonnier_epsilon: float = 1e-3,
+) -> Tensor:
+    """Match signed source gradients using a structure-only IR gate."""
+    if charbonnier_epsilon <= 0:
+        raise ValueError("charbonnier epsilon must be positive")
+    with torch.autocast(device_type=fused_y.device.type, enabled=False):
+        fused_y = luminance(fused_y.float())
+        visible_y = luminance(visible_y.float())
+        infrared_aligned = luminance(infrared_aligned.float())
+        weight = structure_weight.float().clamp(0, 1)
+        gx_v, gy_v = sobel(visible_y)
+        gx_i, gy_i = sobel(infrared_aligned)
+        target_gx = torch.lerp(gx_v, gx_i, weight)
+        target_gy = torch.lerp(gy_v, gy_i, weight)
+        gx_f, gy_f = sobel(fused_y)
+        return charbonnier(gx_f, target_gx, charbonnier_epsilon) + charbonnier(
+            gy_f, target_gy, charbonnier_epsilon
         )
 
 
@@ -411,23 +468,6 @@ def normalized_edge_energy(
     return magnitude / scale
 
 
-def align_infrared_luminance(visible: Tensor, infrared: Tensor) -> Tensor:
-    """Match each IR image's global mean and contrast to the visible luminance.
-
-    Visible and thermal sensors do not share an absolute brightness scale.  The
-    aligned signal is only a fusion target/reference; it preserves IR structure
-    while avoiding a global darkening or brightening caused by raw IR values.
-    """
-    visible_y, infrared_y = luminance(visible.float()), luminance(infrared.float())
-    dims = (-2, -1)
-    visible_mean = visible_y.mean(dims, keepdim=True)
-    infrared_mean = infrared_y.mean(dims, keepdim=True)
-    visible_std = visible_y.std(dims, keepdim=True, unbiased=False)
-    infrared_std = infrared_y.std(dims, keepdim=True, unbiased=False)
-    scale = (visible_std / infrared_std.clamp_min(1e-3)).clamp(0.25, 4.0)
-    return ((infrared_y - infrared_mean) * scale + visible_mean).clamp(0, 1)
-
-
 def adaptive_ir_blend_weight(
     visible: Tensor,
     infrared: Tensor,
@@ -492,6 +532,97 @@ def _smoothstep(value: Tensor, low: float, high: float) -> Tensor:
     return position.square() * (3 - 2 * position)
 
 
+def highlight_reconstruction_target(
+    normal_target: Tensor,
+    visible: Tensor,
+    infrared_aligned: Tensor,
+    structure_weight: Tensor,
+    *,
+    saturation_threshold: float,
+    saturation_transition: float,
+    rgb_clip_threshold: float,
+    local_std_threshold: float,
+    tone_knee: float,
+    tone_strength: float,
+    ir_detail_scale: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Compress clipped VIS highlights and inject bounded zero-mean IR detail."""
+    if saturation_transition <= 0 or local_std_threshold <= 0:
+        raise ValueError("highlight mask transitions must be positive")
+    if (
+        not 0 <= saturation_threshold < 1
+        or not 0 <= rgb_clip_threshold < 1
+        or not 0 <= tone_knee < 1
+    ):
+        raise ValueError("highlight clipping thresholds must be in [0, 1)")
+    if tone_strength <= 0 or ir_detail_scale < 0:
+        raise ValueError("highlight reconstruction scales are invalid")
+
+    with torch.autocast(device_type=visible.device.type, enabled=False):
+        visible_y = luminance(visible.float())
+        infrared_y = luminance(infrared_aligned.float())
+        local_mean = gaussian_low_pass(visible_y, 5, 1.0)
+        local_variance = (
+            gaussian_low_pass(visible_y.square(), 5, 1.0) - local_mean.square()
+        ).clamp_min(0)
+        flatness = 1 - _smoothstep(
+            local_variance.sqrt(), local_std_threshold, 2 * local_std_threshold
+        )
+        clipping = _smoothstep(
+            visible.float().amax(1, keepdim=True), rgb_clip_threshold, 1.0
+        )
+        brightness = torch.sigmoid(
+            (visible_y - saturation_threshold) / saturation_transition
+        )
+        saturation = (brightness * clipping * flatness).clamp(0, 1)
+        bloom = torch.maximum(
+            saturation, gaussian_low_pass(saturation, 9, 2.0)
+        ).clamp(0, 1)
+        ring = (bloom - saturation).clamp_min(0)
+
+        excess = (visible_y - tone_knee).clamp_min(0)
+        compressed = visible_y - excess + excess / (1 + tone_strength * excess)
+        detail = high_pass(infrared_y, 9, 2.0)
+        local_scale = gaussian_low_pass(detail.abs(), 9, 2.0).clamp_min(1e-3)
+        detail = (detail / local_scale).clamp(-1, 1)
+        core_target = (
+            compressed
+            + ir_detail_scale * structure_weight.float().clamp(0, 1) * detail
+        ).clamp(0, 1)
+        ring_target = torch.lerp(normal_target.float(), compressed, 0.5)
+        target = (
+            (1 - bloom) * normal_target.float()
+            + ring * ring_target
+            + saturation * core_target
+        )
+    return target.to(normal_target), saturation, bloom
+
+
+def highlight_reconstruction_losses(
+    fused_y: Tensor,
+    target: Tensor,
+    bloom: Tensor,
+    *,
+    charbonnier_epsilon: float = 1e-3,
+) -> tuple[Tensor, Tensor]:
+    """Return bloom-normalized intensity and signed-gradient reconstruction."""
+    with torch.autocast(device_type=fused_y.device.type, enabled=False):
+        fused_y, target, mask = fused_y.float(), target.float(), bloom.float().clamp(0, 1)
+        denominator = mask.sum(dim=(-2, -1)).clamp_min(1e-6)
+        intensity = (
+            ((fused_y - target).abs() * mask).sum((-2, -1)) / denominator
+        ).mean()
+        fused_gx, fused_gy = sobel(fused_y)
+        target_gx, target_gy = sobel(target)
+        gradient_error = torch.sqrt(
+            (fused_gx - target_gx).square() + charbonnier_epsilon**2
+        ) + torch.sqrt(
+            (fused_gy - target_gy).square() + charbonnier_epsilon**2
+        )
+        gradient = ((gradient_error * mask).sum((-2, -1)) / denominator).mean()
+    return intensity, gradient
+
+
 def hot_object_ir_blend_weight(
     visible: Tensor,
     infrared: Tensor,
@@ -508,6 +639,7 @@ def hot_object_ir_blend_weight(
     visible_support_kernel: int,
     smoothing_kernel: int,
     energy_normalization: str,
+    structure_decoupled: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Return aligned IR, its admission map, and a positive thermal-hot map.
 
@@ -557,9 +689,9 @@ def hot_object_ir_blend_weight(
 
     positive_contrast = (infrared_aligned - visible_y).clamp_min(0)
     hotness = _smoothstep(positive_contrast, hot_contrast_low, hot_contrast_high)
-    contextual_weight = (
-        dark_context_weight * darkness * reliability + edge_weight * edge_advantage
-    )
+    contextual_weight = dark_context_weight * darkness * reliability
+    if not structure_decoupled:
+        contextual_weight = contextual_weight + edge_weight * edge_advantage
     padding = smoothing_kernel // 2
     if padding:
         contextual_weight = F.avg_pool2d(
@@ -615,6 +747,7 @@ def vif_intensity_target(
     ir_hot_weight: float = 0.3,
     ir_dark_context_weight: float = 0.45,
     ir_edge_weight: float = 0.08,
+    ir_structure_decoupled: bool = False,
     visible_support_kernel: int = 3,
     weight_smoothing_kernel: int = 3,
 ) -> tuple[Tensor, Tensor | None]:
@@ -651,6 +784,7 @@ def vif_intensity_target(
             visible_support_kernel=visible_support_kernel,
             smoothing_kernel=weight_smoothing_kernel,
             energy_normalization=energy_normalization,
+            structure_decoupled=ir_structure_decoupled,
         )
         return visible_y + weight * (infrared_aligned - visible_y).clamp_min(0), weight
     if mode != "gradient_weighted_visible_anchor":
@@ -717,9 +851,13 @@ def vif_losses(
     ir_hot_weight: float = 0.3,
     ir_dark_context_weight: float = 0.45,
     ir_edge_weight: float = 0.08,
+    ir_structure_decoupled: bool = False,
     intensity_visible_support_kernel: int = 3,
     intensity_weight_smoothing_kernel: int = 3,
     intensity_weight: Tensor | None = None,
+    structure_weight: Tensor | None = None,
+    ir_structure_max_weight: float = 1.0,
+    structure_ssim_scale: float = 0.4,
     gradient_mode: str = "magnitude_max",
     ir_gradient_dominance_ratio: float = 1.2,
     visible_gradient_support_kernel: int = 3,
@@ -761,6 +899,7 @@ def vif_losses(
             visible_support_kernel=intensity_visible_support_kernel,
             smoothing_kernel=intensity_weight_smoothing_kernel,
             energy_normalization=intensity_energy_normalization,
+            structure_decoupled=ir_structure_decoupled,
         )
         if intensity_weight is None:
             intensity_weight = computed_weight
@@ -779,8 +918,22 @@ def vif_losses(
             ir_hot_weight=ir_hot_weight,
             ir_dark_context_weight=ir_dark_context_weight,
             ir_edge_weight=ir_edge_weight,
+            ir_structure_decoupled=ir_structure_decoupled,
             visible_support_kernel=intensity_visible_support_kernel,
             weight_smoothing_kernel=intensity_weight_smoothing_kernel,
+        )
+    if structure_weight is None and (
+        gradient_mode == "independent_directional"
+        or ssim_mode == "structure_adaptive"
+    ):
+        structure_weight = independent_ir_structure_weight(
+            visible_y,
+            infrared_reference,
+            ir_dominance_ratio=ir_gradient_dominance_ratio,
+            visible_support_kernel=visible_gradient_support_kernel,
+            transition=gradient_transition,
+            min_magnitude=gradient_min_magnitude,
+            max_weight=ir_structure_max_weight,
         )
     if gradient_mode == "magnitude_max":
         target_gradient = torch.maximum(
@@ -818,6 +971,16 @@ def vif_losses(
             intensity_weight,
             charbonnier_epsilon=gradient_charbonnier_epsilon,
         )
+    elif gradient_mode == "independent_directional":
+        if structure_weight is None:
+            raise ValueError("independent_directional requires a structure weight")
+        gradient_loss = independent_directional_gradient_loss(
+            predicted_y,
+            visible_y,
+            infrared_reference,
+            structure_weight,
+            charbonnier_epsilon=gradient_charbonnier_epsilon,
+        )
     else:
         raise ValueError(f"Unknown VIF gradient mode: {gradient_mode}")
     color = fused.new_zeros(())
@@ -840,6 +1003,15 @@ def vif_losses(
         selected_ssim = (
             (1 - intensity_weight.float()) * visible_map
             + intensity_weight.float() * infrared_map
+        ).mean()
+    elif ssim_mode == "structure_adaptive":
+        if structure_weight is None:
+            raise ValueError("structure_adaptive SSIM requires a structure weight")
+        visible_map = ssim_map(predicted_y, visible_y)
+        infrared_map = ssim_map(predicted_y, infrared_reference)
+        ssim_weight = (structure_ssim_scale * structure_weight.float()).clamp(0, 1)
+        selected_ssim = (
+            (1 - ssim_weight) * visible_map + ssim_weight * infrared_map
         ).mean()
     else:
         raise ValueError(f"Unknown VIF SSIM mode: {ssim_mode}")
@@ -894,12 +1066,12 @@ def mfif_losses(
 
 
 def moe_balance_loss(
-    diagnostics: tuple[RouterDiagnostics, ...],
+    states: tuple[RouterBalanceState, ...],
 ) -> tuple[Tensor, Tensor, Tensor]:
-    if not diagnostics:
-        raise ValueError("MoE balance requires router diagnostics")
+    if not states:
+        raise ValueError("MoE balance requires live router states")
     importance_losses, load_losses, entropies = [], [], []
-    for item in diagnostics:
+    for item in states:
         valid = item.valid_expert_mask.float()
         reduce_dims = tuple(index for index in range(valid.ndim) if index != 1)
         target = valid.mean(reduce_dims)
@@ -907,16 +1079,13 @@ def moe_balance_loss(
         importance = item.probabilities.mean(
             tuple(index for index in range(item.probabilities.ndim) if index != 1)
         )
-        hard_load = (
-            item.hard_load.detach()
-            if item.hard_load is not None
-            else torch.nn.functional.one_hot(
-                item.topk_indices, item.probabilities.shape[1]
-            )
-            .float()
-            .mean((0, 1))
-            .detach()
-        )
+        hard_load = item.hard_load
+        if hard_load is None:
+            assignments = F.one_hot(
+                item.probabilities.argmax(1), item.probabilities.shape[1]
+            ).float()
+            hard_load = assignments.mean(tuple(range(assignments.ndim - 1)))
+        hard_load = hard_load.detach()
         effective_experts = (target > 0).sum().to(importance)
         importance_losses.append((importance - target).square().sum())
         load_losses.append(effective_experts * (importance * hard_load).sum())
@@ -926,6 +1095,66 @@ def moe_balance_loss(
         torch.stack(load_losses).mean(),
         torch.stack(entropies).mean(),
     )
+
+
+def availability_conditioned_router_usage(
+    state: RouterBalanceState,
+) -> tuple[Tensor, Tensor]:
+    """Return per-expert soft usage and physical-evidence support."""
+
+    probabilities = state.probabilities.float()
+    valid = state.valid_expert_mask
+    spatial_dims = probabilities.ndim - 2
+    expanded_valid = valid.reshape(*valid.shape, *((1,) * spatial_dims)).to(
+        probabilities
+    )
+    if state.opportunity_weights is None:
+        opportunity = expanded_valid.expand_as(probabilities)
+    else:
+        opportunity = state.opportunity_weights.detach().float()
+        if opportunity.shape != probabilities.shape:
+            raise ValueError(
+                "Router starvation opportunity weights must match probabilities"
+            )
+        opportunity = opportunity.to(probabilities) * expanded_valid
+    reduce_dims = tuple(index for index in range(probabilities.ndim) if index != 1)
+    denominator = opportunity.sum(reduce_dims)
+    usage = (probabilities * opportunity).sum(reduce_dims) / denominator.clamp_min(
+        1e-8
+    )
+    possible = expanded_valid.expand_as(probabilities).sum(reduce_dims)
+    support = denominator / possible.clamp_min(1)
+    return usage, support
+
+
+def moe_starvation_floor_loss(
+    states: tuple[RouterBalanceState, ...],
+    strengths: dict[str, list[float]],
+    *,
+    threshold: float,
+    evidence_threshold: float,
+) -> Tensor:
+    """Apply a one-sided usage floor only to monitor-confirmed starving experts."""
+
+    if not states:
+        raise ValueError("MoE starvation prevention requires live router states")
+    terms: list[Tensor] = []
+    for state in states:
+        active = strengths.get(state.block_id)
+        if active is None:
+            continue
+        usage, support = availability_conditioned_router_usage(state)
+        strength = usage.new_tensor(active)
+        if strength.numel() != usage.numel():
+            raise ValueError("MoE starvation strength count does not match experts")
+        eligible = support >= evidence_threshold
+        selected = (strength > 0) & eligible
+        if selected.any():
+            deficit = ((threshold - usage) / threshold).clamp_min(0).square()
+            terms.extend((deficit * strength)[selected].unbind())
+    if terms:
+        return torch.stack(terms).mean()
+    return sum(state.probabilities.sum() for state in states) * 0
 
 
 def residual_magnitude(refinement: Tensor | None, fused: Tensor) -> Tensor:
@@ -999,7 +1228,11 @@ class MultiTaskLossManager(nn.Module):
         weights: dict[str, float] = {}
         skipped: dict[str, str] = {}
         intensity_weight: Tensor | None = None
+        structure_weight: Tensor | None = None
         hotness: Tensor | None = None
+        highlight_target: Tensor | None = None
+        saturation_mask: Tensor | None = None
+        bloom_mask: Tensor | None = None
         hot_infrared_reference: Tensor | None = None
         hot_target_reference: Tensor | None = None
         output, batch = context.output, context.batch
@@ -1020,6 +1253,7 @@ class MultiTaskLossManager(nn.Module):
                 ir_hot_weight=vif_config.ir_hot_weight,
                 ir_dark_context_weight=vif_config.ir_dark_context_weight,
                 ir_edge_weight=vif_config.ir_edge_weight,
+                ir_structure_decoupled=vif_config.ir_structure_decoupled,
                 visible_support_kernel=vif_config.intensity_visible_support_kernel,
                 weight_smoothing_kernel=(vif_config.intensity_weight_smoothing_kernel),
             )
@@ -1046,9 +1280,55 @@ class MultiTaskLossManager(nn.Module):
                         energy_normalization=(
                             vif_config.intensity_energy_normalization
                         ),
+                        structure_decoupled=vif_config.ir_structure_decoupled,
                     )
                 )
-                hot_target_reference = target_intensity
+            highlight_active = (
+                vif_config.highlight_reconstruction_weight > 0
+                or vif_config.highlight_gradient_weight > 0
+            )
+            if vif_config.ir_structure_decoupled or highlight_active:
+                structure_reference = (
+                    hot_infrared_reference
+                    if hot_infrared_reference is not None
+                    else align_infrared_luminance(visible, infrared)
+                )
+                structure_weight = independent_ir_structure_weight(
+                    visible,
+                    structure_reference,
+                    ir_dominance_ratio=vif_config.ir_gradient_dominance_ratio,
+                    visible_support_kernel=(
+                        vif_config.visible_gradient_support_kernel
+                    ),
+                    transition=vif_config.gradient_transition,
+                    min_magnitude=vif_config.gradient_min_magnitude,
+                    max_weight=vif_config.ir_structure_max_weight,
+                )
+            if highlight_active:
+                assert structure_weight is not None
+                highlight_target, saturation_mask, bloom_mask = (
+                    highlight_reconstruction_target(
+                        target_intensity,
+                        visible,
+                        structure_reference,
+                        structure_weight,
+                        saturation_threshold=(
+                            vif_config.highlight_saturation_threshold
+                        ),
+                        saturation_transition=(
+                            vif_config.highlight_saturation_transition
+                        ),
+                        rgb_clip_threshold=vif_config.highlight_rgb_clip_threshold,
+                        local_std_threshold=(
+                            vif_config.highlight_local_std_threshold
+                        ),
+                        tone_knee=vif_config.highlight_tone_knee,
+                        tone_strength=vif_config.highlight_tone_strength,
+                        ir_detail_scale=vif_config.highlight_ir_detail_scale,
+                    )
+                )
+                target_intensity = highlight_target
+            hot_target_reference = target_intensity
             final_vif = vif_losses(
                 output.fused,
                 visible,
@@ -1066,6 +1346,7 @@ class MultiTaskLossManager(nn.Module):
                 ir_hot_weight=vif_config.ir_hot_weight,
                 ir_dark_context_weight=vif_config.ir_dark_context_weight,
                 ir_edge_weight=vif_config.ir_edge_weight,
+                ir_structure_decoupled=vif_config.ir_structure_decoupled,
                 intensity_visible_support_kernel=(
                     vif_config.intensity_visible_support_kernel
                 ),
@@ -1073,6 +1354,9 @@ class MultiTaskLossManager(nn.Module):
                     vif_config.intensity_weight_smoothing_kernel
                 ),
                 intensity_weight=intensity_weight,
+                structure_weight=structure_weight,
+                ir_structure_max_weight=vif_config.ir_structure_max_weight,
+                structure_ssim_scale=vif_config.structure_ssim_scale,
                 gradient_mode=vif_config.gradient_mode,
                 ir_gradient_dominance_ratio=vif_config.ir_gradient_dominance_ratio,
                 visible_gradient_support_kernel=(
@@ -1104,17 +1388,42 @@ class MultiTaskLossManager(nn.Module):
                     if output.fused_y is not None
                     else luminance(output.fused)
                 )
+                effective_hotness = (
+                    hotness
+                    if bloom_mask is None
+                    else hotness * (1 - bloom_mask.to(hotness))
+                )
                 components["fusion/hot_underexposure"] = hot_underexposure_loss(
                     predicted_y,
                     visible,
                     hot_infrared_reference,
-                    hotness,
+                    effective_hotness,
                     minimum_contrast_retention=(
                         vif_config.hot_minimum_contrast_retention
                     ),
                 )
                 weights["fusion/hot_underexposure"] = (
                     vif_config.hot_underexposure_weight
+                )
+            if highlight_target is not None and bloom_mask is not None:
+                predicted_y = (
+                    output.fused_y
+                    if output.fused_y is not None
+                    else luminance(output.fused)
+                )
+                reconstruction, highlight_gradient = highlight_reconstruction_losses(
+                    predicted_y,
+                    highlight_target,
+                    bloom_mask,
+                    charbonnier_epsilon=vif_config.gradient_charbonnier_epsilon,
+                )
+                components["fusion/highlight_reconstruction"] = reconstruction
+                components["fusion/highlight_gradient"] = highlight_gradient
+                weights["fusion/highlight_reconstruction"] = (
+                    vif_config.highlight_reconstruction_weight
+                )
+                weights["fusion/highlight_gradient"] = (
+                    vif_config.highlight_gradient_weight
                 )
             if output.coarse is not None:
                 coarse = (
@@ -1140,6 +1449,7 @@ class MultiTaskLossManager(nn.Module):
                         ir_hot_weight=vif_config.ir_hot_weight,
                         ir_dark_context_weight=vif_config.ir_dark_context_weight,
                         ir_edge_weight=vif_config.ir_edge_weight,
+                        ir_structure_decoupled=vif_config.ir_structure_decoupled,
                         intensity_visible_support_kernel=(
                             vif_config.intensity_visible_support_kernel
                         ),
@@ -1147,6 +1457,11 @@ class MultiTaskLossManager(nn.Module):
                             vif_config.intensity_weight_smoothing_kernel
                         ),
                         intensity_weight=intensity_weight,
+                        structure_weight=structure_weight,
+                        ir_structure_max_weight=(
+                            vif_config.ir_structure_max_weight
+                        ),
+                        structure_ssim_scale=vif_config.structure_ssim_scale,
                         gradient_mode=vif_config.gradient_mode,
                         ir_gradient_dominance_ratio=(
                             vif_config.ir_gradient_dominance_ratio
@@ -1219,6 +1534,9 @@ class MultiTaskLossManager(nn.Module):
             "chroma_cr_error",
             "y_gamut_clip_ratio",
             "coarse_final_y_mae",
+            "y_residual_rms",
+            "y_residual_to_coarse_ratio",
+            "y_residual_scale",
         ):
             if name in output.debug:
                 value = output.debug[name]
@@ -1258,6 +1576,35 @@ class MultiTaskLossManager(nn.Module):
                         "ir_hotness_mean": hotness.mean().detach(),
                         "ir_hotness_active_ratio": (
                             (hotness > 0).float().mean().detach()
+                        ),
+                    }
+                )
+            if structure_weight is not None:
+                diagnostics.update(
+                    {
+                        "ir_structure_weight_mean": (
+                            structure_weight.mean().detach()
+                        ),
+                        "ir_structure_weight_max": (
+                            structure_weight.amax().detach()
+                        ),
+                        "ir_structure_weight_active_ratio": (
+                            (structure_weight > 0.5).float().mean().detach()
+                        ),
+                    }
+                )
+            if saturation_mask is not None and bloom_mask is not None:
+                diagnostics.update(
+                    {
+                        "highlight_saturation_ratio": saturation_mask.mean().detach(),
+                        "highlight_bloom_ratio": bloom_mask.mean().detach(),
+                        "highlight_target_reduction": (
+                            (luminance(visible) - target_intensity)
+                            .clamp_min(0)
+                            .mul(saturation_mask)
+                            .sum()
+                            .div(saturation_mask.sum().clamp_min(1e-6))
+                            .detach()
                         ),
                     }
                 )
@@ -1430,9 +1777,9 @@ class MultiTaskLossManager(nn.Module):
                 )
         elif self.config.frequency.enabled:
             skipped["frequency"] = "No router diagnostics"
-        if self.config.moe.enabled and output.router_diagnostics:
+        if self.config.moe.enabled and output.router_balance_states:
             soft_balance, switch_balance, router_entropy = moe_balance_loss(
-                output.router_diagnostics
+                output.router_balance_states
             )
             components.update(
                 {
