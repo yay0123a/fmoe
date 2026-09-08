@@ -1,0 +1,23 @@
+_base_: stage9_specialist_feedback_space.yaml
+
+experiment:
+  name: stage10_msrs_mfif_unfrozen
+
+model:
+  guidance:
+    focus:
+      # Focus supervision trains the focus head without dominating the shared
+      # source backbone. MFIF reconstruction losses still update the full
+      # fusion path below.
+      detach_backbone_features: true
+
+training:
+  task_update_policy:
+    freeze:
+      _replace_: true
+      vif: []
+      mfif:
+        - shared_ir
+    # Remove the conservative MFIF gradient scaling inherited from Stage 8.
+    gradient_scales:
+      _replace_: true

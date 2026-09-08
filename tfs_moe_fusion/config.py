@@ -23,6 +23,14 @@ class BackboneConfig:
     name: str = "custom_multiscale"
     channels: list[int] = field(default_factory=lambda: [48, 96, 192, 384])
     depths: list[int] = field(default_factory=lambda: [2, 2, 4, 4])
+    source_block: str = "lama"
+    lama_heads: list[int] = field(default_factory=lambda: [2, 4, 8, 16])
+    lama_mlp_ratio: float = 2.0
+    lama_qkv_bias: bool = True
+    mdc_enabled: bool = True
+    mdc_placements: list[str] = field(default_factory=lambda: ["s1", "s2"])
+    mdc_kernels: list[int] = field(default_factory=lambda: [3, 5])
+    mdc_dilation: int = 2
     max_downsample: int = 8
     normalization: str = "group_norm"
     shared_source_encoder: bool = True
@@ -636,6 +644,27 @@ class ProjectConfig:
             )
         if any(value <= 0 for value in backbone.channels + backbone.depths):
             raise ConfigurationError("backbone channels/depths must be positive")
+        if backbone.source_block not in {"convnext_like", "lama"}:
+            raise ConfigurationError(
+                "backbone.source_block must be convnext_like or lama"
+            )
+        if len(backbone.lama_heads) != len(backbone.channels) or any(
+            value <= 0 for value in backbone.lama_heads
+        ):
+            raise ConfigurationError(
+                "backbone.lama_heads must contain one positive value per stage"
+            )
+        if backbone.source_block == "lama" and any(
+            channels % heads
+            for channels, heads in zip(
+                backbone.channels, backbone.lama_heads, strict=True
+            )
+        ):
+            raise ConfigurationError(
+                "Each backbone channel count must be divisible by its LAMA head count"
+            )
+        if backbone.lama_mlp_ratio <= 0:
+            raise ConfigurationError("backbone.lama_mlp_ratio must be positive")
         if backbone.normalization not in {"group_norm", "layer_norm_2d", "identity"}:
             raise ConfigurationError(
                 "backbone.normalization must be group_norm, layer_norm_2d, or identity"
@@ -654,6 +683,18 @@ class ProjectConfig:
 
         frequency = model.frequency
         legal_stages = {f"s{index + 1}" for index in range(len(backbone.channels))}
+        if not set(backbone.mdc_placements) <= legal_stages:
+            raise ConfigurationError(
+                f"backbone.mdc_placements must be a subset of {sorted(legal_stages)}"
+            )
+        if (
+            len(backbone.mdc_kernels) != 2
+            or any(value <= 0 or value % 2 == 0 for value in backbone.mdc_kernels)
+            or backbone.mdc_dilation <= 0
+        ):
+            raise ConfigurationError(
+                "backbone MDC requires two positive odd kernels and positive dilation"
+            )
         if not set(frequency.placements) <= legal_stages:
             raise ConfigurationError(
                 f"frequency.placements must be a subset of {sorted(legal_stages)}"

@@ -137,6 +137,7 @@ class FusionBackbone(nn.Module, ABC):
 import torch
 from torch import nn
 
+from tfs_moe_fusion.acl_blocks import ACLStage
 from tfs_moe_fusion.color import compose_luminance_with_visible_chroma
 from tfs_moe_fusion.config import BackboneConfig, FrequencyConfig, MoEConfig
 from tfs_moe_fusion.frequency import (
@@ -378,6 +379,12 @@ class CustomMultiscaleBackbone(FusionBackbone):
             raise ValueError("The fusion backbone requires exactly four stages")
         settings = backbone_config or BackboneConfig(channels=channels, depths=depths)
         self.channels, self.depths = tuple(channels), tuple(depths)
+        self.source_block = settings.source_block
+        self.mdc_placements = (
+            tuple(settings.mdc_placements)
+            if settings.source_block == "lama" and settings.mdc_enabled
+            else ()
+        )
         self.padder = ArbitrarySizePadder(pad_multiple)
         self.stats_extractor = SpectralStatsExtractor(frequency.statistics_detach)
         self.stems = ModalityStemBank(channels[0])
@@ -395,12 +402,33 @@ class CustomMultiscaleBackbone(FusionBackbone):
             settings.drop_path,
             settings.normalization,
         )
-        self.source_stages = nn.ModuleList(
-            [
-                nn.Sequential(*[block(c) for _ in range(d)])
-                for c, d in zip(channels, depths, strict=True)
-            ]
-        )
+        if settings.source_block == "lama":
+            self.source_stages = nn.ModuleList(
+                [
+                    ACLStage(
+                        channels=c,
+                        depth=d,
+                        num_heads=settings.lama_heads[index],
+                        mlp_ratio=settings.lama_mlp_ratio,
+                        qkv_bias=settings.lama_qkv_bias,
+                        drop_path=settings.drop_path,
+                        use_mdc=settings.mdc_enabled
+                        and f"s{index + 1}" in settings.mdc_placements,
+                        mdc_kernels=tuple(settings.mdc_kernels),
+                        mdc_dilation=settings.mdc_dilation,
+                    )
+                    for index, (c, d) in enumerate(
+                        zip(channels, depths, strict=True)
+                    )
+                ]
+            )
+        else:
+            self.source_stages = nn.ModuleList(
+                [
+                    nn.Sequential(*[block(c) for _ in range(d)])
+                    for c, d in zip(channels, depths, strict=True)
+                ]
+            )
         self.fused_stages = nn.ModuleList(
             [
                 nn.Sequential(*[block(c) for _ in range(d)])
@@ -608,6 +636,8 @@ class CustomMultiscaleBackbone(FusionBackbone):
             "scientific_model": True,
             "padding": padding,
             "source_encoder_shared": True,
+            "source_block": self.source_block,
+            "mdc_placements": self.mdc_placements,
             "coarse_head": head_name,
             "cross_modal": tuple(cross_modal),
             "frequency_placements": tuple(sorted(self.frequency_blocks)),

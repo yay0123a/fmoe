@@ -12,6 +12,14 @@ model:
     name: custom_multiscale
     channels: [48, 96, 192, 384]
     depths: [2, 2, 4, 4]
+    source_block: lama
+    lama_heads: [2, 4, 8, 16]
+    lama_mlp_ratio: 2.0
+    lama_qkv_bias: true
+    mdc_enabled: true
+    mdc_placements: [s1, s2]
+    mdc_kernels: [3, 5]
+    mdc_dilation: 2
     max_downsample: 8
     normalization: group_norm
     shared_source_encoder: true
