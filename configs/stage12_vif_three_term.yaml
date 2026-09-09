@@ -1,0 +1,20 @@
+_base_: stage11_vif_adaptive_intensity.yaml
+
+experiment:
+  name: stage12_msrs_vif_three_term
+
+training:
+  losses:
+    vif:
+      active_terms: [intensity, gradient, ssim]
+      gradient_mode: multi_scale_reliable_angular
+      angular_beta: 0.2
+      angular_edge_threshold: 0.02
+      gradient_scale_initial_weights: [0.7, 0.3]
+      gradient_scale_min_weight: 0.1
+      ssim_mode: structure_adaptive_multi_window
+      ssim_window_initial_weights: [0.5, 0.3, 0.2]
+      ssim_window_min_weight: 0.05
+      ssim_window_sigmas: [1.5, 3.5, 7.0]
+      # Use the full structure reliability for source selection in this mode.
+      structure_ssim_scale: 1.0

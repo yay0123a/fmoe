@@ -110,7 +110,34 @@ def load_checkpoint(
 
     incompatible = model.load_state_dict(payload["model"], strict=strict)
     if optimizer is not None and payload.get("optimizer") is not None:
-        optimizer.load_state_dict(payload["optimizer"])
+        optimizer_state = payload["optimizer"]
+        try:
+            optimizer.load_state_dict(optimizer_state)
+        except ValueError:
+            # Step-1 checkpoints add one loss-parameter group. Allow a legacy
+            # model-only optimizer state to seed the new experiment while
+            # leaving that final group freshly initialized.
+            current_state = optimizer.state_dict()
+            saved_groups = optimizer_state.get("param_groups", [])
+            current_groups = current_state.get("param_groups", [])
+            compatible_legacy_state = (
+                len(current_groups) == len(saved_groups) + 1
+                and current_groups[-1].get("group_name") == "vif_loss_weights"
+            )
+            if not compatible_legacy_state:
+                raise ValueError(
+                    "Checkpoint optimizer parameter groups do not match this experiment. "
+                    "When adding new loss terms, use --init-checkpoint to load model "
+                    "weights with fresh loss parameters and optimizer state."
+                ) from None
+            migrated_state = {
+                **optimizer_state,
+                "param_groups": [
+                    *(dict(group) for group in saved_groups),
+                    dict(current_groups[-1]),
+                ],
+            }
+            optimizer.load_state_dict(migrated_state)
     if restore_rng:
         # ``map_location`` applies to every tensor in the checkpoint, including
         # RNG states.  CPU RNG state restoration only accepts a CPU ByteTensor,
@@ -272,6 +299,25 @@ def reduce_mean(value: Tensor) -> Tensor:
     result = value.detach().clone()
     torch.distributed.all_reduce(result)
     return result / torch.distributed.get_world_size()
+
+
+@torch.no_grad()
+def synchronize_module_parameters(module: nn.Module) -> None:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    for parameter in module.parameters():
+        torch.distributed.broadcast(parameter, src=0)
+
+
+@torch.no_grad()
+def synchronize_module_gradients(module: nn.Module) -> None:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    world_size = torch.distributed.get_world_size()
+    for parameter in module.parameters():
+        if parameter.grad is not None:
+            torch.distributed.all_reduce(parameter.grad)
+            parameter.grad.div_(world_size)
 
 
 from collections.abc import Iterator
@@ -1158,19 +1204,25 @@ class GradientConflictMonitor:
 
 
 def gradient_statistics(
-    model: nn.Module, *, max_norm: float | None = None
+    model: nn.Module,
+    *,
+    max_norm: float | None = None,
+    extra_parameters: tuple[nn.Parameter, ...] = (),
 ) -> dict[str, float]:
+    parameters: tuple[nn.Parameter, ...] = tuple(model.parameters()) + tuple(
+        extra_parameters
+    )
     if max_norm is not None:
         # Clipping already computes the global norm. Materialize it once and
         # keep the per-step non-finite guard before the optimizer update.
-        norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm))
+        norm = float(torch.nn.utils.clip_grad_norm_(parameters, max_norm))
         return {
             "gradient_norm": norm,
             "nonfinite_gradients": float(not math.isfinite(norm)),
         }
     gradients = [
         parameter.grad.detach().float().norm()
-        for parameter in model.parameters()
+        for parameter in parameters
         if parameter.grad is not None
     ]
     if not gradients:
@@ -1713,9 +1765,26 @@ class Trainer:
         self.checkpoint_dir = self.run_dir / "checkpoints"
         self.logger = logger or logging.getLogger(__name__)
         self.loss_manager = MultiTaskLossManager(config.training.losses).to(device)
+        synchronize_module_parameters(self.loss_manager)
         self.optimizer, self.registry = build_optimizer(
             model, config.training.optimizer
         )
+        self.loss_parameters = tuple(self.loss_manager.parameters())
+        if self.loss_parameters:
+            loss_lr = (
+                config.training.optimizer.learning_rate
+                * config.training.losses.vif.adaptive_weight_lr_multiplier
+            )
+            self.optimizer.add_param_group(
+                {
+                    "params": self.loss_parameters,
+                    "lr": loss_lr,
+                    "initial_lr": loss_lr,
+                    "weight_decay": 0.0,
+                    "group_name": "vif_loss_weights",
+                    "no_decay": True,
+                }
+            )
         self.model = (
             wrap_ddp(
                 self.raw_model,
@@ -1823,6 +1892,15 @@ class Trainer:
                             "ir_intensity_weight_active_ratio",
                             "ir_hotness_mean",
                             "ir_hotness_active_ratio",
+                            "highlight_mask_ratio",
+                            "highlight_core_ratio",
+                            "ir_positive_target_gain",
+                            "loss_weight/intensity",
+                            "loss_weight/gradient",
+                            "loss_weight/ssim",
+                            "loss_log_var/intensity",
+                            "loss_log_var/gradient",
+                            "loss_log_var/ssim",
                             "router_ir_importance",
                             "router_ir_hard_load",
                             "router_ir_weighted_contribution_rms",
@@ -1835,6 +1913,14 @@ class Trainer:
                         )
                         if name in result.diagnostics
                     }
+                    y_only_metrics.update({
+                        name: value for name, value in result.diagnostics.items()
+                        if name.startswith((
+                            "raw_loss/", "loss_active/", "gradient_scale_weight/",
+                            "ssim_window_weight/", "gradient_reconstruction/",
+                            "gradient_angular/", "ssim_window_loss/", "ir_structure_weight/",
+                        ))
+                    })
                     log_metrics = _scalar_metrics_to_cpu(
                         {
                             **{
@@ -2026,6 +2112,12 @@ class Trainer:
         compute_frequency, compute_infrared = expert_regularizer_flags(
             config.losses, loss_multipliers, task
         )
+        adaptive_vif = (
+            task is TaskType.VIF
+            and config.losses.vif.objective_mode == "adaptive_three_term"
+        )
+        if adaptive_vif:
+            compute_frequency = compute_infrared = False
         execution_policy = replace(
             execution_policy,
             compute_frequency_regularizers=compute_frequency,
@@ -2087,7 +2179,7 @@ class Trainer:
                         )
                     )
                     starvation = config.losses.moe_starvation
-                    if starvation.enabled and not (
+                    if starvation.enabled and not adaptive_vif and not (
                         execution_policy is not None
                         and execution_policy.expert_only
                     ):
@@ -2123,6 +2215,7 @@ class Trainer:
                 self.state.micro_step += 1
         assert aggregate is not None
         self.amp.unscale_(self.optimizer)
+        synchronize_module_gradients(self.loss_manager)
         self.policy.scale_gradients(task)
         diagnostics_due = self.state.global_step % config.diagnostics.interval == 0
         gradient_info = {}
@@ -2135,11 +2228,13 @@ class Trainer:
                 max_norm=config.gradient_clip.max_norm
                 if config.gradient_clip.enabled
                 else None,
+                extra_parameters=self.loss_parameters,
             )
         )
         if gradient_info["nonfinite_gradients"]:
             raise FloatingPointError("Training produced non-finite gradients")
         self.amp.step(self.optimizer)
+        self.loss_manager.clamp_adaptive_parameters_()
         self.scheduler.step()
         if self.ema is not None:
             self.ema.update(self.raw_model)
@@ -2210,6 +2305,7 @@ class Trainer:
                 "provider": self.provider.state_dict(),
                 "gradient_conflicts": self.gradient_conflicts.state_dict(),
                 "router_monitor": self.router_monitor.state_dict(),
+                "loss_manager": self.loss_manager.state_dict(),
             },
             metadata=metadata,
         )
@@ -2242,7 +2338,20 @@ class Trainer:
                 "cannot resume training"
             )
         if report.scheduler_state is not None:
-            self.scheduler.load_state_dict(report.scheduler_state)
+            scheduler_state = dict(report.scheduler_state)
+            base_lrs = list(scheduler_state.get("base_lrs", ()))
+            if (
+                self.loss_parameters
+                and len(base_lrs) + 1 == len(self.optimizer.param_groups)
+            ):
+                loss_group = self.optimizer.param_groups[-1]
+                base_lrs.append(float(loss_group["initial_lr"]))
+                scheduler_state["base_lrs"] = base_lrs
+                last_lrs = list(scheduler_state.get("_last_lr", ()))
+                if len(last_lrs) + 1 == len(self.optimizer.param_groups):
+                    last_lrs.append(float(loss_group["lr"]))
+                    scheduler_state["_last_lr"] = last_lrs
+            self.scheduler.load_state_dict(scheduler_state)
         if report.scaler_state is not None:
             self.amp.scaler.load_state_dict(report.scaler_state)
         if self.ema is not None and report.ema_state is not None:
@@ -2250,6 +2359,14 @@ class Trainer:
         if report.sampler_state is not None:
             self.task_sampler.load_state_dict(report.sampler_state)
         state = report.engine_state or {}
+        if "loss_manager" in state:
+            loss_state = state["loss_manager"]
+            if (
+                "loss_log_vars" in loss_state
+                or self.loss_manager.loss_log_vars is None
+            ):
+                self.loss_manager.load_state_dict(loss_state)
+            synchronize_module_parameters(self.loss_manager)
         if "trainer" in state:
             self.state = TrainerState(**state["trainer"])
         else:
@@ -2277,6 +2394,11 @@ class Trainer:
         config = self.config.training.losses.consistency
         return (
             config.enabled
+            and not (
+                task is TaskType.VIF
+                and self.config.training.losses.vif.objective_mode
+                == "adaptive_three_term"
+            )
             and task in {TaskType.VIF, TaskType.SEG}
             and random.random() < config.probability
         )

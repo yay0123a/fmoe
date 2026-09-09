@@ -532,6 +532,143 @@ def _smoothstep(value: Tensor, low: float, high: float) -> Tensor:
     return position.square() * (3 - 2 * position)
 
 
+def _replicated_gaussian_low_pass(
+    image: Tensor, size: int, sigma: float
+) -> Tensor:
+    channels = image.shape[1]
+    kernel = gaussian_kernel(size, sigma, image).expand(channels, 1, size, size)
+    padding = size // 2
+    padded = F.pad(image, (padding, padding, padding, padding), mode="replicate")
+    return F.conv2d(padded, kernel, groups=channels)
+
+
+def build_highlight_mask(
+    visible: Tensor,
+    *,
+    saturation_threshold: float,
+    saturation_transition: float,
+    rgb_clip_threshold: float,
+    local_std_threshold: float,
+    core_threshold: float,
+) -> tuple[Tensor, Tensor]:
+    """Return soft tone-compression and hard highlight-core masks."""
+    if saturation_transition <= 0 or local_std_threshold <= 0:
+        raise ValueError("highlight mask transitions must be positive")
+    if not 0 <= saturation_threshold < 1 or not 0 <= rgb_clip_threshold < 1:
+        raise ValueError("highlight thresholds must be in [0, 1)")
+    if not 0 < core_threshold <= 1:
+        raise ValueError("highlight core_threshold must be in (0, 1]")
+
+    with torch.autocast(device_type=visible.device.type, enabled=False):
+        visible_fp32 = visible.float()
+        visible_y = luminance(visible_fp32)
+        local_mean = _replicated_gaussian_low_pass(visible_y, 5, 1.0)
+        local_variance = (
+            _replicated_gaussian_low_pass(visible_y.square(), 5, 1.0)
+            - local_mean.square()
+        ).clamp_min(0)
+        flatness = 1 - _smoothstep(
+            local_variance.sqrt(), local_std_threshold, 2 * local_std_threshold
+        )
+        brightness_high = min(1.0, saturation_threshold + saturation_transition)
+        brightness = _smoothstep(
+            visible_y, saturation_threshold, brightness_high
+        )
+        clipping = _smoothstep(
+            visible_fp32.amax(1, keepdim=True), rgb_clip_threshold, 1.0
+        )
+        soft_mask = (brightness * clipping * flatness).clamp(0, 1)
+        core_mask = (soft_mask >= core_threshold).to(soft_mask.dtype)
+        return soft_mask.to(visible), core_mask.to(visible)
+
+
+def tone_compress(
+    visible_y: Tensor,
+    highlight_mask: Tensor,
+    *,
+    knee: float,
+    strength: float,
+) -> Tensor:
+    """Compress highlight excess while remaining identity outside the mask."""
+    if not 0 <= knee < 1 or strength <= 0:
+        raise ValueError("tone compression knee/strength are invalid")
+    excess = (visible_y - knee).clamp_min(0)
+    compressed = visible_y - excess + excess / (1 + strength * excess)
+    return torch.lerp(visible_y, compressed, highlight_mask.to(visible_y)).clamp(0, 1)
+
+
+def adaptive_tone_aware_intensity_target(
+    visible: Tensor,
+    infrared: Tensor,
+    *,
+    hot_low: float,
+    hot_high: float,
+    hot_weight: float,
+    max_weight: float,
+    smoothing_kernel: int,
+    saturation_threshold: float,
+    saturation_transition: float,
+    rgb_clip_threshold: float,
+    local_std_threshold: float,
+    tone_knee: float,
+    tone_strength: float,
+    highlight_core_threshold: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Build the Step-1 target from raw-VIS hotness and VIS-priority highlights."""
+    if hot_low < 0 or hot_high <= hot_low:
+        raise ValueError("hot thresholds must satisfy 0 <= low < high")
+    if not 0 <= hot_weight <= max_weight <= 1:
+        raise ValueError("IR intensity weights must satisfy 0 <= hot <= max <= 1")
+    if smoothing_kernel <= 0 or smoothing_kernel % 2 == 0:
+        raise ValueError("smoothing_kernel must be positive and odd")
+
+    with torch.autocast(device_type=visible.device.type, enabled=False):
+        visible_y = luminance(visible.float())
+        infrared_y = align_infrared_luminance(visible_y, infrared.float())
+        # Deliberately compare against uncompressed VIS. Tone compression must
+        # never manufacture apparent positive thermal contrast.
+        ir_contrast = (infrared_y - visible_y).clamp_min(0)
+        hotness = _smoothstep(ir_contrast, hot_low, hot_high)
+        infrared_weight = (hot_weight * hotness).clamp(0, max_weight)
+        padding = smoothing_kernel // 2
+        if padding:
+            infrared_weight = F.avg_pool2d(
+                F.pad(
+                    infrared_weight,
+                    (padding, padding, padding, padding),
+                    mode="replicate",
+                ),
+                kernel_size=smoothing_kernel,
+                stride=1,
+            )
+        highlight_mask, highlight_core = build_highlight_mask(
+            visible.float(),
+            saturation_threshold=saturation_threshold,
+            saturation_transition=saturation_transition,
+            rgb_clip_threshold=rgb_clip_threshold,
+            local_std_threshold=local_std_threshold,
+            core_threshold=highlight_core_threshold,
+        )
+        visible_tone = tone_compress(
+            visible_y,
+            highlight_mask,
+            knee=tone_knee,
+            strength=tone_strength,
+        )
+        # A hard core gate makes the documented overlap priority exact. The
+        # soft mask remains responsible for a smooth tone-compression boundary.
+        infrared_weight = infrared_weight * (1 - highlight_core.float())
+        target = torch.lerp(visible_tone, infrared_y, infrared_weight).clamp(0, 1)
+        return (
+            target.to(visible),
+            infrared_weight.to(visible),
+            hotness.to(visible),
+            highlight_mask.to(visible),
+            highlight_core.to(visible),
+            infrared_y.to(visible),
+        )
+
+
 def highlight_reconstruction_target(
     normal_target: Tensor,
     visible: Tensor,
@@ -1209,14 +1346,168 @@ def semantic_losses(
     return losses
 
 
-from tfs_moe_fusion.config import LossConfig
+from tfs_moe_fusion.config import LossConfig, VIFFusionLossConfig
 from tfs_moe_fusion.types import ContractError
 
 
+def bounded_simplex_logits(initial: list[float], floor: float) -> Tensor:
+    """Initialize the effective (post-floor) weights to the requested values."""
+    weights = torch.tensor(initial, dtype=torch.float32)
+    return ((weights - floor) / (1 - len(initial) * floor)).log()
+
+
+def bounded_simplex_weights(logits: Tensor, floor: float) -> Tensor:
+    return floor + (1 - logits.numel() * floor) * logits.softmax(0)
+
+
+def reliable_sobel(image: Tensor, dilation: int = 1) -> tuple[Tensor, Tensor]:
+    """Signed Sobel at full resolution, without artificial frame edges."""
+    gray = luminance(image.float())
+    kernel = gray.new_tensor(((-1, 0, 1), (-2, 0, 2), (-1, 0, 1))) / 4
+    kernel = kernel.view(1, 1, 3, 3)
+    padded = F.pad(gray, (dilation,) * 4, mode="replicate")
+    return (
+        F.conv2d(padded, kernel, dilation=dilation),
+        F.conv2d(padded, kernel.transpose(-1, -2), dilation=dilation),
+    )
+
+
+def reliable_gradient_target(
+    visible_y: Tensor, infrared_y: Tensor, config: VIFFusionLossConfig, dilation: int
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Compute IR structure reliability independently at each Sobel dilation."""
+    gx_v, gy_v = reliable_sobel(visible_y, dilation)
+    gx_i, gy_i = reliable_sobel(infrared_y, dilation)
+    mag_v = torch.sqrt(gx_v.square() + gy_v.square() + 1e-12)
+    mag_i = torch.sqrt(gx_i.square() + gy_i.square() + 1e-12)
+    # Scale nearby VIS support with the Sobel footprint as well.
+    size = (config.visible_gradient_support_kernel - 1) * dilation + 1
+    support = F.max_pool2d(mag_v, size, stride=1, padding=size // 2)
+    minimum = config.gradient_min_magnitude
+    dominance = mag_i / support.clamp_min(minimum)
+    reliability = (
+        torch.sigmoid(
+            (dominance - config.ir_gradient_dominance_ratio) / config.gradient_transition
+        )
+        * torch.sigmoid((mag_i - minimum) / minimum)
+    ).clamp(0, config.ir_structure_max_weight)
+    return (
+        torch.lerp(gx_v, gx_i, reliability),
+        torch.lerp(gy_v, gy_i, reliability),
+        reliability,
+    )
+
+
+def multi_scale_reliable_angular_loss(
+    fused_y: Tensor, visible_y: Tensor, infrared_y: Tensor,
+    config: VIFFusionLossConfig, scale_weights: Tensor,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    diagnostics = {}
+    terms = []
+    with torch.autocast(device_type=fused_y.device.type, enabled=False):
+        for dilation in (1, 2):
+            tx, ty, reliability = reliable_gradient_target(
+                visible_y.float(), infrared_y.float(), config, dilation
+            )
+            gx, gy = reliable_sobel(fused_y.float(), dilation)
+            reconstruction = charbonnier(
+                gx, tx, config.gradient_charbonnier_epsilon
+            ) + charbonnier(gy, ty, config.gradient_charbonnier_epsilon)
+            mag_f = torch.sqrt(gx.square() + gy.square() + 1e-12)
+            mag_t = torch.sqrt(tx.square() + ty.square() + 1e-12)
+            cosine = ((gx * tx + gy * ty) / (mag_f * mag_t + 1e-6)).clamp(-1, 1)
+            valid = (mag_t > config.angular_edge_threshold).float()
+            # A sample with no valid edges contributes exactly zero.
+            angular = (
+                ((1 - cosine) * valid).sum((-3, -2, -1))
+                / valid.sum((-3, -2, -1)).clamp_min(1)
+            ).mean()
+            terms.append(reconstruction + config.angular_beta * angular)
+            diagnostics[f"gradient_reconstruction/d{dilation}"] = reconstruction.detach()
+            diagnostics[f"gradient_angular/d{dilation}"] = angular.detach()
+            diagnostics[f"ir_structure_weight/d{dilation}"] = reliability.mean().detach()
+    return (scale_weights * torch.stack(terms)).sum(), diagnostics
+
+
+def separable_ssim_map(left: Tensor, right: Tensor, size: int, sigma: float) -> Tensor:
+    """FP32 local SSIM with separable Gaussian filtering for large windows.
+
+    Uses the same statistics, constants, padding and bounds as legacy ssim_map;
+    the old implementation remains untouched for all existing modes.
+    """
+    with torch.autocast(device_type=left.device.type, enabled=False):
+        left, right = luminance(left.float()), luminance(right.float())
+        coords = torch.arange(size, device=left.device, dtype=torch.float32) - (size - 1) / 2
+        vector = torch.exp(-coords.square() / (2 * sigma * sigma))
+        vector = vector / vector.sum()
+        horizontal = vector.view(1, 1, 1, size)
+        vertical = vector.view(1, 1, size, 1)
+        pad = size // 2
+
+        def blur(value: Tensor) -> Tensor:
+            value = F.conv2d(F.pad(value, (pad, pad, 0, 0), mode="replicate"), horizontal)
+            return F.conv2d(F.pad(value, (0, 0, pad, pad), mode="replicate"), vertical)
+
+        # Batch the five local moment calculations into two separable passes.
+        mx, my, ex2, ey2, exy = blur(torch.cat(
+            (left, right, left.square(), right.square(), left * right), dim=0
+        )).chunk(5, dim=0)
+        vx, vy = (ex2 - mx.square()).clamp_min(0), (ey2 - my.square()).clamp_min(0)
+        covariance = exy - mx * my
+        numerator = (2 * mx * my + 0.01**2) * (2 * covariance + 0.03**2)
+        denominator = (mx.square() + my.square() + 0.01**2) * (vx + vy + 0.03**2)
+        return (numerator / denominator.clamp_min(torch.finfo(torch.float32).eps)).clamp(-1, 1)
+
+
+def multi_window_structure_ssim_loss(
+    fused_y: Tensor, visible_y: Tensor, infrared_y: Tensor,
+    config: VIFFusionLossConfig, window_weights: Tensor,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    diagnostics = {}
+    terms = []
+    with torch.autocast(device_type=fused_y.device.type, enabled=False):
+        _, _, reliability = reliable_gradient_target(visible_y, infrared_y, config, 1)
+        # Preserve the existing explicit SSIM gate scaling (not a fourth loss).
+        structure_weight = (config.structure_ssim_scale * reliability).clamp(0, 1)
+        for size, sigma in zip((11, 25, 49), config.ssim_window_sigmas, strict=True):
+            vis_map = separable_ssim_map(fused_y, visible_y, size, sigma)
+            ir_map = separable_ssim_map(fused_y, infrared_y, size, sigma)
+            term = (1 - torch.lerp(vis_map, ir_map, structure_weight)).mean()
+            terms.append(term)
+            diagnostics[f"ssim_window_loss/{size}"] = term.detach()
+    return (window_weights * torch.stack(terms)).sum(), diagnostics
+
+
 class MultiTaskLossManager(nn.Module):
+    _adaptive_vif_terms = ("intensity", "gradient", "ssim")
+
     def __init__(self, config: LossConfig) -> None:
         super().__init__()
         self.config = config
+        if config.vif.objective_mode == "adaptive_three_term":
+            initial = torch.tensor(
+                [
+                    config.vif.initial_loss_weights[name]
+                    for name in self._adaptive_vif_terms
+                ],
+                dtype=torch.float32,
+            )
+            self.loss_log_vars = nn.Parameter(-initial.log())
+        else:
+            self.register_parameter("loss_log_vars", None)
+        self.register_parameter("scale_logits", None)
+        self.register_parameter("window_logits", None)
+        if config.vif.objective_mode == "adaptive_three_term":
+            if "gradient" in config.vif.active_terms:
+                self.scale_logits = nn.Parameter(bounded_simplex_logits(
+                    config.vif.gradient_scale_initial_weights,
+                    config.vif.gradient_scale_min_weight,
+                ))
+            if "ssim" in config.vif.active_terms:
+                self.window_logits = nn.Parameter(bounded_simplex_logits(
+                    config.vif.ssim_window_initial_weights,
+                    config.vif.ssim_window_min_weight,
+                ))
 
     def forward(self, context: LossContext) -> LossOutput:
         if (
@@ -1224,6 +1515,11 @@ class MultiTaskLossManager(nn.Module):
             or context.task is not context.output.task
         ):
             raise ContractError("Loss task must match both batch and output")
+        if (
+            context.task is TaskType.VIF
+            and self.config.vif.objective_mode == "adaptive_three_term"
+        ):
+            return self._adaptive_vif(context)
         components: dict[str, Tensor] = {}
         weights: dict[str, float] = {}
         skipped: dict[str, str] = {}
@@ -1640,6 +1936,152 @@ class MultiTaskLossManager(nn.Module):
                     ir_contribution
                 ).mean()
         return LossOutput(total, components, weighted, diagnostics, skipped)
+
+    def _adaptive_vif(self, context: LossContext) -> LossOutput:
+        """Compute only the explicitly active terms of the new VIF objective."""
+        if self.loss_log_vars is None:
+            raise RuntimeError("Adaptive VIF loss parameters were not initialized")
+        config = self.config.vif
+        visible, infrared = self._visible_ir(context.batch)
+        output = context.output
+        predicted_y = (
+            output.fused_y if output.fused_y is not None else luminance(output.fused)
+        )
+        (
+            target,
+            infrared_weight,
+            hotness,
+            highlight_mask,
+            highlight_core,
+            infrared_y,
+        ) = adaptive_tone_aware_intensity_target(
+            visible,
+            infrared,
+            hot_low=config.ir_hot_contrast_low,
+            hot_high=config.ir_hot_contrast_high,
+            hot_weight=config.ir_hot_weight,
+            max_weight=config.ir_intensity_max_weight,
+            smoothing_kernel=config.intensity_weight_smoothing_kernel,
+            saturation_threshold=config.highlight_saturation_threshold,
+            saturation_transition=config.highlight_saturation_transition,
+            rgb_clip_threshold=config.highlight_rgb_clip_threshold,
+            local_std_threshold=config.highlight_local_std_threshold,
+            tone_knee=config.highlight_tone_knee,
+            tone_strength=config.highlight_tone_strength,
+            highlight_core_threshold=config.highlight_core_threshold,
+        )
+        visible_y = luminance(visible.float())
+        components = {}
+        detail_diagnostics = {}
+        if "intensity" in config.active_terms:
+            components["fusion/intensity"] = F.l1_loss(predicted_y.float(), target.float())
+        if "gradient" in config.active_terms:
+            if self.scale_logits is None:
+                raise RuntimeError("Gradient scale parameters were not initialized")
+            scale_weights = bounded_simplex_weights(
+                self.scale_logits, config.gradient_scale_min_weight
+            )
+            components["fusion/gradient"], details = multi_scale_reliable_angular_loss(
+                predicted_y, visible_y, infrared_y, config, scale_weights
+            )
+            detail_diagnostics.update(details)
+            for dilation, weight in zip((1, 2), scale_weights, strict=True):
+                detail_diagnostics[f"gradient_scale_weight/d{dilation}"] = weight.detach()
+        if "ssim" in config.active_terms:
+            if self.window_logits is None:
+                raise RuntimeError("SSIM window parameters were not initialized")
+            window_weights = bounded_simplex_weights(
+                self.window_logits, config.ssim_window_min_weight
+            )
+            components["fusion/ssim"], details = multi_window_structure_ssim_loss(
+                predicted_y, visible_y, infrared_y, config, window_weights
+            )
+            detail_diagnostics.update(details)
+            for size, weight in zip((11, 25, 49), window_weights, strict=True):
+                detail_diagnostics[f"ssim_window_weight/{size}"] = weight.detach()
+        weighted = {}
+        for index, name in enumerate(self._adaptive_vif_terms):
+            key = f"fusion/{name}"
+            if key in components:
+                log_var = self.loss_log_vars[index]
+                weighted[key] = self._phase_multiplier(key, context) * (
+                    torch.exp(-log_var) * components[key] + log_var
+                )
+        total = torch.stack(tuple(weighted.values())).sum()
+        if not torch.isfinite(total):
+            raise FloatingPointError("Non-finite adaptive VIF total loss")
+
+        diagnostics: dict[str, Any] = {
+            "task": context.task.value,
+            "phase": context.phase,
+            "component_count": len(components),
+            "router_blocks": len(output.router_diagnostics),
+            "vif/objective_mode": config.objective_mode,
+            "vif/intensity_mode": config.intensity_mode,
+            "vif/gradient_mode": config.gradient_mode,
+            "vif/ssim_mode": config.ssim_mode,
+            "ir_intensity_weight_mean": infrared_weight.mean().detach(),
+            "ir_intensity_weight_max": infrared_weight.amax().detach(),
+            "ir_intensity_weight_active_ratio": (
+                (infrared_weight > 0).float().mean().detach()
+            ),
+            "ir_hotness_mean": hotness.mean().detach(),
+            "ir_hotness_active_ratio": (hotness > 0).float().mean().detach(),
+            "highlight_mask_ratio": highlight_mask.mean().detach(),
+            "highlight_core_ratio": highlight_core.mean().detach(),
+            "highlight_target_reduction": (
+                (luminance(visible).float() - target.float())
+                .clamp_min(0)
+                .mul(highlight_core.float())
+                .sum()
+                .div(highlight_core.float().sum().clamp_min(1e-6))
+                .detach()
+            ),
+            "ir_positive_target_gain": (
+                (target.float() - luminance(visible).float())
+                .clamp_min(0)
+                .mul(hotness.float() * (1 - highlight_core.float()))
+                .sum()
+                .div(
+                    (hotness.float() * (1 - highlight_core.float()))
+                    .sum()
+                    .clamp_min(1e-6)
+                )
+                .detach()
+            ),
+            "aligned_ir_mean": infrared_y.mean().detach(),
+            **detail_diagnostics,
+        }
+        for key, value in components.items():
+            diagnostics[f"raw_loss/{key.split('/')[-1]}"] = value.detach()
+        for index, name in enumerate(self._adaptive_vif_terms):
+            value = self.loss_log_vars[index]
+            diagnostics[f"loss_active/{name}"] = float(name in config.active_terms)
+            diagnostics[f"loss_log_var/{name}"] = value.detach().clone()
+            diagnostics[f"loss_weight/{name}"] = torch.exp(-value.detach())
+        for name in (
+            "chroma_cb_error",
+            "chroma_cr_error",
+            "y_gamut_clip_ratio",
+            "coarse_final_y_mae",
+            "y_residual_rms",
+            "y_residual_to_coarse_ratio",
+            "y_residual_scale",
+        ):
+            if name in output.debug:
+                value = output.debug[name]
+                diagnostics[name] = (
+                    value.detach() if isinstance(value, Tensor) else value
+                )
+        return LossOutput(total, components, weighted, diagnostics, {})
+
+    @torch.no_grad()
+    def clamp_adaptive_parameters_(self) -> None:
+        if self.loss_log_vars is not None:
+            self.loss_log_vars.clamp_(
+                self.config.vif.loss_log_var_min,
+                self.config.vif.loss_log_var_max,
+            )
 
     def _focus(self, context, components, weights, skipped) -> None:
         focus, target = context.output.focus, context.batch.focus_target

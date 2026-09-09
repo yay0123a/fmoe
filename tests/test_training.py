@@ -123,6 +123,7 @@ def test_frequency_specialization_reports_both_leakages() -> None:
 
 from tfs_moe_fusion.losses import (
     adaptive_ir_blend_weight,
+    adaptive_tone_aware_intensity_target,
     align_infrared_luminance,
     directional_gradient_loss,
     directional_gradient_targets,
@@ -140,6 +141,51 @@ from tfs_moe_fusion.losses import (
     vif_intensity_target,
     vif_losses,
 )
+
+
+def test_tone_aware_target_preserves_normal_regions_and_prioritizes_highlights() -> None:
+    visible = torch.full((1, 3, 64, 64), 0.2)
+    infrared = torch.full((1, 1, 64, 64), 0.2)
+    # Equal-area bright regions keep global VIS/IR statistics matched, making
+    # the behavior assertions independent of the luminance alignment itself.
+    visible[..., 8:24, 8:24] = 1.0
+    infrared[..., 32:48, 8:24] = 1.0
+    visible[..., 8:24, 40:56] = 1.0
+    infrared[..., 8:24, 40:56] = 1.0
+
+    target, ir_weight, hotness, highlight, core, aligned_ir = (
+        adaptive_tone_aware_intensity_target(
+            visible,
+            infrared,
+            hot_low=0.08,
+            hot_high=0.3,
+            hot_weight=0.4,
+            max_weight=0.4,
+            smoothing_kernel=3,
+            saturation_threshold=0.9,
+            saturation_transition=0.04,
+            rgb_clip_threshold=0.98,
+            local_std_threshold=0.025,
+            tone_knee=0.75,
+            tone_strength=6.0,
+            highlight_core_threshold=0.5,
+        )
+    )
+    visible_y = luminance(visible)
+    normal = (..., slice(52, 60), slice(8, 24))
+    visible_highlight = (..., slice(12, 20), slice(12, 20))
+    thermal_hot = (..., slice(36, 44), slice(12, 20))
+    overlap = (..., slice(12, 20), slice(44, 52))
+
+    torch.testing.assert_close(target[normal], visible_y[normal])
+    assert target[thermal_hot].mean() > visible_y[thermal_hot].mean()
+    assert hotness[thermal_hot].mean() > 0.9
+    assert target[visible_highlight].mean() < visible_y[visible_highlight].mean()
+    assert highlight[visible_highlight].mean() > 0.9
+    assert core[overlap].min() == 1
+    assert ir_weight[overlap].max() == 0
+    assert target[overlap].mean() < visible_y[overlap].mean()
+    assert torch.isfinite(aligned_ir).all()
 
 
 def test_vif_and_mfif_losses_are_finite_and_differentiable() -> None:
@@ -559,6 +605,36 @@ from tfs_moe_fusion.types import TaskType
 from tfs_moe_fusion.utils import make_probe_batch
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _enable_step1_vif(config) -> None:
+    vif = config.training.losses.vif
+    vif.objective_mode = "adaptive_three_term"
+    vif.active_terms = ["intensity"]
+    vif.intensity_mode = "tone_aware_hot_object"
+
+
+def test_step1_vif_has_only_adaptive_intensity_loss() -> None:
+    config = _smoke_config()
+    _enable_step1_vif(config)
+    model = build_model(config).train()
+    batch = make_probe_batch(config, TaskType.VIF)
+    manager = MultiTaskLossManager(config.training.losses)
+    result = manager(LossContext(batch, model(batch), TaskType.VIF, 0, 0, model))
+
+    assert set(result.components) == {"fusion/intensity"}
+    assert set(result.weighted_components) == {"fusion/intensity"}
+    assert result.diagnostics["component_count"] == 1
+    assert result.diagnostics["vif/objective_mode"] == "adaptive_three_term"
+    assert manager.loss_log_vars is not None
+    expected = -torch.log(torch.tensor([1.0, 1.5, 0.3]))
+    torch.testing.assert_close(manager.loss_log_vars.detach(), expected)
+    for name in ("intensity", "gradient", "ssim"):
+        assert f"loss_weight/{name}" in result.diagnostics
+        assert f"loss_log_var/{name}" in result.diagnostics
+    result.total.backward()
+    assert manager.loss_log_vars.grad is not None
+    assert torch.isfinite(manager.loss_log_vars.grad).all()
 
 
 def test_loss_manager_returns_structured_vif_output() -> None:
@@ -1093,6 +1169,76 @@ from pathlib import Path
 from tfs_moe_fusion.trainer import Trainer
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_step1_trainer_updates_and_restores_loss_weights(
+    tmp_path: Path, semantic_rt_assets: tuple[Path, Path, Path]
+) -> None:
+    config = _smoke_config(semantic_rt_assets)
+    _enable_step1_vif(config)
+    config.training.ema.enabled = False
+    trainer = Trainer(build_model(config), config, torch.device("cpu"), tmp_path)
+
+    assert trainer.loss_manager.loss_log_vars is not None
+    groups = [
+        group
+        for group in trainer.optimizer.param_groups
+        if group.get("group_name") == "vif_loss_weights"
+    ]
+    assert len(groups) == 1
+    assert groups[0]["weight_decay"] == 0
+    assert groups[0]["initial_lr"] == pytest.approx(
+        config.training.optimizer.learning_rate
+        * config.training.losses.vif.adaptive_weight_lr_multiplier
+    )
+    before = trainer.loss_manager.loss_log_vars.detach().clone()
+    result = trainer.train_step(TaskType.VIF)
+    after = trainer.loss_manager.loss_log_vars.detach().clone()
+    assert set(result.components) == {"fusion/intensity"}
+    assert not torch.equal(after, before)
+    torch.testing.assert_close(after[1:], before[1:])
+
+    checkpoint = trainer.save(tmp_path / "step1.pt")
+    trainer.provider.close()
+    restored = Trainer(
+        build_model(config), config, torch.device("cpu"), tmp_path / "restored"
+    )
+    restored.resume(checkpoint)
+    assert restored.loss_manager.loss_log_vars is not None
+    torch.testing.assert_close(restored.loss_manager.loss_log_vars.detach(), after)
+    restored.provider.close()
+
+
+def test_step1_trainer_accepts_legacy_model_only_optimizer_checkpoint(
+    tmp_path: Path, semantic_rt_assets: tuple[Path, Path, Path]
+) -> None:
+    legacy_config = _smoke_config(semantic_rt_assets)
+    legacy_config.training.ema.enabled = False
+    legacy = Trainer(
+        build_model(legacy_config),
+        legacy_config,
+        torch.device("cpu"),
+        tmp_path / "legacy",
+    )
+    legacy.train_step(TaskType.VIF)
+    checkpoint = legacy.save(tmp_path / "legacy.pt")
+    legacy.provider.close()
+
+    step1_config = _smoke_config(semantic_rt_assets)
+    _enable_step1_vif(step1_config)
+    step1_config.training.ema.enabled = False
+    step1 = Trainer(
+        build_model(step1_config),
+        step1_config,
+        torch.device("cpu"),
+        tmp_path / "step1",
+    )
+    step1.resume(checkpoint)
+    assert step1.loss_manager.loss_log_vars is not None
+    assert len(step1.scheduler.base_lrs) == len(step1.optimizer.param_groups)
+    result = step1.train_step(TaskType.VIF)
+    assert set(result.components) == {"fusion/intensity"}
+    step1.provider.close()
 
 
 def test_trainer_performs_real_updates_for_all_tasks(

@@ -10,7 +10,7 @@ import torch
 
 from tfs_moe_fusion.losses import LossContext, MultiTaskLossManager
 from tfs_moe_fusion.model import build_model
-from tfs_moe_fusion.trainer import Trainer
+from tfs_moe_fusion.trainer import Trainer, load_checkpoint
 from tfs_moe_fusion.types import TaskType
 from tfs_moe_fusion.utils import (
     configure_logging,
@@ -30,7 +30,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override training.device from the config (for example cpu or cuda:1)",
     )
     parser.add_argument("--max-steps", type=int)
-    parser.add_argument("--resume", type=Path)
+    checkpoint_group = parser.add_mutually_exclusive_group()
+    checkpoint_group.add_argument("--resume", type=Path)
+    checkpoint_group.add_argument(
+        "--init-checkpoint", type=Path,
+        help="Initialize model weights only; start optimizer, loss weights and steps fresh",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--task", default="vif", choices=[task.value for task in TaskType]
@@ -42,6 +47,8 @@ def main() -> None:
     args = build_parser().parse_args()
     rank = int(os.environ.get("RANK", "0"))
     config, run_dir = prepare_run(args.config, save_resolved=rank == 0)
+    if args.init_checkpoint and config.training.checkpoint.resume:
+        raise ValueError("--init-checkpoint cannot be combined with checkpoint.resume")
     logger = configure_logging(log_file=run_dir / "train.log" if rank == 0 else None)
     if rank != 0:
         logger.disabled = True
@@ -57,19 +64,23 @@ def main() -> None:
         )
 
     model = build_model(config).to(device)
+    if args.init_checkpoint:
+        load_checkpoint(args.init_checkpoint, model, map_location=device)
+        logger.info("Initialized model weights from %s (fresh training state)", args.init_checkpoint)
 
     if args.dry_run:
         task = TaskType.parse(args.task)
         batch = make_probe_batch(config, task).to(device)
         model.train()
         output = model(batch)
-        loss = MultiTaskLossManager(config.training.losses)(
+        loss_manager = MultiTaskLossManager(config.training.losses).to(device)
+        loss = loss_manager(
             LossContext(batch, output, task, 0, 0, model)
         ).total
         loss.backward()
         if not all(
             parameter.grad is None or torch.isfinite(parameter.grad).all()
-            for parameter in model.parameters()
+            for parameter in (*model.parameters(), *loss_manager.parameters())
         ):
             raise RuntimeError("Dry-run produced a non-finite gradient")
         logger.info(

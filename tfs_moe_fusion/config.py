@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from types import UnionType
@@ -265,6 +266,18 @@ class EMAConfig:
 
 @dataclass(slots=True)
 class VIFFusionLossConfig:
+    objective_mode: str = "legacy"
+    active_terms: list[str] = field(default_factory=lambda: ["intensity"])
+    initial_loss_weights: dict[str, float] = field(
+        default_factory=lambda: {
+            "intensity": 1.0,
+            "gradient": 1.5,
+            "ssim": 0.3,
+        }
+    )
+    adaptive_weight_lr_multiplier: float = 0.1
+    loss_log_var_min: float = -3.0
+    loss_log_var_max: float = 3.0
     intensity: float = 1.0
     gradient: float = 1.0
     ssim: float = 0.5
@@ -290,6 +303,7 @@ class VIFFusionLossConfig:
     highlight_local_std_threshold: float = 0.025
     highlight_tone_knee: float = 0.75
     highlight_tone_strength: float = 6.0
+    highlight_core_threshold: float = 0.5
     highlight_ir_detail_scale: float = 0.06
     highlight_reconstruction_weight: float = 0.0
     highlight_gradient_weight: float = 0.0
@@ -304,6 +318,17 @@ class VIFFusionLossConfig:
     gradient_min_magnitude: float = 0.02
     gradient_charbonnier_epsilon: float = 1e-3
     ssim_mode: str = "source_max"
+    angular_beta: float = 0.2
+    angular_edge_threshold: float = 0.02
+    gradient_scale_initial_weights: list[float] = field(
+        default_factory=lambda: [0.7, 0.3]
+    )
+    gradient_scale_min_weight: float = 0.1
+    ssim_window_initial_weights: list[float] = field(
+        default_factory=lambda: [0.5, 0.3, 0.2]
+    )
+    ssim_window_min_weight: float = 0.05
+    ssim_window_sigmas: list[float] = field(default_factory=lambda: [1.5, 3.5, 7.0])
 
 
 @dataclass(slots=True)
@@ -1257,6 +1282,85 @@ class ProjectConfig:
         if training.checkpoint.keep_last <= 0:
             raise ConfigurationError("checkpoint.keep_last must be positive")
         vif_loss = training.losses.vif
+        if vif_loss.objective_mode not in {"legacy", "adaptive_three_term"}:
+            raise ConfigurationError(
+                "VIF objective_mode must be legacy or adaptive_three_term"
+            )
+        valid_vif_terms = {"intensity", "gradient", "ssim"}
+        for name, weights, floor, count in (
+            ("gradient_scale", vif_loss.gradient_scale_initial_weights,
+             vif_loss.gradient_scale_min_weight, 2),
+            ("ssim_window", vif_loss.ssim_window_initial_weights,
+             vif_loss.ssim_window_min_weight, 3),
+        ):
+            if (
+                not math.isfinite(floor) or not 0 <= floor < 1 / count
+                or len(weights) != count
+                or any(not math.isfinite(w) or w <= floor for w in weights)
+                or not math.isclose(sum(weights), 1.0, abs_tol=1e-6)
+            ):
+                raise ConfigurationError(f"Invalid {name} initial weights or minimum")
+        if (
+            not math.isfinite(vif_loss.angular_beta) or vif_loss.angular_beta < 0
+            or not math.isfinite(vif_loss.angular_edge_threshold)
+            or vif_loss.angular_edge_threshold <= 0
+            or len(vif_loss.ssim_window_sigmas) != 3
+            or any(not math.isfinite(s) or s <= 0 for s in vif_loss.ssim_window_sigmas)
+        ):
+            raise ConfigurationError("Invalid angular parameters or SSIM sigmas")
+        if vif_loss.objective_mode == "legacy" and (
+            vif_loss.gradient_mode == "multi_scale_reliable_angular"
+            or vif_loss.ssim_mode == "structure_adaptive_multi_window"
+        ):
+            raise ConfigurationError("New gradient/SSIM modes require adaptive_three_term")
+        if (
+            not vif_loss.active_terms
+            or len(vif_loss.active_terms) != len(set(vif_loss.active_terms))
+            or not set(vif_loss.active_terms) <= valid_vif_terms
+        ):
+            raise ConfigurationError(
+                "VIF active_terms must be a non-empty unique subset of "
+                "intensity, gradient, and ssim"
+            )
+        if set(vif_loss.initial_loss_weights) != valid_vif_terms or any(
+            not math.isfinite(value) or value <= 0
+            for value in vif_loss.initial_loss_weights.values()
+        ):
+            raise ConfigurationError(
+                "VIF initial_loss_weights must define positive finite intensity, "
+                "gradient, and ssim weights"
+            )
+        if (
+            not math.isfinite(vif_loss.adaptive_weight_lr_multiplier)
+            or vif_loss.adaptive_weight_lr_multiplier <= 0
+        ):
+            raise ConfigurationError(
+                "VIF adaptive_weight_lr_multiplier must be positive and finite"
+            )
+        if not (
+            math.isfinite(vif_loss.loss_log_var_min)
+            and math.isfinite(vif_loss.loss_log_var_max)
+            and vif_loss.loss_log_var_min < vif_loss.loss_log_var_max
+        ):
+            raise ConfigurationError(
+                "VIF loss log-variance bounds must be finite and increasing"
+            )
+        if vif_loss.objective_mode == "adaptive_three_term":
+            if vif_loss.intensity_mode != "tone_aware_hot_object":
+                raise ConfigurationError(
+                    "Adaptive three-term VIF requires "
+                    "intensity_mode=tone_aware_hot_object"
+                )
+            for term, mode, required in (
+                ("gradient", vif_loss.gradient_mode, "multi_scale_reliable_angular"),
+                ("ssim", vif_loss.ssim_mode, "structure_adaptive_multi_window"),
+            ):
+                if term in vif_loss.active_terms and mode != required:
+                    raise ConfigurationError(f"Adaptive VIF {term} requires {required}")
+        elif vif_loss.intensity_mode == "tone_aware_hot_object":
+            raise ConfigurationError(
+                "tone_aware_hot_object requires objective_mode=adaptive_three_term"
+            )
         if (
             min(
                 vif_loss.intensity,
@@ -1269,6 +1373,7 @@ class ProjectConfig:
         ):
             raise ConfigurationError("VIF loss weights cannot be negative")
         if vif_loss.gradient_mode not in {
+            "multi_scale_reliable_angular",
             "magnitude_max",
             "directional_visible_anchor",
             "soft_directional_visible_anchor",
@@ -1281,6 +1386,7 @@ class ProjectConfig:
                 "independent_directional"
             )
         if vif_loss.ssim_mode not in {
+            "structure_adaptive_multi_window",
             "source_max",
             "visible_anchor",
             "adaptive_source",
@@ -1295,11 +1401,12 @@ class ProjectConfig:
             "gradient_weighted_visible_anchor",
             "adaptive_dark_ir",
             "hot_object_aware",
+            "tone_aware_hot_object",
         }:
             raise ConfigurationError(
                 "VIF intensity_mode must be pixel_max or "
                 "gradient_weighted_visible_anchor, adaptive_dark_ir, or "
-                "hot_object_aware"
+                "hot_object_aware, or tone_aware_hot_object"
             )
         if vif_loss.intensity_energy_normalization not in {
             "none",
@@ -1349,8 +1456,13 @@ class ProjectConfig:
             "highlight_rgb_clip_threshold",
             "highlight_tone_knee",
         ):
-            if not 0.0 <= getattr(vif_loss, name) < 1.0:
+            value = getattr(vif_loss, name)
+            if not 0.0 <= value < 1.0:
                 raise ConfigurationError(f"VIF {name} must be in [0, 1)")
+        if not 0.0 < vif_loss.highlight_core_threshold <= 1.0:
+            raise ConfigurationError(
+                "VIF highlight_core_threshold must be in (0, 1]"
+            )
         for name in (
             "highlight_saturation_transition",
             "highlight_local_std_threshold",

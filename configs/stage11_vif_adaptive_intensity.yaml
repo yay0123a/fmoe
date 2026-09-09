@@ -1,0 +1,19 @@
+_base_: stage7_adaptive_ir.yaml
+
+experiment:
+  name: stage11_msrs_vif_adaptive_intensity
+
+training:
+  losses:
+    vif:
+      objective_mode: adaptive_three_term
+      active_terms: [intensity]
+      initial_loss_weights:
+        intensity: 1.0
+        gradient: 1.5
+        ssim: 0.3
+      adaptive_weight_lr_multiplier: 0.1
+      loss_log_var_min: -3.0
+      loss_log_var_max: 3.0
+      intensity_mode: tone_aware_hot_object
+      highlight_core_threshold: 0.5
