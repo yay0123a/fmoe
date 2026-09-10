@@ -66,13 +66,15 @@ from tfs_moe_fusion.types import (
 
 @dataclass(slots=True)
 class FeaturePyramid:
+    """Three or four ordered scales; S4 is absent in a three-stage backbone."""
+
     s1: Tensor
     s2: Tensor
     s3: Tensor
-    s4: Tensor
+    s4: Tensor | None = None
 
     def as_dict(self) -> dict[str, Tensor]:
-        return {"s1": self.s1, "s2": self.s2, "s3": self.s3, "s4": self.s4}
+        return {f"s{index}": value for index, value in enumerate(self, start=1)}
 
     def validate(self) -> None:
         values = tuple(self)
@@ -86,10 +88,11 @@ class FeaturePyramid:
                 raise ValueError("Feature pyramid must downsample by two at each stage")
 
     def __iter__(self):
-        return iter((self.s1, self.s2, self.s3, self.s4))
+        values = (self.s1, self.s2, self.s3)
+        return iter(values if self.s4 is None else (*values, self.s4))
 
     def __len__(self) -> int:
-        return 4
+        return 3 if self.s4 is None else 4
 
     def __getitem__(self, index: int | str) -> Tensor:
         if isinstance(index, str):
@@ -139,7 +142,8 @@ from torch import nn
 
 from tfs_moe_fusion.acl_blocks import ACLStage
 from tfs_moe_fusion.color import compose_luminance_with_visible_chroma
-from tfs_moe_fusion.config import BackboneConfig, FrequencyConfig, MoEConfig
+from tfs_moe_fusion.config import BackboneConfig, CrossModalConfig, FrequencyConfig, MoEConfig
+from tfs_moe_fusion.cross_modal import InteractionAdaptiveFusion
 from tfs_moe_fusion.frequency import (
     FrequencyFoundationBlock,
     SpectralStatsExtractor,
@@ -301,7 +305,9 @@ class DownsampleBlock(nn.Module):
 
 
 class CrossModalFusionBlock(nn.Module):
-    def __init__(self, channels: int) -> None:
+    def __init__(
+        self, channels: int, config: CrossModalConfig | None = None, stage: str = "s1"
+    ) -> None:
         super().__init__()
         self.source_projection = nn.Conv2d(channels, channels, 1)
         hidden = max(4, channels // 4)
@@ -314,6 +320,13 @@ class CrossModalFusionBlock(nn.Module):
         self.refine = nn.Sequential(
             ConvNeXtLikeBlock(channels), ConvNeXtLikeBlock(channels)
         )
+        self.interaction = (
+            InteractionAdaptiveFusion(
+                channels, config.heads.get(stage), config.window_size,
+                config.alpha_init, config.beta_init,
+            )
+            if config is not None and config.enabled else None
+        )
 
     def forward(
         self, source_a: Tensor, source_b: Tensor, previous: Tensor | None = None
@@ -324,17 +337,19 @@ class CrossModalFusionBlock(nn.Module):
         score_b = self.shared_score(torch.cat((pb, common, difference), 1))
         weights = torch.softmax(torch.cat((score_a, score_b), 1), 1)
         fused = weights[:, :1] * pa + weights[:, 1:] * pb
+        diagnostics = {
+            "weight_a": weights[:, :1].detach().float().mean(),
+            "weight_b": weights[:, 1:].detach().float().mean(),
+        }
+        if self.interaction is not None:
+            fused, interaction_diagnostics = self.interaction(pa, pb, fused)
+            diagnostics.update(interaction_diagnostics)
+            diagnostics["weight_a_mean"] = diagnostics["weight_a"]
+            diagnostics["weight_b_mean"] = diagnostics["weight_b"]
         if previous is not None:
             fused = fused + self.previous_projection(previous)
         fused = self.refine(fused)
-        return fused, {
-            "weight_a": weights[:, :1],
-            "weight_b": weights[:, 1:],
-            "difference": difference,
-        }
-
-
-SymmetricAdaptiveFusion = CrossModalFusionBlock
+        return fused, diagnostics
 
 
 class SkipFusionBlock(nn.Module):
@@ -375,8 +390,9 @@ class CustomMultiscaleBackbone(FusionBackbone):
         shared_expert_bank: SharedExpertBank | None = None,
     ) -> None:
         super().__init__()
-        if len(channels) != 4 or len(depths) != 4:
-            raise ValueError("The fusion backbone requires exactly four stages")
+        if len(channels) not in {3, 4} or len(depths) != len(channels):
+            raise ValueError("The fusion backbone requires three or four matching stages")
+        num_stages = len(channels)
         settings = backbone_config or BackboneConfig(channels=channels, depths=depths)
         self.channels, self.depths = tuple(channels), tuple(depths)
         self.source_block = settings.source_block
@@ -436,13 +452,16 @@ class CustomMultiscaleBackbone(FusionBackbone):
             ]
         )
         self.source_downsamples = nn.ModuleList(
-            [DownsampleBlock(channels[i], channels[i + 1]) for i in range(3)]
+            [DownsampleBlock(channels[i], channels[i + 1]) for i in range(num_stages - 1)]
         )
         self.fused_downsamples = nn.ModuleList(
-            [DownsampleBlock(channels[i], channels[i + 1]) for i in range(3)]
+            [DownsampleBlock(channels[i], channels[i + 1]) for i in range(num_stages - 1)]
         )
         self.cross_modal_fusions = nn.ModuleList(
-            [CrossModalFusionBlock(c) for c in channels]
+            [
+                CrossModalFusionBlock(c, settings.cross_modal, f"s{index + 1}")
+                for index, c in enumerate(channels)
+            ]
         )
         self.frequency_blocks = nn.ModuleDict()
         uses_moe_slots = moe is not None and moe.enabled
@@ -506,7 +525,10 @@ class CustomMultiscaleBackbone(FusionBackbone):
                 if blocks:
                     self.moe_blocks[stage] = blocks
         self.decoder_stages = nn.ModuleList(
-            [SkipFusionBlock(channels[i], channels[i - 1]) for i in range(3, 0, -1)]
+            [
+                SkipFusionBlock(channels[i], channels[i - 1])
+                for i in range(num_stages - 1, 0, -1)
+            ]
         )
         self.fusion_y_head = nn.Sequential(
             nn.Conv2d(channels[0], 1, 3, padding=1), nn.Sigmoid()

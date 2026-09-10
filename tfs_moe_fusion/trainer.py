@@ -1919,6 +1919,7 @@ class Trainer:
                             "raw_loss/", "loss_active/", "gradient_scale_weight/",
                             "ssim_window_weight/", "gradient_reconstruction/",
                             "gradient_angular/", "ssim_window_loss/", "ir_structure_weight/",
+                            "iacf/",
                         ))
                     })
                     log_metrics = _scalar_metrics_to_cpu(
@@ -2178,6 +2179,13 @@ class Trainer:
                             loss_multipliers,
                         )
                     )
+                    for stage_index, values in enumerate(output.debug.get("cross_modal", ()), 1):
+                        if "oaf_scale" in values:
+                            result.diagnostics.update({
+                                f"iacf/s{stage_index}/{name}": value
+                                for name, value in values.items()
+                                if name not in {"weight_a", "weight_b"}
+                            })
                     starvation = config.losses.moe_starvation
                     if starvation.enabled and not adaptive_vif and not (
                         execution_policy is not None

@@ -56,6 +56,47 @@ yet.
 
 ## Train
 
+The training and inference entry points now default to the three-stage VIF/MFIF
+profile, `configs/stage15_dark_ir_three_stage.yaml`. It uses channels `[48, 96, 192]`,
+depths `[2, 2, 4]`, S2/S3 encoder MoE sites, and S3/S2 feedback. SegFormer and
+the semantic expert are disabled. The fusion model has **8,092,505 trainable
+parameters**. Training starts fresh (`checkpoint.resume: null`) and writes to
+`runs/stage15_msrs_dark_ir_three_stage_iacf`; inference defaults to that run's `latest.pt`.
+It inherits the Stage15 loss settings, including dark IR blending (0.6), maximum
+gain (0.3), local glare IR weight (0.2), and disabled highlight tone mapping.
+The original four-stage Stage15 profile remains available for comparisons.
+
+This profile enables TITA-inspired IACF in the existing cross-modal fusion slots:
+spatial anchor + six-operation OAF-Lite at S1, with additional bidirectional
+8x8 window interaction at S2/S3 (4/8 heads). Interaction and OAF residual scales
+are learnable sigmoid-bounded values initialized to 0.1. The original ACL source
+encoder, source evidence, fused ConvNeXt stages, MoE, feedback, decoder and training
+settings are unchanged. IACF adds 373,333 parameters (4.84%). It uses no new dependencies.
+
+For VIF/SEG, keep **A=visible, B=infrared**. MFIF keeps the dataset's two RGB inputs;
+the ordered relation/operation predictors do not guarantee source-swap invariance.
+This is inspired by [TITA](https://github.com/huxingyuabc/TITA), not a reproduction:
+we use a scalar interaction gate and fixed-average HPF plus depthwise-separable
+ADD/MUL instead of IPA noise tokens and CARAFE. OAF receives no task embedding.
+
+`model.backbone.cross_modal.enabled: false` restores the original fusion architecture
+and parameter keys for baseline comparisons; older profiles default to this setting.
+Do not resume an old non-IACF checkpoint with the enabled profile: architecture and
+optimizer parameter groups differ. Start fresh, or disable IACF to evaluate the old run.
+Training logs include detached scalars under `diagnostic/iacf/s*/`: anchor weights,
+relation mean/std (S2/S3 only), actual scaled cross-update RMS and relative RMS,
+six OAF weights, anchor/OAF delta RMS, and residual scales. Full attention/relation/
+candidate maps are not retained. Initial smoke diagnostics do not establish fusion
+quality or rule out later gate collapse; inspect these metrics during real training.
+
+```bash
+python train.py --config configs/stage15_dark_ir_three_stage.yaml
+python train.py --device cpu --dry-run --task vif
+python train.py --device cpu --dry-run --task mfif
+```
+
+Legacy four-stage SemanticRT training:
+
 ```bash
 python train.py --config configs/default.yaml
 ```

@@ -20,6 +20,16 @@ class ExperimentConfig:
 
 
 @dataclass(slots=True)
+class CrossModalConfig:
+    enabled: bool = False
+    # Only listed stages use cross attention; every enabled stage uses OAF.
+    heads: dict[str, int] = field(default_factory=lambda: {"s2": 4, "s3": 8})
+    window_size: int = 8
+    alpha_init: float = 0.1
+    beta_init: float = 0.1
+
+
+@dataclass(slots=True)
 class BackboneConfig:
     name: str = "custom_multiscale"
     channels: list[int] = field(default_factory=lambda: [48, 96, 192, 384])
@@ -42,6 +52,7 @@ class BackboneConfig:
     mlp_ratio: float = 2.0
     layer_scale_init: float = 1e-6
     drop_path: float = 0.0
+    cross_modal: CrossModalConfig = field(default_factory=CrossModalConfig)
 
 
 @dataclass(slots=True)
@@ -305,7 +316,6 @@ class VIFFusionLossConfig:
     glare_ir_weight: float = 0.0
     dark_ir_blend: float = 0.0
     dark_ir_max_gain: float = 0.3
-    dark_gradient_consistency: bool = False
     highlight_tone_knee: float = 0.75
     highlight_tone_strength: float = 6.0
     highlight_core_threshold: float = 0.5
@@ -672,6 +682,8 @@ class ProjectConfig:
             raise ConfigurationError(
                 "backbone.channels and backbone.depths must be non-empty and equal length"
             )
+        if len(backbone.channels) not in {3, 4}:
+            raise ConfigurationError("The fusion backbone requires three or four stages")
         if any(value <= 0 for value in backbone.channels + backbone.depths):
             raise ConfigurationError("backbone channels/depths must be positive")
         if backbone.source_block not in {"convnext_like", "lama"}:
@@ -699,8 +711,12 @@ class ProjectConfig:
             raise ConfigurationError(
                 "backbone.normalization must be group_norm, layer_norm_2d, or identity"
             )
-        if backbone.max_downsample != 8:
-            raise ConfigurationError("backbone.max_downsample must be 8")
+        expected_downsample = 2 ** (len(backbone.channels) - 1)
+        if backbone.max_downsample != expected_downsample:
+            raise ConfigurationError(
+                f"backbone.max_downsample must be {expected_downsample} "
+                f"for {len(backbone.channels)} stages"
+            )
         if not (
             backbone.shared_source_encoder
             and backbone.separate_modality_stems
@@ -713,6 +729,22 @@ class ProjectConfig:
 
         frequency = model.frequency
         legal_stages = {f"s{index + 1}" for index in range(len(backbone.channels))}
+        cross_modal = backbone.cross_modal
+        if not set(cross_modal.heads) <= legal_stages:
+            raise ConfigurationError("backbone.cross_modal.heads contains an inactive stage")
+        for stage, heads in cross_modal.heads.items():
+            channels = backbone.channels[int(stage[1:]) - 1]
+            if (
+                not isinstance(heads, int) or heads <= 0
+                or (cross_modal.enabled and channels % heads)
+            ):
+                raise ConfigurationError(
+                    f"backbone.cross_modal.heads[{stage}] must divide channels={channels}"
+                )
+        if not isinstance(cross_modal.window_size, int) or cross_modal.window_size <= 0:
+            raise ConfigurationError("backbone.cross_modal.window_size must be a positive integer")
+        if not 0 < cross_modal.alpha_init < 1 or not 0 < cross_modal.beta_init < 1:
+            raise ConfigurationError("backbone.cross_modal initial scales must be in (0,1)")
         if not set(backbone.mdc_placements) <= legal_stages:
             raise ConfigurationError(
                 f"backbone.mdc_placements must be a subset of {sorted(legal_stages)}"
@@ -842,11 +874,12 @@ class ProjectConfig:
             )
         if model.moe.expert_dim <= 0:
             raise ConfigurationError("model.moe.expert_dim must be positive")
-        if set(model.moe.patch_size) != {"s2", "s3", "s4"} or any(
+        moe_stages = legal_stages - {"s1"}
+        if set(model.moe.patch_size) != moe_stages or any(
             value <= 0 for value in model.moe.patch_size.values()
         ):
             raise ConfigurationError(
-                "model.moe.patch_size must define positive s2/s3/s4 values"
+                f"model.moe.patch_size must define positive values for {sorted(moe_stages)}"
             )
         if min(
             model.moe.common_scale_init, model.moe.specialist_scale_init
@@ -911,10 +944,13 @@ class ProjectConfig:
             value < 0 for value in model.moe.block_counts.values()
         ):
             raise ConfigurationError(
-                "moe.block_counts must define non-negative s1/s2/s3/s4 counts"
+                f"moe.block_counts must define non-negative counts for {sorted(legal_stages)}"
             )
-        if model.moe.block_counts != {"s1": 0, "s2": 1, "s3": 1, "s4": 1}:
-            raise ConfigurationError("The encoder requires MoE counts 0/1/1/1")
+        expected_counts = {stage: int(stage != "s1") for stage in legal_stages}
+        if model.moe.block_counts != expected_counts:
+            raise ConfigurationError(
+                "The encoder requires zero MoE blocks at S1 and one at each deeper stage"
+            )
         if model.moe.train_execution not in {
             "dense_masked",
             "sparse_batch",
@@ -1464,12 +1500,6 @@ class ProjectConfig:
             raise ConfigurationError("VIF dark_ir_blend must be in [0, 1]")
         if not 0.0 < vif_loss.dark_ir_max_gain <= 1.0:
             raise ConfigurationError("VIF dark_ir_max_gain must be in (0, 1]")
-        if vif_loss.dark_gradient_consistency and (
-            vif_loss.objective_mode != "adaptive_three_term" or vif_loss.dark_ir_blend <= 0
-        ):
-            raise ConfigurationError(
-                "Dark gradient consistency requires adaptive VIF with dark IR blending"
-            )
         for name in (
             "highlight_saturation_threshold",
             "highlight_rgb_clip_threshold",

@@ -1,0 +1,30 @@
+_base_: stage15_dark_ir.yaml
+
+experiment:
+  name: stage15_msrs_dark_ir_three_stage_iacf
+
+model:
+  # Keep padding and S2/S3 routing granularity identical to the four-stage baseline.
+  pad_multiple: 8
+  backbone:
+    channels: [48, 96, 192]
+    depths: [2, 2, 4]
+    lama_heads: [2, 4, 8]
+    max_downsample: 4
+    cross_modal:
+      enabled: true
+      # S1: spatial anchor + OAF; S2/S3: gated window interaction + OAF.
+      heads: {s2: 4, s3: 8}
+      window_size: 8
+      alpha_init: 0.1
+      beta_init: 0.1
+  frequency:
+    placements: [s2, s3]
+  moe:
+    placements: [s2, s3]
+    patch_size: {_replace_: true, s2: 4, s3: 2}
+    block_counts: {_replace_: true, s1: 0, s2: 1, s3: 1}
+
+training:
+  checkpoint:
+    resume: null

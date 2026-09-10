@@ -623,26 +623,6 @@ def local_glare_mask(visible_y: Tensor, aligned_ir: Tensor, infrared: Tensor) ->
     )
 
 
-@torch.no_grad()
-def dark_ir_mask(
-    visible_y: Tensor, aligned_ir: Tensor, infrared: Tensor,
-    threshold: float, transition: float,
-) -> Tensor:
-    """Shared dark-region reliability before applying the intensity blend strength."""
-    local_y = torch.maximum(visible_y, _replicated_box_mean(visible_y, 9))
-    darkness = 1 - _smoothstep(
-        local_y, max(0.0, threshold - transition), threshold + transition
-    )
-    contrast = torch.maximum(
-        infrared - _replicated_box_mean(infrared, 17),
-        infrared - _replicated_box_mean(infrared, 65),
-    )
-    return (
-        darkness * _smoothstep(contrast, 0.01, 0.08)
-        * _smoothstep((aligned_ir - visible_y).clamp_min(0), 0.0, 0.02)
-    )
-
-
 def adaptive_tone_aware_intensity_target(
     visible: Tensor,
     infrared: Tensor,
@@ -723,10 +703,21 @@ def adaptive_tone_aware_intensity_target(
             infrared_weight = torch.maximum(infrared_weight, glare_ir_weight * glare)
         target = torch.lerp(visible_tone, infrared_y, infrared_weight).clamp(0, 1)
         if dark_ir_blend > 0:
-            blend = dark_ir_blend * dark_ir_mask(
-                visible_y, infrared_y, infrared.float(),
-                darkness_threshold, darkness_transition,
-            )
+            with torch.no_grad():
+                local_y = torch.maximum(visible_y, _replicated_box_mean(visible_y, 9))
+                darkness = 1 - _smoothstep(
+                    local_y, max(0.0, darkness_threshold - darkness_transition),
+                    darkness_threshold + darkness_transition,
+                )
+                # Raw-IR local contrast admits both small and broader hot regions.
+                raw_ir = infrared.float()
+                contrast = torch.maximum(
+                    raw_ir - _replicated_box_mean(raw_ir, 17),
+                    raw_ir - _replicated_box_mean(raw_ir, 65),
+                )
+                blend = dark_ir_blend * darkness * _smoothstep(contrast, 0.01, 0.08)
+                # Leave glare unchanged where aligned IR cannot add luminance.
+                blend = blend * _smoothstep(ir_contrast, 0.0, 0.02)
             gain = dark_ir_max_gain * torch.tanh(ir_contrast / dark_ir_max_gain)
             dark_target = (visible_y + gain).clamp(0, 1)
             target = torch.lerp(target, dark_target, blend)
@@ -1476,12 +1467,7 @@ def reliable_gradient_target(
 def multi_scale_reliable_angular_loss(
     fused_y: Tensor, visible_y: Tensor, infrared_y: Tensor,
     config: VIFFusionLossConfig, scale_weights: Tensor,
-    *, intensity_target: Tensor | None = None, dark_mask: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    if config.dark_gradient_consistency and (
-        intensity_target is None or dark_mask is None
-    ):
-        raise ValueError("Dark gradient consistency requires intensity target and dark mask")
     diagnostics = {}
     terms = []
     with torch.autocast(device_type=fused_y.device.type, enabled=False):
@@ -1490,30 +1476,16 @@ def multi_scale_reliable_angular_loss(
                 visible_y.float(), infrared_y.float(), config, dilation
             )
             gx, gy = reliable_sobel(fused_y.float(), dilation)
+            reconstruction = charbonnier(
+                gx, tx, config.gradient_charbonnier_epsilon
+            ) + charbonnier(gy, ty, config.gradient_charbonnier_epsilon)
             mag_f = torch.sqrt(gx.square() + gy.square() + 1e-12)
-
-            def distance_maps(rx: Tensor, ry: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-                epsilon = config.gradient_charbonnier_epsilon
-                error = torch.sqrt((gx - rx).square() + epsilon**2)
-                error = error + torch.sqrt((gy - ry).square() + epsilon**2)
-                magnitude = torch.sqrt(rx.square() + ry.square() + 1e-12)
-                cosine = ((gx * rx + gy * ry) / (mag_f * magnitude + 1e-6)).clamp(-1, 1)
-                valid = (magnitude > config.angular_edge_threshold).float()
-                return error, (1 - cosine) * valid, valid
-
-            reconstruction, angle, valid = distance_maps(tx, ty)
-            if config.dark_gradient_consistency:
-                dx, dy = reliable_sobel(intensity_target.detach().float(), dilation)
-                dark_reconstruction, dark_angle, dark_valid = distance_maps(dx, dy)
-                mask = dark_mask.detach().float()
-                # Blend loss maps, not signed source gradients.
-                reconstruction = torch.lerp(reconstruction, dark_reconstruction, mask)
-                angle = torch.lerp(angle, dark_angle, mask)
-                valid = torch.lerp(valid, dark_valid, mask)
-            reconstruction = reconstruction.mean()
+            mag_t = torch.sqrt(tx.square() + ty.square() + 1e-12)
+            cosine = ((gx * tx + gy * ty) / (mag_f * mag_t + 1e-6)).clamp(-1, 1)
+            valid = (mag_t > config.angular_edge_threshold).float()
             # A sample with no valid edges contributes exactly zero.
             angular = (
-                angle.sum((-3, -2, -1))
+                ((1 - cosine) * valid).sum((-3, -2, -1))
                 / valid.sum((-3, -2, -1)).clamp_min(1)
             ).mean()
             terms.append(reconstruction + config.angular_beta * angular)
@@ -2081,15 +2053,8 @@ class MultiTaskLossManager(nn.Module):
             scale_weights = bounded_simplex_weights(
                 self.scale_logits, config.gradient_scale_min_weight
             )
-            dark_mask = None
-            if config.dark_gradient_consistency:
-                dark_mask = dark_ir_mask(
-                    visible_y, infrared_y, infrared.float(),
-                    config.ir_darkness_threshold, config.ir_darkness_transition,
-                )
             components["fusion/gradient"], details = multi_scale_reliable_angular_loss(
-                predicted_y, visible_y, infrared_y, config, scale_weights,
-                intensity_target=target, dark_mask=dark_mask,
+                predicted_y, visible_y, infrared_y, config, scale_weights
             )
             detail_diagnostics.update(details)
             for dilation, weight in zip((1, 2), scale_weights, strict=True):

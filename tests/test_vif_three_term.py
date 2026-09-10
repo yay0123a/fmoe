@@ -117,12 +117,6 @@ def test_dark_ir_compensation_only_changes_dark_intensity():
     assert set(old) == set(new) == {"fusion/intensity", "fusion/gradient", "fusion/ssim"}
     for key in ("fusion/gradient", "fusion/ssim"):
         torch.testing.assert_close(old[key], new[key])
-    c.training.losses.vif.dark_gradient_consistency = True
-    consistent = evaluate(0.6)
-    for key in ("fusion/intensity", "fusion/ssim"):
-        torch.testing.assert_close(new[key], consistent[key])
-    assert not torch.isclose(new["fusion/gradient"], consistent["fusion/gradient"])
-    c.training.losses.vif.dark_gradient_consistency = False
     for brightness in (1.0, 0.05):
         visible.fill_(brightness)
         if brightness < 1:
@@ -130,37 +124,6 @@ def test_dark_ir_compensation_only_changes_dark_intensity():
         torch.testing.assert_close(
             evaluate(0.0)["fusion/intensity"], evaluate(0.6)["fusion/intensity"]
         )
-
-
-def test_dark_gradient_mask_preserves_legacy_and_favors_intensity_edges():
-    c = load_config(ROOT / "configs/stage16_dark_gradient.yaml").training.losses.vif
-    visible = torch.full((1, 1, 21, 25), 0.05)
-    infrared = visible.clone()
-    infrared[..., 12:] = 0.65
-    target = visible.clone()
-    target[..., 12:] = 0.25
-    target.requires_grad_()
-    fused = target.detach().clone().requires_grad_()
-    weights = torch.tensor([0.7, 0.3])
-    c.dark_gradient_consistency = False
-    legacy, _ = multi_scale_reliable_angular_loss(fused, visible, infrared, c, weights)
-    c.dark_gradient_consistency = True
-    unchanged, _ = multi_scale_reliable_angular_loss(
-        fused, visible, infrared, c, weights,
-        intensity_target=target, dark_mask=torch.zeros_like(target),
-    )
-    torch.testing.assert_close(legacy, unchanged)
-    mask = torch.ones_like(target, requires_grad=True)
-    aligned, _ = multi_scale_reliable_angular_loss(
-        fused, visible, infrared, c, weights, intensity_target=target, dark_mask=mask,
-    )
-    overbright, _ = multi_scale_reliable_angular_loss(
-        infrared, visible, infrared, c, weights, intensity_target=target, dark_mask=mask,
-    )
-    assert aligned < overbright
-    aligned.backward()
-    assert torch.isfinite(fused.grad).all()
-    assert target.grad is None and mask.grad is None
 
 
 @pytest.mark.parametrize("precision", [torch.float32, torch.bfloat16])

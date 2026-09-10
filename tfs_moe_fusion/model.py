@@ -194,14 +194,14 @@ class TaskConditionedRefinementDecoder(nn.Module):
         use_task_film: bool = True,
     ) -> None:
         super().__init__()
-        self.deep_conditioner = GuidanceConditioner(channels[3])
-        self.deep_film = TaskFiLM(channels[3], task_embedding, use_task_film)
+        self.deep_conditioner = GuidanceConditioner(channels[-1])
+        self.deep_film = TaskFiLM(channels[-1], task_embedding, use_task_film)
         self.stages = nn.ModuleList(
             [
                 RefinementStage(
                     channels[index], channels[index - 1], task_embedding, use_task_film
                 )
-                for index in range(3, 0, -1)
+                for index in range(len(channels) - 1, 0, -1)
             ]
         )
         self.residual_head = TaskResidualHead(
@@ -212,9 +212,9 @@ class TaskConditionedRefinementDecoder(nn.Module):
         self, pyramid: FeaturePyramid, guidance: tuple[Tensor, ...], task: TaskType
     ) -> Tensor:
         features = tuple(pyramid)
-        decoded = self.deep_film(self.deep_conditioner(features[3], guidance[3]), task)
+        decoded = self.deep_film(self.deep_conditioner(features[-1], guidance[-1]), task)
         for stage, skip, guide in zip(
-            self.stages, reversed(features[:3]), reversed(guidance[:3]), strict=True
+            self.stages, reversed(features[:-1]), reversed(guidance[:-1]), strict=True
         ):
             decoded = stage(decoded, skip, guide, task)
         return decoded

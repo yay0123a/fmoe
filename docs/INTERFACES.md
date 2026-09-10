@@ -4,8 +4,10 @@
 
 `FusionBatch` contains two `SourceBatch` values, a homogeneous `TaskType`,
 sample identifiers, and optional supervision. Each source carries an explicit
-`ModalityType`; source A is never assumed to be visible and source B is never
-assumed to be infrared.
+`ModalityType`; stems, source evidence and output color handling use this metadata.
+The Stage15 three-stage IACF profile uses ordered predictors and expects A=visible,
+B=infrared for VIF/SEG. MFIF uses its two RGB sources in dataset order. The legacy
+fusion path remains source-symmetric; IACF does not promise swap invariance.
 
 Canonical image layout is `float32 [B,C,H,W]` in `[0,1]`. RGB modalities require
 three channels and gray/infrared modalities require one channel.
@@ -33,11 +35,23 @@ contracts rather than adding task-specific branches to training scripts.
 
 ## Stage 2 backbone output
 
-`BackboneOutput` carries named `FeaturePyramid.s1/s2/s3/s4` values for the
-source-A, source-B, and fused four-scale pyramids,
+`BackboneOutput` carries named `FeaturePyramid.s1/s2/s3` values and an optional
+`s4` for the source-A, source-B, and fused three- or four-scale pyramids.
+On three-stage models, `s4` is `None`; iteration, length, and dictionary/index
+access expose only the three active scales. It also carries
 the full-resolution decoder feature, exact-size sigmoid image output, spectral
 statistics, and non-scientific debug metadata. Pyramids use the reversibly
 padded size; the public fused image is cropped to the original height and width.
+
+IACF only changes the cross-modal fusion slot, before the existing fused stage/MoE.
+`source_a`/`source_b` pyramids and router/expert evidence remain unmodified source
+encoder outputs. The spatial anchor is corrected by OAF before adding the existing
+projected previous-scale feature and applying the existing refine blocks.
+`debug["cross_modal"]` contains detached stage scalars. `weight_a`/`weight_b` are
+now spatial/batch means (not maps); the existing IR-weight logging still uses them.
+Enabled IACF also supplies explicit `weight_a_mean`/`weight_b_mean` and OAF metrics;
+relation/cross-update metrics exist only where attention is enabled. No full
+relation, attention, candidate or difference feature maps are retained by default.
 
 ## Stage 3 routing output
 

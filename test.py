@@ -44,17 +44,17 @@ CITYSCAPES_COLORS = np.array(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("configs/stage12_vif_three_term.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("configs/stage15_dark_ir_three_stage.yaml"))
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("runs/stage12_msrs_vif_three_term/checkpoints/latest.pt"),
+        default=Path("runs/stage15_msrs_dark_ir_three_stage_iacf/checkpoints/latest.pt"),
     )
     parser.add_argument("--input-a", type=Path,default=Path("data/msrs/test/vi/00918N.png")) #vi
     parser.add_argument("--input-b", type=Path,default=Path("data/msrs/test/ir/00918N.png")) #ir
     #parser.add_argument("--input-a", type=Path,default=Path("data/mfif/semantic_rt/dof_stack/img_00125/0.jpg")) #n
     #parser.add_argument("--input-b", type=Path,default=Path("data/mfif/semantic_rt/dof_stack/img_00125/1.jpg")) #f
-    parser.add_argument("--output", type=Path, default=Path("runs/stage12"))
+    parser.add_argument("--output", type=Path, default=Path("runs/stage16_three_stage"))
     parser.add_argument(
         "--task", required=True, choices=[item.value for item in TaskType]
     )
@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--device",
         #default=None,
-        default="cuda:7",
+        default="cuda:6",
         help="Override training.device from the config (for example cpu or cuda:1)",
     )
     parser.add_argument("--save-coarse", action="store_true")
@@ -83,7 +83,7 @@ def main() -> None:
         )
     model = build_model(config).to(device).eval()
 
-    if args.checkpoint is not None:
+    if args.checkpoint is not None and not args.dry_run:
         report = load_checkpoint(args.checkpoint, model, map_location=device)
         logger.info(
             "Loaded checkpoint epoch=%d step=%d", report.epoch, report.global_step
