@@ -301,6 +301,11 @@ class VIFFusionLossConfig:
     highlight_saturation_transition: float = 0.04
     highlight_rgb_clip_threshold: float = 0.98
     highlight_local_std_threshold: float = 0.025
+    highlight_tone_enabled: bool = True
+    glare_ir_weight: float = 0.0
+    dark_ir_blend: float = 0.0
+    dark_ir_max_gain: float = 0.3
+    dark_gradient_consistency: bool = False
     highlight_tone_knee: float = 0.75
     highlight_tone_strength: float = 6.0
     highlight_core_threshold: float = 0.5
@@ -1450,6 +1455,20 @@ class ProjectConfig:
         if vif_loss.hot_underexposure_weight < 0:
             raise ConfigurationError(
                 "VIF hot_underexposure_weight cannot be negative"
+            )
+        if not 0.0 <= vif_loss.glare_ir_weight <= vif_loss.ir_intensity_max_weight:
+            raise ConfigurationError(
+                "VIF glare_ir_weight must be in [0, ir_intensity_max_weight]"
+            )
+        if not 0.0 <= vif_loss.dark_ir_blend <= 1.0:
+            raise ConfigurationError("VIF dark_ir_blend must be in [0, 1]")
+        if not 0.0 < vif_loss.dark_ir_max_gain <= 1.0:
+            raise ConfigurationError("VIF dark_ir_max_gain must be in (0, 1]")
+        if vif_loss.dark_gradient_consistency and (
+            vif_loss.objective_mode != "adaptive_three_term" or vif_loss.dark_ir_blend <= 0
+        ):
+            raise ConfigurationError(
+                "Dark gradient consistency requires adaptive VIF with dark IR blending"
             )
         for name in (
             "highlight_saturation_threshold",

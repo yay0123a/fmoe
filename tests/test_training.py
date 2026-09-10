@@ -143,7 +143,10 @@ from tfs_moe_fusion.losses import (
 )
 
 
-def test_tone_aware_target_preserves_normal_regions_and_prioritizes_highlights() -> None:
+@pytest.mark.parametrize("tone_enabled", [True, False])
+def test_tone_aware_target_preserves_normal_regions_and_prioritizes_highlights(
+    tone_enabled: bool,
+) -> None:
     visible = torch.full((1, 3, 64, 64), 0.2)
     infrared = torch.full((1, 1, 64, 64), 0.2)
     # Equal-area bright regions keep global VIS/IR statistics matched, making
@@ -169,6 +172,7 @@ def test_tone_aware_target_preserves_normal_regions_and_prioritizes_highlights()
             tone_knee=0.75,
             tone_strength=6.0,
             highlight_core_threshold=0.5,
+            highlight_tone_enabled=tone_enabled,
         )
     )
     visible_y = luminance(visible)
@@ -180,11 +184,14 @@ def test_tone_aware_target_preserves_normal_regions_and_prioritizes_highlights()
     torch.testing.assert_close(target[normal], visible_y[normal])
     assert target[thermal_hot].mean() > visible_y[thermal_hot].mean()
     assert hotness[thermal_hot].mean() > 0.9
-    assert target[visible_highlight].mean() < visible_y[visible_highlight].mean()
+    for region in (visible_highlight, overlap):
+        if tone_enabled:
+            assert target[region].mean() < visible_y[region].mean()
+        else:
+            torch.testing.assert_close(target[region], visible_y[region])
     assert highlight[visible_highlight].mean() > 0.9
     assert core[overlap].min() == 1
     assert ir_weight[overlap].max() == 0
-    assert target[overlap].mean() < visible_y[overlap].mean()
     assert torch.isfinite(aligned_ir).all()
 
 

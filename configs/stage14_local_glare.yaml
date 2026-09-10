@@ -1,0 +1,9 @@
+_base_: stage13_no_tone.yaml
+
+experiment:
+  name: stage14_msrs_local_glare
+
+training:
+  losses:
+    vif:
+      glare_ir_weight: 0.2

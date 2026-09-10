@@ -1,0 +1,9 @@
+_base_: stage12_vif_three_term.yaml
+
+experiment:
+  name: stage13_msrs_no_tone
+
+training:
+  losses:
+    vif:
+      highlight_tone_enabled: false

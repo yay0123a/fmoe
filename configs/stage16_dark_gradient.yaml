@@ -1,0 +1,9 @@
+_base_: stage15_dark_ir.yaml
+
+experiment:
+  name: stage16_msrs_dark_gradient
+
+training:
+  losses:
+    vif:
+      dark_gradient_consistency: true

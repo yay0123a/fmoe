@@ -1,0 +1,10 @@
+_base_: stage14_local_glare.yaml
+
+experiment:
+  name: stage15_msrs_dark_ir
+
+training:
+  losses:
+    vif:
+      dark_ir_blend: 0.6
+      dark_ir_max_gain: 0.3
